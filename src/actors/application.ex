@@ -2,7 +2,7 @@
 # This would be added to your Gleam application supervisor
 
 # For now, you can start it manually in Gleam or create a simple Elixir app file:
-defmodule ClockApp do
+defmodule TrackTagsApplication do
   use Application
 
   def start() do
@@ -12,10 +12,7 @@ defmodule ClockApp do
     ]
 
     # One-for-one strategy with exponential backoff built into ClockActor
-    opts = [strategy: :one_for_one, name: ClockApp.Supervisor]
+    opts = [strategy: :one_for_one, name: TrackTagsApplication.Supervisor]
     Supervisor.start_link(children, opts)
   end
 end
-
-# Or start it directly from Gleam:
-# :application.start(:clock_app) :application.start(:clock_app)

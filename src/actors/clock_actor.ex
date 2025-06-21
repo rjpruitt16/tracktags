@@ -135,7 +135,7 @@ defmodule ClockActor do
     Enum.each(subscribers, fn pid ->
       # Check if process is still alive before sending
       if Process.alive?(pid) do
-        send(pid, tick_message)
+        send(pid, {:tick, tick_message})
         Logger.debug("[ClockActor] Sent #{tick_name} as map to #{inspect(pid)}")
       else
         Logger.debug("[ClockActor] Removing dead subscriber: #{inspect(pid)}")
