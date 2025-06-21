@@ -49,33 +49,13 @@ defmodule ClockActor do
   def handle_call({:subscribe, tick_name, subscriber}, _from, state) do
     Logger.info("[ClockActor] Subscribing to #{tick_name}")
 
-    # Handle both Gleam subjects and raw PIDs
-    pid =
-      case subscriber do
-        # Gleam subject
-        {:subject, pid, _ref} -> pid
-        # Raw PID
-        pid when is_pid(pid) -> pid
-      end
-
-    # Get existing subscribers for this tick
-    subscribers =
+    existing =
       case :ets.lookup(:tick_subscribers, tick_name) do
         [{^tick_name, subs}] -> subs
         [] -> []
       end
 
-    # Add new subscriber if not already present
-    updated_subscribers =
-      case Enum.member?(subscribers, pid) do
-        true -> subscribers
-        false -> [pid | subscribers]
-      end
-
-    # Update ETS table
-    :ets.insert(:tick_subscribers, {tick_name, updated_subscribers})
-
-    Logger.info("[ClockActor] Now #{length(updated_subscribers)} subscribers for #{tick_name}")
+    :ets.insert(:tick_subscribers, {tick_name, [subscriber | existing]})
     {:reply, :ok, state}
   end
 
@@ -117,37 +97,47 @@ defmodule ClockActor do
 
   def handle_info({:tick, tick_name}, state) do
     timestamp = DateTime.utc_now() |> DateTime.to_iso8601()
+    tick_message = %{"tick_type" => tick_name, "timestamp" => timestamp}
 
-    # Get subscribers for this tick
+    # Grab whatever is in ETS (no pruning)
     subscribers =
       case :ets.lookup(:tick_subscribers, tick_name) do
         [{^tick_name, subs}] -> subs
         [] -> []
       end
 
-    # Send tick to all subscribers as a MAP instead of tuple
-    # This is compatible with Gleam's dynamic decoder
-    tick_message = %{
-      "tick_type" => tick_name,
-      "timestamp" => timestamp
-    }
+    Logger.debug(
+      "[ClockActor] Broadcasting #{tick_name} to #{length(subscribers)} subs: #{inspect(subscribers)}"
+    )
 
-    Enum.each(subscribers, fn pid ->
-      # Check if process is still alive before sending
-      if Process.alive?(pid) do
-        send(pid, {:tick, tick_message})
-        Logger.debug("[ClockActor] Sent #{tick_name} as map to #{inspect(pid)}")
-      else
-        Logger.debug("[ClockActor] Removing dead subscriber: #{inspect(pid)}")
-        # Remove dead process from subscribers
-        updated_subs = List.delete(subscribers, pid)
-        :ets.insert(:tick_subscribers, {tick_name, updated_subs})
-      end
+    Enum.each(subscribers, fn
+      subject = {:subject, pid, _ref} ->
+        # Try both Gleam send and raw send so we can compare
+        Logger.debug(" → sending via gleam@erlang@process.send to subject #{inspect(subject)}")
+
+        try do
+          :gleam@erlang@process.send(subject, tick_message)
+        rescue
+          e -> Logger.error("   gleam send failed: #{inspect(e)}")
+        end
+
+        Logger.debug(" → sending via raw send to pid #{inspect(pid)}")
+
+        try do
+          send(pid, tick_message)
+        rescue
+          e -> Logger.error("   raw send failed: #{inspect(e)}")
+        end
+
+      pid when is_pid(pid) ->
+        Logger.debug(" → sending raw to pid #{inspect(pid)}")
+
+        try do
+          send(pid, tick_message)
+        rescue
+          e -> Logger.error("   raw send failed: #{inspect(e)}")
+        end
     end)
-
-    if length(subscribers) > 0 do
-      Logger.debug("[ClockActor] Sent #{tick_name} to #{length(subscribers)} subscribers")
-    end
 
     {:noreply, state}
   end
