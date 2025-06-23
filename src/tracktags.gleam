@@ -1,118 +1,80 @@
-import erlang_interop
+import actors/application
+import actors/metric_actor
+import actors/user_actor
+import envoy
+import gleam/dict
+import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/io
+import gleam/option.{None, Some}
+import gleam/otp/actor
+import gleam/string
 
-// External functions to interact with ClockActor
-// Now we pass raw PIDs instead of Subjects
-@external(erlang, "Elixir.ClockActor", "subscribe")
-fn subscribe_raw(tick_name: String, pid: process.Pid) -> atom.Atom
-
-@external(erlang, "Elixir.ClockActor", "unsubscribe")
-fn unsubscribe_raw(tick_name: String, pid: process.Pid) -> atom.Atom
-
-@external(erlang, "Elixir.ClockApp", "start")
-fn start_clock_app() -> Result(atom.Atom, String)
-
-// Wrapper functions that use the current process PID
-fn subscribe(tick_name: String) -> atom.Atom {
-  subscribe_raw(tick_name, erlang_interop.self())
+pub fn get_env_or(key: String, default: String) -> String {
+  option.unwrap(
+    case envoy.get(key) {
+      Ok(val) -> Some(val)
+      Error(_) -> None
+    },
+    default,
+  )
 }
 
-fn unsubscribe(tick_name: String) -> atom.Atom {
-  unsubscribe_raw(tick_name, erlang_interop.self())
-}
-
-// Function that runs in the listener process
-fn listener_process(parent: process.Subject(Nil)) {
-  io.println("🎯 Subscribing to ticks...")
-
-  let result1 = subscribe("tick_1s")
-  io.println("tick_1s subscription: " <> atom.to_string(result1))
-
-  let result2 = subscribe("tick_5s")
-  io.println("tick_5s subscription: " <> atom.to_string(result2))
-
-  io.println("👂 Listening for 30 seconds...")
-
-  // Listen for 30 seconds
-  listen_with_timeout(30_000)
-
-  io.println("🛑 Unsubscribing...")
-  let _ = unsubscribe("tick_1s")
-  let _ = unsubscribe("tick_5s")
-
-  // Notify parent we're done
-  process.send(parent, Nil)
-}
-
-@external(erlang, "erlang", "system_time")
-fn system_time(unit: atom.Atom) -> Int
-
-fn current_time_ms() -> Int {
-  system_time(atom.create_from_string("millisecond"))
-}
-
-fn listen_with_timeout(timeout_ms: Int) {
-  let start = current_time_ms()
-  listen_until(start + timeout_ms)
-}
-
-fn listen_until(end_time: Int) {
-  case current_time_ms() > end_time {
-    True -> {
-      io.println("⏱️ Timeout reached")
-      Nil
-    }
-    False -> {
-      case erlang_interop.receive_message(5000) {
-        Ok(message) -> {
-          case message {
-            erlang_interop.TimestampMessage(name, timestamp) -> {
-              case name {
-                "tick_1s" -> io.println("🟢 1s tick: " <> timestamp)
-                "tick_5s" -> io.println("🔵 5s tick: " <> timestamp)
-                "tick_30s" -> io.println("🟣 30s tick: " <> timestamp)
-                _ -> io.println("❓ Unknown: " <> name)
-              }
-            }
-            _ -> io.println("📦 Other message received")
-          }
-          listen_until(end_time)
-        }
-        Error(_) -> {
-          io.println("⏰ No message timeout")
-          listen_until(end_time)
-        }
-      }
-    }
-  }
-}
-
+// In your main function or test
 pub fn main() {
-  io.println("🚀 Starting Clock Actor Test (MVP)")
+  // Get the Clockwork SSE URL from environment or use default
+  let clockwork_url =
+    get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
+  io.println("[Main] Using Clockwork URL: " <> clockwork_url)
 
-  // Start ClockApp
-  io.println("📡 Starting ClockApp...")
-  case start_clock_app() {
-    Ok(_) -> io.println("✅ ClockApp started")
-    Error(e) -> {
-      io.println("❌ Failed: " <> e)
-      panic
+  // Create a test metric actor state
+  let test_metric =
+    metric_actor.Metric(
+      account_id: "test_account_123",
+      metric_name: "api_calls",
+      value: 0.0,
+      tags: dict.new(),
+      timestamp: current_timestamp(),
+    )
+
+  let metric_state =
+    metric_actor.State(
+      default_metric: test_metric,
+      current_metric: test_metric,
+      tick_type: "tick_1s",
+    )
+
+  // Create user actor state - starts with empty metric_actors dict
+  // The supervisor will handle starting the actual actors
+  let user_state =
+    user_actor.State(metric_actors: dict.new(), account_id: "test_account_123")
+
+  // Start the whole application with the test state and SSE URL
+  case
+    application.start_app(
+      dict.new() |> dict.insert(user_state, [metric_state]),
+      clockwork_url,
+    )
+  {
+    Ok(actor) -> {
+      io.println(
+        "[Main] App started, waiting a bit then sending test messages...",
+      )
+      process.sleep(2000)
+      // Wait 2 seconds
+      // TODO: Send some test messages to user actor
+      io.println("[Main] Would send test messages here")
     }
+    Error(e) -> io.println("[Main] Failed to start: " <> string.inspect(e))
   }
 
-  process.sleep(1000)
+  process.sleep_forever()
+}
 
-  // Create subject for completion notification
-  let done = process.new_subject()
+@external(erlang, "os", "system_time")
+fn system_time() -> Int
 
-  // Start listener process
-  process.start(fn() { listener_process(done) }, False)
-
-  // Wait for completion
-  case process.receive(done, 35_000) {
-    Ok(_) -> io.println("✅ Test completed")
-    Error(_) -> io.println("⚠️ Test timeout")
-  }
+fn current_timestamp() -> Int {
+  system_time() / 1_000_000_000
 }
