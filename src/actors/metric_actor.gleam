@@ -36,6 +36,16 @@ pub type State {
   State(default_metric: Metric, current_metric: Metric, tick_type: String)
 }
 
+pub fn send_tick(
+  subject: process.Subject(Message),
+  tick_type: String,
+  timestamp: String,
+) -> Nil {
+  let tick_map =
+    dict.from_list([#("tick_type", tick_type), #("timestamp", timestamp)])
+  process.send(subject, Tick(tick_map))
+}
+
 // Decode a %{"tick_type" => t, "timestamp" => ts} map
 fn decode_tick_map(
   tick_map: Dict(String, String),
@@ -119,6 +129,14 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
 fn flush_metrics(state: State) -> actor.Next(State, Message) {
   actor.continue(State(..state, current_metric: state.default_metric))
+}
+
+pub fn start_direct(
+  initial: State,
+) -> Result(actor.Started(process.Subject(Message)), actor.StartError) {
+  actor.new(initial)
+  |> actor.on_message(handle_message)
+  |> actor.start
 }
 
 @external(erlang, "os", "system_time")
