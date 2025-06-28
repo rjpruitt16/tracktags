@@ -1,55 +1,113 @@
+// In src/actors/application.gleam - Dynamic user spawning
 import actors/metric_actor
 import actors/user_actor.{type State}
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/otp/static_supervisor
 import gleam/string
+import glixir
+import logging
 
 // External function to start Elixir application with URL
 @external(erlang, "Elixir.TrackTagsApplication", "start")
 fn start_elixir_application(url: String) -> dynamic.Dynamic
 
-fn build_user_loop(
-  build: static_supervisor.Builder,
-  user_states: dict.Dict(user_actor.State, List(metric_actor.State)),
-) -> static_supervisor.Builder {
-  io.println("[Application] build_metric_loop called with ")
-  dict.to_list(user_states)
-  |> list.fold(build, fn(build, user_to_metrics) {
-    let #(user_state, metric_states) = user_to_metrics
-    static_supervisor.add(build, user_actor.start(user_state, metric_states))
-  })
+// Helper function to spawn a test user
+fn spawn_test_user(
+  supervisor: glixir.Supervisor,
+  account_id: String,
+) -> Result(Nil, String) {
+  logging.log(logging.Debug, "[Application] Spawning test user: " <> account_id)
+
+  let user_spec = user_actor.start(account_id)
+  case glixir.start_child(supervisor, user_spec) {
+    Ok(_child_pid) -> {
+      logging.log(
+        logging.Info,
+        "[Application] ✅ Test user spawned: " <> account_id,
+      )
+      Ok(Nil)
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[Application] ❌ Failed to spawn user: " <> error,
+      )
+      Error("Failed to spawn user " <> account_id <> ": " <> error)
+    }
+  }
+}
+
+// Helper function to spawn multiple test users
+fn spawn_test_users(supervisor: glixir.Supervisor) -> Result(Nil, String) {
+  let test_users = ["test_user_001", "test_user_002", "test_user_003"]
+
+  logging.log(
+    logging.Info,
+    "[Application] Spawning "
+      <> int.to_string(list.length(test_users))
+      <> " test users",
+  )
+
+  test_users
+  |> list.try_each(fn(account_id) { spawn_test_user(supervisor, account_id) })
 }
 
 pub fn start_app(
   users_to_metrics: dict.Dict(user_actor.State, List(metric_actor.State)),
   sse_url: String,
 ) {
-  io.println(
+  logging.log(
+    logging.Debug,
     "[Application] Starting elixir application with SSE URL: " <> sse_url,
   )
   start_elixir_application(sse_url)
 
-  io.println(
-    "[Application] Building supervision tree with "
-    <> int.to_string(list.length(dict.to_list(users_to_metrics)))
-    <> " user states",
+  logging.log(
+    logging.Debug,
+    "[Application] Original user count from static data: "
+      <> int.to_string(list.length(dict.to_list(users_to_metrics))),
   )
 
-  let supervisor_result =
-    build_user_loop(
-      static_supervisor.new(static_supervisor.OneForOne),
-      users_to_metrics,
-    )
-    |> static_supervisor.start
+  // Start dynamic supervisor
+  let supervisor_result = case glixir.start_supervisor_simple() {
+    Ok(glixir_supervisor) -> {
+      logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
-  io.println(
-    "[Application] Supervisor start result: "
-    <> string.inspect(supervisor_result),
+      // Spawn test users to verify dynamic spawning works
+      case spawn_test_users(glixir_supervisor) {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[Application] ✅ All test users spawned successfully",
+          )
+          Ok(glixir_supervisor)
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[Application] ❌ Test user spawning failed: " <> error,
+          )
+          // Continue anyway - the supervisor is working, just user spawning failed
+          Ok(glixir_supervisor)
+        }
+      }
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
+      )
+      Error("Failed to start supervisor: " <> string.inspect(error))
+    }
+  }
+
+  logging.log(
+    logging.Debug,
+    "[Application] Final supervisor result: "
+      <> string.inspect(supervisor_result),
   )
-
   supervisor_result
 }

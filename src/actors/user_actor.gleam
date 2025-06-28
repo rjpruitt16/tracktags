@@ -1,5 +1,7 @@
 import actors/metric_actor.{type Metric, State}
 import gleam/dict.{type Dict}
+import gleam/dynamic
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/io
 import gleam/list
@@ -7,10 +9,14 @@ import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision.{type ChildSpecification}
+import gleam/result
 import gleam/string
+import glixir
+import glixir/supervisor
 
 // TODO: - Gleam OTP library does not have dynamic supervisor
 // so convert when available
+
 pub type Message {
   RecordMetric(metric_id: String, metric: metric_actor.Metric)
   GetMetricActor(
@@ -40,12 +46,11 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         }
         Error(_) -> {
           io.println("[User] No metric actor for metric_id: " <> metric_id)
-          // TODO: Create metric actor on demand
+          // TODO: Create metric actor on demand (Phase 2)
           actor.continue(state)
         }
       }
     }
-
     GetMetricActor(account_id, reply_with) -> {
       let result =
         dict.get(state.metric_actors, account_id)
@@ -59,7 +64,35 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   }
 }
 
-pub fn start(
+// NEW: start_link function for bridge to call
+pub fn start_link(
+  account_id: String,
+) -> Result(process.Subject(Message), actor.StartError) {
+  io.println("[UserActor] start_link called for account_id: " <> account_id)
+
+  let state = State(metric_actors: dict.new(), account_id: account_id)
+
+  actor.new(state)
+  |> actor.on_message(handle_message)
+  |> actor.start
+  |> result.map(fn(started) { started.data })
+}
+
+// UPDATED: Now returns glixir.SimpleChildSpec instead of supervision.ChildSpecification
+pub fn start(account_id: String) -> glixir.SimpleChildSpec {
+  supervisor.SimpleChildSpec(
+    id: "user_" <> account_id,
+    start_module: atom.create("Elixir.UserActorBridge"),
+    start_function: atom.create("start_link"),
+    start_args: [dynamic.string(account_id)],
+    restart: glixir.permanent,
+    shutdown_timeout: 5000,
+    child_type: glixir.worker,
+  )
+}
+
+// KEEP OLD VERSION for backward compatibility during transition
+pub fn start_old(
   state: State,
   metric_states: List(metric_actor.State),
 ) -> supervision.ChildSpecification(process.Subject(Message)) {
@@ -68,14 +101,12 @@ pub fn start(
     echo metric_states
     let possible =
       actor.new(state) |> actor.on_message(handle_message) |> actor.start
-
     let supervisor = static_supervisor.new(static_supervisor.OneForOne)
     let _ =
       list.fold(metric_states, supervisor, fn(build, state) {
         static_supervisor.add(build, metric_actor.start(state))
       })
       |> static_supervisor.start
-
     possible
   })
 }

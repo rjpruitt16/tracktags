@@ -306,4 +306,3 @@ defmodule ClockActor do
     end)
   end
 end
-
