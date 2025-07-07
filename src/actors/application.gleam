@@ -1,64 +1,171 @@
-// In src/actors/application.gleam - Dynamic user spawning
+// Refactored application.gleam - Clean and stateless with lookup pattern
 import actors/metric_actor
-import actors/user_actor.{type State}
-import gleam/dict.{type Dict}
+import actors/user_actor
+import gleam/dict
 import gleam/dynamic
-import gleam/int
-import gleam/list
-import gleam/otp/static_supervisor
+import gleam/erlang/process
+import gleam/otp/actor
+import gleam/result
 import gleam/string
 import glixir
 import logging
+
+// Simplified application messages - removed GetOrSpawnUser since we use direct lookup
+pub type ApplicationMessage {
+  SendMetricToUser(
+    account_id: String,
+    metric_name: String,
+    value: Float,
+    tick_type: String,
+  )
+  Shutdown
+}
+
+// Simplified state - just need the supervisor, no user tracking
+pub type ApplicationState {
+  ApplicationState(supervisor: glixir.Supervisor)
+}
 
 // External function to start Elixir application with URL
 @external(erlang, "Elixir.TrackTagsApplication", "start")
 fn start_elixir_application(url: String) -> dynamic.Dynamic
 
-// Helper function to spawn a test user
-fn spawn_test_user(
+// Helper function to get or spawn a user using lookup pattern
+fn get_or_spawn_user(
   supervisor: glixir.Supervisor,
   account_id: String,
-) -> Result(Nil, String) {
-  logging.log(logging.Debug, "[Application] Spawning test user: " <> account_id)
-
-  let user_spec = user_actor.start(account_id)
-  case glixir.start_child(supervisor, user_spec) {
-    Ok(_child_pid) -> {
+) -> Result(process.Subject(user_actor.Message), String) {
+  // First try to find existing user
+  case user_actor.lookup_user_subject(account_id) {
+    Ok(user_subject) -> {
       logging.log(
-        logging.Info,
-        "[Application] ✅ Test user spawned: " <> account_id,
+        logging.Debug,
+        "[Application] ✅ Found existing user: " <> account_id,
       )
-      Ok(Nil)
+      Ok(user_subject)
     }
-    Error(error) -> {
+    Error(_) -> {
+      // Need to spawn new user
       logging.log(
-        logging.Error,
-        "[Application] ❌ Failed to spawn user: " <> error,
+        logging.Debug,
+        "[Application] Spawning new user: " <> account_id,
       )
-      Error("Failed to spawn user " <> account_id <> ": " <> error)
+
+      let user_spec = user_actor.start(account_id)
+      case glixir.start_child(supervisor, user_spec) {
+        Ok(_child_pid) -> {
+          logging.log(
+            logging.Info,
+            "[Application] ✅ User spawned: " <> account_id,
+          )
+
+          // Give it a moment to register, then look it up
+          process.sleep(50)
+          case user_actor.lookup_user_subject(account_id) {
+            Ok(user_subject) -> {
+              logging.log(
+                logging.Info,
+                "[Application] ✅ Found newly spawned user: " <> account_id,
+              )
+              Ok(user_subject)
+            }
+            Error(_) -> {
+              let error_msg =
+                "User spawned but not found in registry: " <> account_id
+              logging.log(logging.Error, "[Application] ❌ " <> error_msg)
+              Error(error_msg)
+            }
+          }
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[Application] ❌ Failed to spawn user: " <> error,
+          )
+          Error("Failed to spawn user " <> account_id <> ": " <> error)
+        }
+      }
     }
   }
 }
 
-// Helper function to spawn multiple test users
-fn spawn_test_users(supervisor: glixir.Supervisor) -> Result(Nil, String) {
-  let test_users = ["test_user_001", "test_user_002", "test_user_003"]
-
+// Simplified application actor message handler
+fn handle_application_message(
+  state: ApplicationState,
+  message: ApplicationMessage,
+) -> actor.Next(ApplicationState, ApplicationMessage) {
   logging.log(
     logging.Info,
-    "[Application] Spawning "
-      <> int.to_string(list.length(test_users))
-      <> " test users",
+    "[ApplicationActor] Received message: " <> string.inspect(message),
   )
 
-  test_users
-  |> list.try_each(fn(account_id) { spawn_test_user(supervisor, account_id) })
+  case message {
+    SendMetricToUser(account_id, metric_name, value, tick_type) -> {
+      logging.log(
+        logging.Info,
+        "[ApplicationActor] Sending metric "
+          <> metric_name
+          <> " to user "
+          <> account_id,
+      )
+
+      // Get or spawn the user
+      case get_or_spawn_user(state.supervisor, account_id) {
+        Ok(user_subject) -> {
+          // Create the metric
+          let test_metric =
+            metric_actor.Metric(
+              account_id: account_id,
+              metric_name: metric_name,
+              value: value,
+              tags: dict.new(),
+              timestamp: current_timestamp(),
+            )
+
+          // Send RecordMetric to the user actor
+          process.send(
+            user_subject,
+            user_actor.RecordMetric(metric_name, test_metric, value, tick_type),
+          )
+          logging.log(
+            logging.Info,
+            "[ApplicationActor] ✅ Sent RecordMetric to user " <> account_id,
+          )
+
+          actor.continue(state)
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[ApplicationActor] Failed to get user for metric: " <> error,
+          )
+          actor.continue(state)
+        }
+      }
+    }
+
+    Shutdown -> {
+      logging.log(logging.Info, "[ApplicationActor] Shutting down")
+      actor.stop()
+    }
+  }
+}
+
+// Start application actor that manages the supervisor
+pub fn start_application_actor(
+  supervisor: glixir.Supervisor,
+) -> Result(process.Subject(ApplicationMessage), actor.StartError) {
+  let initial_state = ApplicationState(supervisor: supervisor)
+
+  actor.new(initial_state)
+  |> actor.on_message(handle_application_message)
+  |> actor.start
+  |> result.map(fn(started) { started.data })
 }
 
 pub fn start_app(
-  users_to_metrics: dict.Dict(user_actor.State, List(metric_actor.State)),
   sse_url: String,
-) {
+) -> Result(process.Subject(ApplicationMessage), String) {
   logging.log(
     logging.Debug,
     "[Application] Starting elixir application with SSE URL: " <> sse_url,
@@ -67,31 +174,29 @@ pub fn start_app(
 
   logging.log(
     logging.Debug,
-    "[Application] Original user count from static data: "
-      <> int.to_string(list.length(dict.to_list(users_to_metrics))),
+    "[Application] Starting dynamic user spawning test",
   )
+  // ADD THIS LINE HERE:
+  let assert Ok(_) = glixir.start_registry("tracktags_actors")
+  logging.log(logging.Info, "[Application] ✅ Registry started")
 
   // Start dynamic supervisor
-  let supervisor_result = case glixir.start_supervisor_simple() {
+  case glixir.start_supervisor_simple() {
     Ok(glixir_supervisor) -> {
       logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
-      // Spawn test users to verify dynamic spawning works
-      case spawn_test_users(glixir_supervisor) {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[Application] ✅ All test users spawned successfully",
-          )
-          Ok(glixir_supervisor)
+      // Start application actor to manage state
+      case start_application_actor(glixir_supervisor) {
+        Ok(app_actor) -> {
+          logging.log(logging.Info, "[Application] ✅ Application actor started")
+          Ok(app_actor)
         }
-        Error(error) -> {
+        Error(_error) -> {
           logging.log(
             logging.Error,
-            "[Application] ❌ Test user spawning failed: " <> error,
+            "[Application] ❌ Failed to start application actor",
           )
-          // Continue anyway - the supervisor is working, just user spawning failed
-          Ok(glixir_supervisor)
+          Error("Failed to start application actor")
         }
       }
     }
@@ -103,11 +208,11 @@ pub fn start_app(
       Error("Failed to start supervisor: " <> string.inspect(error))
     }
   }
+}
 
-  logging.log(
-    logging.Debug,
-    "[Application] Final supervisor result: "
-      <> string.inspect(supervisor_result),
-  )
-  supervisor_result
+@external(erlang, "os", "system_time")
+fn system_time() -> Int
+
+fn current_timestamp() -> Int {
+  system_time() / 1_000_000_000
 }

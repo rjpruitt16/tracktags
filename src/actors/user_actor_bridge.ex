@@ -19,4 +19,3 @@ defmodule UserActorBridge do
     end
   end
 end
-

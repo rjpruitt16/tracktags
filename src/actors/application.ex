@@ -25,4 +25,3 @@ defmodule TrackTagsApplication do
     end
   end
 end
-
