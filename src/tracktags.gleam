@@ -1,4 +1,5 @@
 import actors/application
+import actors/clock_actor
 import envoy
 import gleam/erlang/process
 import gleam/int

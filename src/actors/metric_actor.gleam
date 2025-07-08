@@ -68,12 +68,19 @@ fn decode_tick_map(
   Ok(#(tick_type, timestamp))
 }
 
-// FFI to your ClockActor.subscribe/2
-@external(erlang, "Elixir.ClockActor", "subscribe")
+// Use Gleam ClockActor instead of Elixir
+// TODO: Need ClockActor reference - for now just log
 fn subscribe_to_tick(
   tick_type: String,
   subscriber: process.Subject(Message),
-) -> Nil
+) -> Nil {
+  logging.log(
+    logging.Info,
+    "[MetricActor] Would subscribe to "
+      <> tick_type
+      <> " (ClockActor integration pending)",
+  )
+}
 
 // Helper to parse JSON tags (simple version for now)
 fn parse_tags_json(tags_json: String) -> Dict(String, String) {

@@ -1,4 +1,5 @@
 // Refactored application.gleam - Clean and stateless with lookup pattern
+import actors/clock_actor
 import actors/metric_actor
 import actors/user_actor
 import gleam/dict
@@ -24,24 +25,6 @@ pub type ApplicationMessage {
 // Simplified state - just need the supervisor, no user tracking
 pub type ApplicationState {
   ApplicationState(supervisor: glixir.Supervisor)
-}
-
-// External function to start Elixir application with URL - returns a Result
-@external(erlang, "Elixir.TrackTagsApplication", "start")
-fn start_elixir_application_raw(url: String) -> dynamic.Dynamic
-
-// Wrapper to handle the Elixir return value properly
-fn start_elixir_application(url: String) -> Result(dynamic.Dynamic, String) {
-  let result = start_elixir_application_raw(url)
-
-  // The Elixir function returns {:ok, pid} or {:error, reason}
-  // We just need it to succeed, we don't need the pid
-  case result {
-    _ -> {
-      logging.log(logging.Info, "[Application] ✅ Elixir application started")
-      Ok(result)
-    }
-  }
 }
 
 // Helper function to get or spawn a user using lookup pattern
@@ -177,30 +160,28 @@ pub fn start_application_actor(
   |> result.map(fn(started) { started.data })
 }
 
+// Update the start_app function
 pub fn start_app(
   sse_url: String,
 ) -> Result(process.Subject(ApplicationMessage), String) {
   logging.log(
     logging.Info,
-    "[TrackTagsApplication] Starting application with SSE URL: " <> sse_url,
+    "[Application] Starting TrackTags application with SSE URL: " <> sse_url,
   )
 
-  // Start the Elixir application first and handle the result properly
-  case start_elixir_application(sse_url) {
-    Ok(_) -> {
-      logging.log(logging.Info, "[Application] ✅ Elixir application started")
+  // Start the registry
+  let assert Ok(_) = glixir.start_registry("tracktags_actors")
+  logging.log(logging.Info, "[Application] ✅ Registry started")
 
-      // Start the registry
-      let assert Ok(_) = glixir.start_registry("tracktags_actors")
-      logging.log(logging.Info, "[Application] ✅ Registry started")
+  // Start dynamic supervisor
+  case glixir.start_supervisor_simple() {
+    Ok(glixir_supervisor) -> {
+      logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
-      // Start dynamic supervisor
-      case glixir.start_supervisor_simple() {
-        Ok(glixir_supervisor) -> {
-          logging.log(
-            logging.Info,
-            "[Application] ✅ Dynamic supervisor started",
-          )
+      // Start ClockActor (pure Gleam version)
+      case clock_actor.start(sse_url) {
+        Ok(_clock_subject) -> {
+          logging.log(logging.Info, "[Application] ✅ ClockActor started")
 
           // Start application actor to manage state
           case start_application_actor(glixir_supervisor) {
@@ -220,21 +201,21 @@ pub fn start_app(
             }
           }
         }
-        Error(error) -> {
+        Error(e) -> {
           logging.log(
             logging.Error,
-            "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
+            "[Application] ❌ Failed to start ClockActor: " <> string.inspect(e),
           )
-          Error("Failed to start supervisor: " <> string.inspect(error))
+          Error("Failed to start ClockActor")
         }
       }
     }
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[Application] ❌ Failed to start Elixir application: " <> error,
+        "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
       )
-      Error("Failed to start Elixir application: " <> error)
+      Error("Failed to start supervisor: " <> string.inspect(error))
     }
   }
 }
