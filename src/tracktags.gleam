@@ -1,13 +1,15 @@
 import actors/application
-import actors/metric_actor
-import actors/user_actor
 import envoy
-import gleam/dict
 import gleam/erlang/process
+import gleam/int
 import gleam/io
-import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
+import logging
+import mist
+import web/router
+import wisp
+import wisp/wisp_mist
 
 pub fn get_env_or(key: String, default: String) -> String {
   option.unwrap(
@@ -19,65 +21,73 @@ pub fn get_env_or(key: String, default: String) -> String {
   )
 }
 
-// Helper to spawn user and send metric  
-fn test_user_and_metric(
-  app_actor: process.Subject(application.ApplicationMessage),
-  account_id: String,
-  metric_name: String,
-  value: Float,
-) -> Nil {
-  io.println(
-    "[Main] 🚀 Testing user: " <> account_id <> " with metric: " <> metric_name,
-  )
-
-  // Send SendMetricToUser - this will spawn user if needed AND send the metric
-  io.println(
-    "[Main] 📤 Sending SendMetricToUser for: "
-    <> account_id
-    <> "/"
-    <> metric_name,
-  )
-  process.send(
-    app_actor,
-    application.SendMetricToUser(account_id, metric_name, value, "tick_1s"),
-  )
-
-  io.println("[Main] ✅ Sent complete metric request for " <> account_id)
-}
-
-@external(erlang, "os", "system_time")
-fn system_time() -> Int
-
-fn current_timestamp() -> Int {
-  system_time() / 1_000_000_000
-}
-
 pub fn main() {
-  // Get the Clockwork SSE URL from environment or use default
+  // Configure logging
+  logging.configure()
+
+  // Get configuration from environment
   let clockwork_url =
     get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
+  let port = 8080
+
+  io.println("[Main] 🚀 Starting TrackTags")
   io.println("[Main] Using Clockwork URL: " <> clockwork_url)
+  io.println("[Main] API will be available on port: " <> int.to_string(port))
 
-  // Start the whole application 
+  // Start the TrackTags application (actors, registry, etc.)
   case application.start_app(clockwork_url) {
-    Ok(app_actor) -> {
-      io.println("[Main] ✅ App started successfully!")
+    Ok(_app_actor) -> {
+      logging.log(
+        logging.Info,
+        "[Main] ✅ TrackTags application started successfully!",
+      )
 
-      process.sleep(1000)
-      // Wait for setup
+      // Configure Wisp
+      wisp.configure_logger()
+      let secret_key_base = wisp.random_string(64)
 
-      io.println("[Main] 🧪 Starting user and metric tests...")
+      // Create the Wisp handler for Mist using wisp_mist submodule
+      let handler = wisp_mist.handler(router.handle_request, secret_key_base)
 
-      // Test 3 users with different metrics
-      test_user_and_metric(app_actor, "test_user_001", "api_calls", 42.0)
-      test_user_and_metric(app_actor, "test_user_002", "cpu_usage", 75.5)
-      test_user_and_metric(app_actor, "test_user_003", "memory_usage", 85.2)
+      // Start the web server
+      let assert Ok(_) =
+        handler
+        |> mist.new
+        |> mist.port(port)
+        |> mist.start
 
-      io.println("[Main] ✅ All tests complete - check for subscribers!")
-      process.sleep(5000)
+      logging.log(logging.Info, "[Main] ✅ Web server started successfully!")
+
+      io.println("")
+      io.println("🎉 TrackTags is running!")
+      io.println(
+        "📡 Metrics API: http://localhost:"
+        <> int.to_string(port)
+        <> "/api/v1/metrics",
+      )
+      io.println(
+        "❤️  Health Check: http://localhost:" <> int.to_string(port) <> "/health",
+      )
+      io.println("")
+      io.println("📖 Test with curl:")
+      io.println(
+        "curl -X POST http://localhost:"
+        <> int.to_string(port)
+        <> "/api/v1/metrics \\",
+      )
+      io.println("  -H \"Authorization: Bearer tk_live_test123\" \\")
+      io.println("  -H \"Content-Type: application/json\" \\")
+      io.println("  -d '{\"metric_name\": \"api_calls\", \"value\": 1.0}'")
+      io.println("")
+
+      process.sleep_forever()
     }
-    Error(e) -> io.println("[Main] Failed to start: " <> string.inspect(e))
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[Main] ❌ Failed to start application: " <> string.inspect(e),
+      )
+      io.println("[Main] Failed to start: " <> string.inspect(e))
+    }
   }
-
-  process.sleep_forever()
 }

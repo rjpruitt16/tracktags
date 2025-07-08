@@ -26,9 +26,23 @@ pub type ApplicationState {
   ApplicationState(supervisor: glixir.Supervisor)
 }
 
-// External function to start Elixir application with URL
+// External function to start Elixir application with URL - returns a Result
 @external(erlang, "Elixir.TrackTagsApplication", "start")
-fn start_elixir_application(url: String) -> dynamic.Dynamic
+fn start_elixir_application_raw(url: String) -> dynamic.Dynamic
+
+// Wrapper to handle the Elixir return value properly
+fn start_elixir_application(url: String) -> Result(dynamic.Dynamic, String) {
+  let result = start_elixir_application_raw(url)
+
+  // The Elixir function returns {:ok, pid} or {:error, reason}
+  // We just need it to succeed, we don't need the pid
+  case result {
+    _ -> {
+      logging.log(logging.Info, "[Application] ✅ Elixir application started")
+      Ok(result)
+    }
+  }
+}
 
 // Helper function to get or spawn a user using lookup pattern
 fn get_or_spawn_user(
@@ -167,45 +181,60 @@ pub fn start_app(
   sse_url: String,
 ) -> Result(process.Subject(ApplicationMessage), String) {
   logging.log(
-    logging.Debug,
-    "[Application] Starting elixir application with SSE URL: " <> sse_url,
+    logging.Info,
+    "[TrackTagsApplication] Starting application with SSE URL: " <> sse_url,
   )
-  start_elixir_application(sse_url)
 
-  logging.log(
-    logging.Debug,
-    "[Application] Starting dynamic user spawning test",
-  )
-  // ADD THIS LINE HERE:
-  let assert Ok(_) = glixir.start_registry("tracktags_actors")
-  logging.log(logging.Info, "[Application] ✅ Registry started")
+  // Start the Elixir application first and handle the result properly
+  case start_elixir_application(sse_url) {
+    Ok(_) -> {
+      logging.log(logging.Info, "[Application] ✅ Elixir application started")
 
-  // Start dynamic supervisor
-  case glixir.start_supervisor_simple() {
-    Ok(glixir_supervisor) -> {
-      logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
+      // Start the registry
+      let assert Ok(_) = glixir.start_registry("tracktags_actors")
+      logging.log(logging.Info, "[Application] ✅ Registry started")
 
-      // Start application actor to manage state
-      case start_application_actor(glixir_supervisor) {
-        Ok(app_actor) -> {
-          logging.log(logging.Info, "[Application] ✅ Application actor started")
-          Ok(app_actor)
+      // Start dynamic supervisor
+      case glixir.start_supervisor_simple() {
+        Ok(glixir_supervisor) -> {
+          logging.log(
+            logging.Info,
+            "[Application] ✅ Dynamic supervisor started",
+          )
+
+          // Start application actor to manage state
+          case start_application_actor(glixir_supervisor) {
+            Ok(app_actor) -> {
+              logging.log(
+                logging.Info,
+                "[Application] ✅ Application actor started",
+              )
+              Ok(app_actor)
+            }
+            Error(_error) -> {
+              logging.log(
+                logging.Error,
+                "[Application] ❌ Failed to start application actor",
+              )
+              Error("Failed to start application actor")
+            }
+          }
         }
-        Error(_error) -> {
+        Error(error) -> {
           logging.log(
             logging.Error,
-            "[Application] ❌ Failed to start application actor",
+            "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
           )
-          Error("Failed to start application actor")
+          Error("Failed to start supervisor: " <> string.inspect(error))
         }
       }
     }
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
+        "[Application] ❌ Failed to start Elixir application: " <> error,
       )
-      Error("Failed to start supervisor: " <> string.inspect(error))
+      Error("Failed to start Elixir application: " <> error)
     }
   }
 }
