@@ -1,295 +1,315 @@
-// Pure Gleam ClockActor - SSE client for tick events using PubSub
-import actors/metric_actor
+// src/actors/clock_actor.gleam - Enhanced with debug logging
+import clients/clockwork_client
 import gleam/dynamic
+import gleam/erlang/atom
 import gleam/erlang/process
-import gleam/list
+import gleam/int
+import gleam/json
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
 import logging
 
-// Messages that the ClockActor can receive
+// ───────────── Messages ─────────────
 pub type Message {
-  Subscribe(
-    tick_name: String,
-    subscriber: process.Subject(metric_actor.Message),
-  )
-  Unsubscribe(
-    tick_name: String,
-    subscriber: process.Subject(metric_actor.Message),
-  )
-  GetStatus
-  SseEvent(event_data: String)
-  SseConnected
+  TickEvent(tick_name: String, timestamp: String)
   SseClosed(reason: String)
   RetryConnect
-  Shutdown
+  StoreSubject(subject: process.Subject(Message))
 }
 
-// ClockActor state
+// ───────────── State ─────────────
 pub type State {
   State(
     url: String,
-    pubsub_name: String,
-    sse_pid: process.Pid,
+    pubsub_name: atom.Atom,
     restart_count: Int,
-    status: String,
+    self_subject: Option(process.Subject(Message)),
   )
 }
 
-// Topic naming convention
-fn topic_for_tick(tick_name: String) -> String {
-  "tick:" <> tick_name
-}
+// ───────────────────────────────────────────────────────────────────────────────
+//  PUBLIC FFI  –  called from Elixir
+// ───────────────────────────────────────────────────────────────────────────────
+/// Elixir passes every parsed tick here.
+pub fn process_tick_event(tick: String, ts: String) -> Nil {
+  // 🔥 ADD THIS DEBUG LOG FIRST
+  logging.log(
+    logging.Info,
+    "[ClockActor] 🎯 RECEIVED TICK FFI CALL: " <> tick <> " at " <> ts,
+  )
 
-// Start SSE connection using HTTPoison (placeholder for now)
-fn start_sse_connection(
-  url: String,
-  self_subject: process.Subject(Message),
-) -> Nil {
-  logging.log(logging.Info, "[ClockActor] Starting SSE connection to: " <> url)
-
-  // For now, just simulate connection - we'll implement actual SSE later
-  process.send(self_subject, SseConnected)
-
-  // TODO: Implement actual HTTPoison streaming
-  Nil
-}
-
-// Parse SSE event data (simplified for now)
-fn parse_sse_event(event_data: String) -> Result(#(String, String), String) {
-  // Simple parsing - look for tick_1s events
-  case string.contains(event_data, "tick_1s") {
-    True -> Ok(#("tick_1s", "mock_timestamp"))
-    False -> Error("Unknown event type")
+  case
+    glixir.lookup_subject(
+      atom.create("tracktags_actors"),
+      atom.create("clock_actor"),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subj) -> {
+      logging.log(
+        logging.Info,
+        "[ClockActor] ✅ Found clock_actor subject, sending TickEvent",
+      )
+      process.send(subj, TickEvent(tick, ts))
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[ClockActor] ❌ Registry lookup failed: " <> string.inspect(err),
+      )
+      logging.log(
+        logging.Error,
+        "[ClockActor] ❌ clock_actor not found in registry",
+      )
+    }
   }
 }
 
-// Update the broadcast_tick function
-fn broadcast_tick(
-  pubsub_name: String,
-  tick_name: String,
-  timestamp: String,
-) -> Nil {
-  let topic = topic_for_tick(tick_name)
+/// Elixir calls this once the SSE loop ends/crashes.
+pub fn sse_closed(reason: String) -> Nil {
+  logging.log(logging.Info, "[ClockActor] 🔥 SSE CLOSED FFI CALL: " <> reason)
 
-  // Create a list of properties for the tick data
-  let tick_properties = [
-    #(dynamic.string("tick_name"), dynamic.string(tick_name)),
-    #(dynamic.string("timestamp"), dynamic.string(timestamp)),
-  ]
+  case
+    glixir.lookup_subject(
+      atom.create("tracktags_actors"),
+      atom.create("clock_actor"),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subj) -> {
+      logging.log(
+        logging.Info,
+        "[ClockActor] ✅ Found clock_actor subject, sending SseClosed",
+      )
+      process.send(subj, SseClosed(reason))
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[ClockActor] ❌ Registry lookup failed for SseClosed: "
+          <> string.inspect(err),
+      )
+    }
+  }
+}
 
-  let dynamic_message = dynamic.properties(tick_properties)
+// ───────────── Helpers ─────────────
+fn topic_for_tick(t: String) -> String {
+  "tick:" <> t
+}
+
+fn encode_tick_message(tick_data: #(String, String)) -> String {
+  let #(tick_name, timestamp) = tick_data
+  let json_result =
+    json.object([
+      #("tick_name", json.string(tick_name)),
+      #("timestamp", json.string(timestamp)),
+    ])
+    |> json.to_string
+
+  // 🔍 DEBUG: Let's see what we're actually creating
+  logging.log(
+    logging.Info,
+    "[ClockActor] 🔍 Encoded JSON: " <> string.inspect(json_result),
+  )
+
+  json_result
+}
+
+fn broadcast_tick(bus: atom.Atom, tick: String, ts: String) -> Nil {
+  logging.log(
+    logging.Info,
+    "[ClockActor] 📡 BROADCASTING TICK: "
+      <> tick
+      <> " on bus: "
+      <> atom.to_string(bus),
+  )
+
+  let tick_data = #(tick, ts)
+  let topic = topic_for_tick(tick)
+  let all_topic = topic_for_tick("all")
+
+  logging.log(logging.Info, "[ClockActor] 📡 Broadcasting to topic: " <> topic)
+
+  case glixir.pubsub_broadcast(bus, topic, tick_data, encode_tick_message) {
+    Ok(_) ->
+      logging.log(
+        logging.Info,
+        "[ClockActor] ✅ Broadcast successful: " <> topic,
+      )
+    Error(e) ->
+      logging.log(
+        logging.Error,
+        "[ClockActor] ❌ Broadcast failed: "
+          <> topic
+          <> " - "
+          <> string.inspect(e),
+      )
+  }
 
   logging.log(
     logging.Info,
-    "[ClockActor] Broadcasting " <> tick_name <> " on topic: " <> topic,
+    "[ClockActor] 📡 Broadcasting to all topic: " <> all_topic,
   )
-
-  case glixir.pubsub_broadcast(pubsub_name, topic, dynamic_message) {
-    Ok(_) -> {
-      logging.log(logging.Debug, "[ClockActor] ✅ Tick broadcast successfully")
-
-      // Also broadcast to "all" topic for subscribers listening to everything
-      case
-        glixir.pubsub_broadcast(
-          pubsub_name,
-          topic_for_tick("all"),
-          dynamic_message,
-        )
-      {
-        Ok(_) -> Nil
-        Error(e) -> {
-          logging.log(
-            logging.Warning,
-            "[ClockActor] Failed to broadcast to 'all' topic: "
-              <> string.inspect(e),
-          )
-          Nil
-        }
-      }
-    }
-    Error(e) -> {
+  case glixir.pubsub_broadcast(bus, all_topic, tick_data, encode_tick_message) {
+    Ok(_) ->
+      logging.log(
+        logging.Info,
+        "[ClockActor] ✅ Broadcast successful: " <> all_topic,
+      )
+    Error(e) ->
       logging.log(
         logging.Error,
-        "[ClockActor] Failed to broadcast tick: " <> string.inspect(e),
+        "[ClockActor] ❌ Broadcast failed: "
+          <> all_topic
+          <> " - "
+          <> string.inspect(e),
       )
-      Nil
+  }
+}
+
+fn start_sse(url: String, parent_pid: process.Pid) -> Nil {
+  logging.log(
+    logging.Info,
+    "[ClockActor] 🚀 Starting SSE connection to: " <> url,
+  )
+
+  // call the raw FFI; parent receives {:tick_event,…} via other FFI calls
+  case clockwork_client.start_sse_ffi(url, parent_pid) {
+    clockwork_client.SseStarted(_) -> {
+      logging.log(
+        logging.Info,
+        "[ClockActor] ✅ SSE worker started successfully",
+      )
+    }
+    clockwork_client.SseError(r) -> {
+      logging.log(logging.Error, "[ClockActor] ❌ SSE start error: " <> r)
     }
   }
 }
 
-// Handle ClockActor messages
-fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
-  case message {
-    Subscribe(tick_name, subscriber) -> {
-      logging.log(logging.Info, "[ClockActor] Subscribing to " <> tick_name)
-
-      // In PubSub pattern, the subscriber manages their own subscription
-      // We just need to tell them which topic to subscribe to
-      let topic = topic_for_tick(tick_name)
-
-      // The subscriber should call glixir.pubsub_subscribe(pubsub_name, topic)
-      // in their own process
+// ───────────── Handler ─────────────
+fn handle_message(st: State, msg: Message) -> actor.Next(State, Message) {
+  case msg {
+    TickEvent(t, ts) -> {
       logging.log(
         logging.Info,
-        "[ClockActor] Subscriber should listen to topic: " <> topic,
+        "[ClockActor] 🎯 PROCESSING TickEvent: " <> t <> " at " <> ts,
       )
-
-      actor.continue(state)
-    }
-
-    Unsubscribe(tick_name, _subscriber) -> {
-      logging.log(logging.Info, "[ClockActor] Unsubscribing from " <> tick_name)
-      // With PubSub, subscribers manage their own unsubscription
-      actor.continue(state)
-    }
-
-    GetStatus -> {
-      logging.log(logging.Info, "[ClockActor] Status: " <> state.status)
-      actor.continue(state)
-    }
-
-    SseEvent(event_data) -> {
-      logging.log(logging.Debug, "[ClockActor] SSE event: " <> event_data)
-      case parse_sse_event(event_data) {
-        Ok(#(tick_name, timestamp)) -> {
-          broadcast_tick(state.pubsub_name, tick_name, timestamp)
-        }
-        Error(_) -> Nil
-      }
-      actor.continue(state)
-    }
-
-    SseConnected -> {
-      logging.log(logging.Info, "[ClockActor] ✅ SSE Connected")
-      actor.continue(State(..state, status: "connected"))
+      broadcast_tick(st.pubsub_name, t, ts)
+      actor.continue(st)
     }
 
     SseClosed(reason) -> {
+      logging.log(logging.Warning, "[ClockActor] ⚠️  SSE closed: " <> reason)
       logging.log(
-        logging.Warning,
-        "[ClockActor] SSE connection closed: " <> reason,
+        logging.Info,
+        "[ClockActor] 🔄 Scheduling reconnection in 5 seconds",
       )
-      actor.continue(State(..state, status: "disconnected"))
+
+      let _ = process.send_after(process.new_subject(), 5000, RetryConnect)
+      actor.continue(st)
     }
 
     RetryConnect -> {
-      logging.log(logging.Info, "[ClockActor] Retrying SSE connection...")
-      actor.continue(State(..state, restart_count: state.restart_count + 1))
+      logging.log(
+        logging.Info,
+        "[ClockActor] 🔄 Re-connect attempt "
+          <> int.to_string(st.restart_count + 1),
+      )
+      start_sse(st.url, process.self())
+      actor.continue(State(..st, restart_count: st.restart_count + 1))
     }
 
-    Shutdown -> {
-      logging.log(logging.Info, "[ClockActor] Shutting down")
-      actor.stop()
+    StoreSubject(subject) -> {
+      logging.log(logging.Info, "[ClockActor] 📝 Storing self subject reference")
+      actor.continue(State(..st, self_subject: Some(subject)))
     }
   }
 }
 
-// Start the ClockActor
+// ───────────── Bootstrap ─────────────
 pub fn start(url: String) -> Result(process.Subject(Message), actor.StartError) {
-  logging.log(logging.Info, "[ClockActor] Starting with URL: " <> url)
+  logging.log(
+    logging.Info,
+    "[ClockActor] 🚀 Starting ClockActor with URL: " <> url,
+  )
 
-  // Start PubSub for clock events
-  let pubsub_name = "clock_events"
-  case glixir.start_pubsub(pubsub_name) {
-    Ok(_) -> {
-      logging.log(
-        logging.Info,
-        "[ClockActor] ✅ PubSub started: " <> pubsub_name,
-      )
+  let bus = atom.create("clock_events")
+  logging.log(
+    logging.Info,
+    "[ClockActor] 🚀 Starting PubSub bus: " <> atom.to_string(bus),
+  )
 
-      let initial_state =
-        State(
-          url: url,
-          pubsub_name: pubsub_name,
-          sse_pid: process.self(),
-          // placeholder
-          restart_count: 0,
-          status: "starting",
-        )
+  let assert Ok(_) = glixir.pubsub_start(bus)
+  logging.log(
+    logging.Info,
+    "[ClockActor] ✅ PubSub bus started: " <> atom.to_string(bus),
+  )
 
-      case
-        actor.new(initial_state)
-        |> actor.on_message(handle_message)
-        |> actor.start()
-      {
-        Ok(started) -> {
-          let subject = started.data
+  let init_state =
+    State(url: url, pubsub_name: bus, restart_count: 0, self_subject: None)
 
-          // Start SSE connection
-          start_sse_connection(url, subject)
-
-          Ok(subject)
-        }
-        Error(e) -> Error(e)
-      }
-    }
+  case
+    actor.new(init_state) |> actor.on_message(handle_message) |> actor.start()
+  {
     Error(e) -> {
       logging.log(
         logging.Error,
-        "[ClockActor] ❌ Failed to start PubSub: " <> string.inspect(e),
+        "[ClockActor] ❌ Failed to start actor: " <> string.inspect(e),
       )
-      Error(actor.InitFailed("Failed to start PubSub"))
+      Error(e)
     }
-  }
-}
 
-// Helper to get the PubSub name (for subscribers)
-pub fn get_pubsub_name() -> String {
-  "clock_events"
-}
+    Ok(started) -> {
+      let subj = started.data
+      logging.log(logging.Info, "[ClockActor] ✅ Actor started successfully")
 
-// Helper to get topic name for a tick type
-pub fn get_tick_topic(tick_name: String) -> String {
-  topic_for_tick(tick_name)
-}
-
-// Test function with real subscriber
-pub fn test_with_subscriber() -> Nil {
-  logging.log(
-    logging.Info,
-    "[ClockActor] Testing with PubSub subscriber pattern...",
-  )
-
-  case start("http://localhost:4000/events") {
-    Ok(clock_subject) -> {
-      logging.log(logging.Info, "[ClockActor] ✅ ClockActor started")
-
-      // In the real implementation, MetricActor would:
-      // 1. Call glixir.pubsub_subscribe(get_pubsub_name(), get_tick_topic("tick_1s"))
-      // 2. Listen for metric_actor.Tick messages in its own actor loop
-
-      // For testing, let's create a simple subscriber
-      let test_subscriber = process.new_subject()
-
-      // Subscribe to tick_1s events
+      // register so Elixir can FFI-call us
+      logging.log(
+        logging.Info,
+        "[ClockActor] 📝 Registering in registry as 'clock_actor'",
+      )
       case
-        glixir.pubsub_subscribe(get_pubsub_name(), get_tick_topic("tick_1s"))
+        glixir.register_subject(
+          atom.create("tracktags_actors"),
+          atom.create("clock_actor"),
+          subj,
+          glixir.atom_key_encoder,
+        )
       {
         Ok(_) -> {
           logging.log(
             logging.Info,
-            "[ClockActor] ✅ Subscribed to tick_1s topic",
+            "[ClockActor] ✅ Successfully registered in registry",
           )
-
-          // Send a test tick manually to verify the connection
-          process.send(clock_subject, SseEvent("test tick_1s event"))
-          logging.log(logging.Info, "[ClockActor] ✅ Sent test tick event")
         }
         Error(e) -> {
           logging.log(
             logging.Error,
-            "[ClockActor] ❌ Failed to subscribe: " <> string.inspect(e),
+            "[ClockActor] ❌ Failed to register in registry: "
+              <> string.inspect(e),
           )
         }
       }
-    }
-    Error(e) -> {
-      logging.log(
-        logging.Error,
-        "[ClockActor] ❌ Failed to start ClockActor: " <> string.inspect(e),
-      )
+
+      // spin up SSE worker (linked)
+      logging.log(logging.Info, "[ClockActor] 🚀 Starting SSE worker")
+      start_sse(url, process.self())
+
+      logging.log(logging.Info, "[ClockActor] 🎉 ClockActor fully initialized")
+      Ok(subj)
     }
   }
+}
+
+// Optional helpers for other modules
+pub fn get_pubsub_name() -> atom.Atom {
+  atom.create("clock_events")
+}
+
+pub fn get_tick_topic(tick: String) -> String {
+  topic_for_tick(tick)
 }

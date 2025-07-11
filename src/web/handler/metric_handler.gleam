@@ -1,6 +1,9 @@
+import actors/application
 import actors/metric_actor
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/erlang/atom
+import gleam/erlang/process
 import gleam/float
 import gleam/http
 import gleam/json
@@ -8,6 +11,7 @@ import gleam/list
 import gleam/option.{type Option}
 import gleam/result
 import gleam/string
+import glixir
 import logging
 import wisp.{type Request, type Response}
 
@@ -151,6 +155,23 @@ fn validate_metric_request(
   })
 }
 
+// Helper to get the application actor from registry
+fn get_application_actor() -> Result(
+  process.Subject(application.ApplicationMessage),
+  String,
+) {
+  case
+    glixir.lookup_subject(
+      atom.create("tracktags_actors"),
+      atom.create("application_actor"),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Application actor not found in registry")
+  }
+}
+
 // Main handler function
 pub fn create_metric(req: Request) -> Response {
   logging.log(logging.Info, "[MetricHandler] POST /api/v1/metrics")
@@ -234,40 +255,63 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
       <> req.metric_name,
   )
 
-  // Create metric object
-  let _metric =
-    metric_actor.Metric(
-      account_id: account_id,
-      metric_name: req.metric_name,
-      value: req.value,
-      tags: tags,
-      timestamp: current_timestamp(),
-    )
+  // 🔥 NEW: Send the metric to the application actor to spawn MetricActor!
+  case get_application_actor() {
+    Ok(app_actor) -> {
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🚀 Sending to application actor: "
+          <> req.metric_name
+          <> " with tick_type: "
+          <> tick_type,
+      )
 
-  // TODO: Get application actor reference and send message
-  // For now, we'll simulate success
+      // Send SendMetricToUser message to application actor
+      process.send(
+        app_actor,
+        application.SendMetricToUser(
+          account_id: account_id,
+          metric_name: req.metric_name,
+          value: req.value,
+          tick_type: tick_type,
+        ),
+      )
 
-  logging.log(
-    logging.Info,
-    "[MetricHandler] ✅ Metric processed: "
-      <> req.metric_name
-      <> " = "
-      <> float.to_string(req.value),
-  )
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Metric sent to application: "
+          <> req.metric_name
+          <> " = "
+          <> float.to_string(req.value),
+      )
 
-  // Return success response
-  let success_json =
-    json.object([
-      #("status", json.string("created")),
-      #("account_id", json.string(account_id)),
-      #("metric_name", json.string(req.metric_name)),
-      #("value", json.float(req.value)),
-      #("operation", json.string(operation)),
-      #("flush_interval", json.string(interval)),
-      #("tick_type", json.string(tick_type)),
-    ])
+      // Return success response
+      let success_json =
+        json.object([
+          #("status", json.string("created")),
+          #("account_id", json.string(account_id)),
+          #("metric_name", json.string(req.metric_name)),
+          #("value", json.float(req.value)),
+          #("operation", json.string(operation)),
+          #("flush_interval", json.string(interval)),
+          #("tick_type", json.string(tick_type)),
+        ])
 
-  wisp.json_response(json.to_string_tree(success_json), 201)
+      wisp.json_response(json.to_string_tree(success_json), 201)
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[MetricHandler] ❌ Failed to get application actor: " <> error,
+      )
+      let error_json =
+        json.object([
+          #("error", json.string("Internal Server Error")),
+          #("message", json.string("Failed to process metric")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
 }
 
 @external(erlang, "os", "system_time")

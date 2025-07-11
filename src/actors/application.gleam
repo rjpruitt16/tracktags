@@ -4,11 +4,13 @@ import actors/metric_actor
 import actors/user_actor
 import gleam/dict
 import gleam/dynamic
+import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/otp/actor
 import gleam/result
 import gleam/string
 import glixir
+import glixir/supervisor
 import logging
 
 // Simplified application messages - removed GetOrSpawnUser since we use direct lookup
@@ -22,14 +24,36 @@ pub type ApplicationMessage {
   Shutdown
 }
 
-// Simplified state - just need the supervisor, no user tracking
+// Simplified state - phantom-typed supervisor
 pub type ApplicationState {
-  ApplicationState(supervisor: glixir.Supervisor)
+  ApplicationState(
+    supervisor: glixir.DynamicSupervisor(
+      String,
+      process.Subject(user_actor.Message),
+    ),
+  )
+}
+
+// Encoder function for user actor arguments
+fn encode_user_args(account_id: String) -> List(dynamic.Dynamic) {
+  [dynamic.string(account_id)]
+}
+
+// Decoder function for user actor replies
+fn decode_user_reply(
+  reply: dynamic.Dynamic,
+) -> Result(process.Subject(user_actor.Message), String) {
+  // The bridge actually returns the subject directly
+  // For now, let's just assume success and use lookup instead
+  Ok(process.new_subject())
 }
 
 // Helper function to get or spawn a user using lookup pattern
 fn get_or_spawn_user(
-  supervisor: glixir.Supervisor,
+  supervisor: glixir.DynamicSupervisor(
+    String,
+    process.Subject(user_actor.Message),
+  ),
   account_id: String,
 ) -> Result(process.Subject(user_actor.Message), String) {
   // First try to find existing user
@@ -49,15 +73,26 @@ fn get_or_spawn_user(
       )
 
       let user_spec = user_actor.start(account_id)
-      case glixir.start_child(supervisor, user_spec) {
-        Ok(_child_pid) -> {
+      case
+        glixir.start_dynamic_child(
+          supervisor,
+          user_spec,
+          encode_user_args,
+          decode_user_reply,
+        )
+      {
+        supervisor.ChildStarted(child_pid, _reply) -> {
           logging.log(
             logging.Info,
-            "[Application] ✅ User spawned: " <> account_id,
+            "[Application] ✅ User spawned: "
+              <> account_id
+              <> " PID: "
+              <> string.inspect(child_pid),
           )
 
           // Give it a moment to register, then look it up
-          process.sleep(50)
+          process.sleep(100)
+          // Increased sleep time
           case user_actor.lookup_user_subject(account_id) {
             Ok(user_subject) -> {
               logging.log(
@@ -67,14 +102,32 @@ fn get_or_spawn_user(
               Ok(user_subject)
             }
             Error(_) -> {
-              let error_msg =
-                "User spawned but not found in registry: " <> account_id
-              logging.log(logging.Error, "[Application] ❌ " <> error_msg)
-              Error(error_msg)
+              logging.log(
+                logging.Warning,
+                "[Application] ⚠️ User spawned but not found in registry, trying again...",
+              )
+              // Try one more time after another brief pause
+              process.sleep(50)
+              case user_actor.lookup_user_subject(account_id) {
+                Ok(user_subject) -> {
+                  logging.log(
+                    logging.Info,
+                    "[Application] ✅ Found user on retry: " <> account_id,
+                  )
+                  Ok(user_subject)
+                }
+                Error(_) -> {
+                  let error_msg =
+                    "User spawned but not found in registry after retries: "
+                    <> account_id
+                  logging.log(logging.Error, "[Application] ❌ " <> error_msg)
+                  Error(error_msg)
+                }
+              }
             }
           }
         }
-        Error(error) -> {
+        supervisor.StartChildError(error) -> {
           logging.log(
             logging.Error,
             "[Application] ❌ Failed to spawn user: " <> error,
@@ -100,10 +153,13 @@ fn handle_application_message(
     SendMetricToUser(account_id, metric_name, value, tick_type) -> {
       logging.log(
         logging.Info,
-        "[ApplicationActor] Sending metric "
+        "[ApplicationActor] 🚀 Processing metric: "
+          <> account_id
+          <> "/"
           <> metric_name
-          <> " to user "
-          <> account_id,
+          <> " (tick_type: "
+          <> tick_type
+          <> ")",
       )
 
       // Get or spawn the user
@@ -120,10 +176,16 @@ fn handle_application_message(
             )
 
           // Send RecordMetric to the user actor
+          logging.log(
+            logging.Info,
+            "[ApplicationActor] 📤 Sending RecordMetric to user: " <> account_id,
+          )
+
           process.send(
             user_subject,
             user_actor.RecordMetric(metric_name, test_metric, value, tick_type),
           )
+
           logging.log(
             logging.Info,
             "[ApplicationActor] ✅ Sent RecordMetric to user " <> account_id,
@@ -134,7 +196,7 @@ fn handle_application_message(
         Error(error) -> {
           logging.log(
             logging.Error,
-            "[ApplicationActor] Failed to get user for metric: " <> error,
+            "[ApplicationActor] ❌ Failed to get user for metric: " <> error,
           )
           actor.continue(state)
         }
@@ -150,14 +212,53 @@ fn handle_application_message(
 
 // Start application actor that manages the supervisor
 pub fn start_application_actor(
-  supervisor: glixir.Supervisor,
+  supervisor: glixir.DynamicSupervisor(
+    String,
+    process.Subject(user_actor.Message),
+  ),
 ) -> Result(process.Subject(ApplicationMessage), actor.StartError) {
   let initial_state = ApplicationState(supervisor: supervisor)
 
-  actor.new(initial_state)
-  |> actor.on_message(handle_application_message)
-  |> actor.start
-  |> result.map(fn(started) { started.data })
+  case
+    actor.new(initial_state)
+    |> actor.on_message(handle_application_message)
+    |> actor.start
+  {
+    Ok(started) -> {
+      let subject = started.data
+
+      // Register the application actor in the registry so handlers can find it
+      logging.log(
+        logging.Info,
+        "[Application] 📝 Registering application actor in registry",
+      )
+      case
+        glixir.register_subject(
+          atom.create("tracktags_actors"),
+          atom.create("application_actor"),
+          subject,
+          glixir.atom_key_encoder,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[Application] ✅ Application actor registered successfully",
+          )
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[Application] ❌ Failed to register application actor: "
+              <> string.inspect(e),
+          )
+        }
+      }
+
+      Ok(subject)
+    }
+    Error(error) -> Error(error)
+  }
 }
 
 // Update the start_app function
@@ -169,12 +270,12 @@ pub fn start_app(
     "[Application] Starting TrackTags application with SSE URL: " <> sse_url,
   )
 
-  // Start the registry
-  let assert Ok(_) = glixir.start_registry("tracktags_actors")
+  // Start the registry with phantom types
+  let assert Ok(_) = glixir.start_registry(atom.create("tracktags_actors"))
   logging.log(logging.Info, "[Application] ✅ Registry started")
 
-  // Start dynamic supervisor
-  case glixir.start_supervisor_simple() {
+  // Start dynamic supervisor with phantom types
+  case glixir.start_dynamic_supervisor_named(atom.create("main_supervisor")) {
     Ok(glixir_supervisor) -> {
       logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
@@ -188,7 +289,7 @@ pub fn start_app(
             Ok(app_actor) -> {
               logging.log(
                 logging.Info,
-                "[Application] ✅ Application actor started",
+                "[Application] ✅ Application actor started and registered",
               )
               Ok(app_actor)
             }

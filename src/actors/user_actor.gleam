@@ -24,7 +24,13 @@ pub type Message {
 }
 
 pub type State {
-  State(account_id: String, metrics_supervisor: glixir.Supervisor)
+  State(
+    account_id: String,
+    metrics_supervisor: glixir.DynamicSupervisor(
+      #(String, String, String, Float, String),
+      process.Subject(metric_actor.Message),
+    ),
+  )
 }
 
 // Helper functions for consistent naming
@@ -35,10 +41,42 @@ pub fn user_subject_name(account_id: String) -> String {
 pub fn lookup_user_subject(
   account_id: String,
 ) -> Result(process.Subject(Message), String) {
-  case glixir.lookup_subject("tracktags_actors", account_id) {
+  case
+    glixir.lookup_subject(
+      atom.create("tracktags_actors"),
+      atom.create(account_id),
+      glixir.atom_key_encoder,
+    )
+  {
     Ok(subject) -> Ok(subject)
     Error(_) -> Error("User actor not found: " <> account_id)
   }
+}
+
+// Encoder function for metric actor arguments
+fn encode_metric_args(
+  args: #(String, String, String, Float, String),
+) -> List(dynamic.Dynamic) {
+  let #(account_id, metric_name, tick_type, initial_value, tags_json) = args
+  [
+    dynamic.string(account_id),
+    dynamic.string(metric_name),
+    dynamic.string(tick_type),
+    dynamic.float(initial_value),
+    dynamic.string(tags_json),
+  ]
+}
+
+fn decode_metric_reply(
+  _reply: dynamic.Dynamic,
+) -> Result(process.Subject(metric_actor.Message), String) {
+  // Instead of trying to decode the bridge reply, use the lookup pattern
+  // The bridge successfully starts the process and registers it
+  // We'll look it up after a brief delay to ensure registration is complete
+
+  // Return success - we'll use lookup in the calling code
+  // This is a placeholder that won't actually be used
+  Ok(process.new_subject())
 }
 
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
@@ -82,8 +120,16 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               "{}",
               // empty tags JSON
             )
-          case glixir.start_child(state.metrics_supervisor, metric_spec) {
-            Ok(child_pid) -> {
+
+          case
+            glixir.start_dynamic_child(
+              state.metrics_supervisor,
+              metric_spec,
+              encode_metric_args,
+              decode_metric_reply,
+            )
+          {
+            supervisor.ChildStarted(child_pid, _reply) -> {
               logging.log(
                 logging.Info,
                 "[UserActor] ✅ Spawned metric actor: "
@@ -116,7 +162,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               }
               actor.continue(state)
             }
-            Error(error) -> {
+            supervisor.StartChildError(error) -> {
               logging.log(
                 logging.Error,
                 "[UserActor] ❌ Failed to spawn metric: " <> error,
@@ -150,6 +196,11 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   }
 }
 
+// Encoder function for user actor arguments
+fn encode_user_args(account_id: String) -> List(dynamic.Dynamic) {
+  [dynamic.string(account_id)]
+}
+
 // start_link function for bridge to call
 pub fn start_link(
   account_id: String,
@@ -157,7 +208,9 @@ pub fn start_link(
   logging.log(logging.Info, "[UserActor] Starting for account: " <> account_id)
 
   // Start metrics supervisor for this user
-  case glixir.start_supervisor_simple() {
+  case
+    glixir.start_dynamic_supervisor_named(atom.create("metrics_" <> account_id))
+  {
     Ok(metrics_supervisor) -> {
       logging.log(
         logging.Debug,
@@ -171,9 +224,10 @@ pub fn start_link(
           // Register in registry for lookup
           case
             glixir.register_subject(
-              "tracktags_actors",
-              account_id,
+              atom.create("tracktags_actors"),
+              atom.create(account_id),
               started.data,
+              glixir.atom_key_encoder,
             )
           {
             Ok(_) ->
@@ -203,15 +257,18 @@ pub fn start_link(
   }
 }
 
-// Returns supervisor.SimpleChildSpec for dynamic spawning
-pub fn start(account_id: String) -> supervisor.SimpleChildSpec {
-  supervisor.SimpleChildSpec(
+// Returns glixir.ChildSpec for dynamic spawning
+pub fn start(
+  account_id: String,
+) -> glixir.ChildSpec(String, process.Subject(Message)) {
+  glixir.child_spec(
     id: "user_" <> account_id,
-    start_module: atom.create("Elixir.UserActorBridge"),
-    start_function: atom.create("start_link"),
-    start_args: [dynamic.string(account_id)],
-    restart: supervisor.Permanent,
+    module: "Elixir.UserActorBridge",
+    function: "start_link",
+    args: account_id,
+    restart: glixir.permanent,
     shutdown_timeout: 5000,
-    child_type: supervisor.Worker,
+    child_type: glixir.worker,
+    encode: encode_user_args,
   )
 }
