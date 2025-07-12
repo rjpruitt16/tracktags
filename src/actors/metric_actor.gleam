@@ -3,12 +3,14 @@ import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/float
 import gleam/json
 import gleam/otp/actor
 import gleam/string
 import glixir
 import glixir/supervisor
 import logging
+import storage/metric_store
 
 // Clean message types - removed PubSubTick and InitializeSubscription
 pub type Message {
@@ -62,72 +64,63 @@ pub fn lookup_metric_subject(
   }
 }
 
-// FFI to start PubSub bridge
-@external(erlang, "Elixir.MetricPubSubBridge", "start_link")
-fn start_pubsub_bridge(
-  account_id: String,
-  metric_name: String,
-  tick_type: String,
-) -> Result(process.Pid, dynamic.Dynamic)
-
-// New handler for bridge to call - this replaces handle_tick_json
-pub fn handle_tick_generic(
-  account_id: String,
-  metric_name: String,
-  json_message: String,
-) -> Nil {
-  logging.log(
-    logging.Info,
-    "[MetricActor] 🎯 Bridge received tick for: "
-      <> account_id
-      <> "/"
-      <> metric_name,
-  )
-
-  // JSON decoder for tick data
-  let tick_decoder = {
-    use tick_name <- decode.field("tick_name", decode.string)
-    use timestamp <- decode.field("timestamp", decode.string)
-    decode.success(TickData(tick_name: tick_name, timestamp: timestamp))
-  }
-
-  case json.parse(json_message, tick_decoder) {
-    Ok(tick_data) -> {
+// In handle_tick_direct function:
+pub fn handle_tick_direct(registry_key: String, json_message: String) -> Nil {
+  // Parse account_id and metric_name - split only on FIRST underscore
+  case string.split_once(registry_key, "_") {
+    Ok(#(account_id, metric_name)) -> {
       logging.log(
         logging.Info,
-        "[MetricActor] ✅ Decoded tick: "
-          <> tick_data.tick_name
-          <> " at "
-          <> tick_data.timestamp,
+        "[MetricActor] 🎯 Direct tick for: " <> account_id <> "/" <> metric_name,
       )
 
-      // Send to specific MetricActor
-      case lookup_metric_subject(account_id, metric_name) {
-        Ok(subject) -> {
-          process.send(subject, Tick(tick_data.timestamp, tick_data.tick_name))
-          logging.log(
-            logging.Info,
-            "[MetricActor] ✅ Sent tick to: " <> account_id <> "/" <> metric_name,
-          )
+      // JSON decoder for tick data
+      let tick_decoder = {
+        use tick_name <- decode.field("tick_name", decode.string)
+        use timestamp <- decode.field("timestamp", decode.string)
+        decode.success(TickData(tick_name: tick_name, timestamp: timestamp))
+      }
+
+      case json.parse(json_message, tick_decoder) {
+        Ok(tick_data) -> {
+          // Direct lookup and send - no bridge needed!
+          case lookup_metric_subject(account_id, metric_name) {
+            Ok(subject) -> {
+              process.send(
+                subject,
+                Tick(tick_data.timestamp, tick_data.tick_name),
+              )
+              logging.log(
+                logging.Info,
+                "[MetricActor] ✅ Direct tick sent to: "
+                  <> account_id
+                  <> "/"
+                  <> metric_name,
+              )
+            }
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[MetricActor] ❌ Actor not found: "
+                  <> account_id
+                  <> "/"
+                  <> metric_name,
+              )
+            }
+          }
         }
-        Error(_) -> {
+        Error(decode_error) -> {
           logging.log(
-            logging.Error,
-            "[MetricActor] ❌ Actor not found: "
-              <> account_id
-              <> "/"
-              <> metric_name,
+            logging.Warning,
+            "[MetricActor] ❌ Invalid tick JSON: " <> json_message,
           )
         }
       }
     }
-    Error(decode_error) -> {
+    Error(_) -> {
       logging.log(
-        logging.Warning,
-        "[MetricActor] ❌ Invalid tick JSON: "
-          <> json_message
-          <> " Error: "
-          <> string.inspect(decode_error),
+        logging.Error,
+        "[MetricActor] ❌ Invalid registry key format: " <> registry_key,
       )
     }
   }
@@ -149,6 +142,7 @@ pub fn start_link(
   tick_type: String,
   initial_value: Float,
   tags_json: String,
+  operation: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -180,6 +174,49 @@ pub fn start_link(
       tick_type: tick_type,
     )
 
+  let metric_operation = case string.uppercase(operation) {
+    "SUM" -> metric_store.Sum
+    "AVG" -> metric_store.Average
+    "MIN" -> metric_store.Min
+    "MAX" -> metric_store.Max
+    "COUNT" -> metric_store.Count
+    "LAST" -> metric_store.Last
+    _ -> metric_store.Sum
+  }
+
+  case metric_store.init_store(account_id) {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] ✅ Store initialized for: " <> account_id,
+      )
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] Store already exists for: " <> account_id,
+      )
+    }
+  }
+
+  // Create the metric in ETS with SUM operation (you can make this configurable later)
+  case
+    metric_store.create_metric(account_id, metric_name, metric_operation, 0.0)
+  {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] ✅ Metric created in store: " <> metric_name,
+      )
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricActor] ⚠️ Metric creation error (might already exist): "
+          <> string.inspect(e),
+      )
+    }
+  }
   case
     actor.new(temp_state) |> actor.on_message(handle_message) |> actor.start
   {
@@ -205,18 +242,29 @@ pub fn start_link(
           )
       }
 
-      // Start PubSub bridge (automatically links via start_link)
-      case start_pubsub_bridge(account_id, metric_name, tick_type) {
-        Ok(_bridge_pid) -> {
+      // NEW: Direct PubSub subscription with registry key
+      case
+        glixir.pubsub_subscribe_with_registry_key(
+          atom.create("clock_events"),
+          "tick:" <> tick_type,
+          "actors@metric_actor",
+          // Your module
+          "handle_tick_direct",
+          // Direct handler function
+          account_id <> "_" <> metric_name,
+          // Registry key
+        )
+      {
+        Ok(_) -> {
           logging.log(
             logging.Info,
-            "[MetricActor] ✅ PubSub bridge started and linked",
+            "[MetricActor] ✅ Direct PubSub subscription created for: " <> key,
           )
         }
         Error(e) -> {
           logging.log(
             logging.Error,
-            "[MetricActor] ❌ Failed to start bridge: " <> string.inspect(e),
+            "[MetricActor] ❌ Failed to subscribe: " <> string.inspect(e),
           )
         }
       }
@@ -240,22 +288,29 @@ pub fn start_link(
   }
 }
 
-// Returns supervisor.ChildSpec for dynamic spawning
 pub fn start(
   account_id: String,
   metric_name: String,
   tick_type: String,
   initial_value: Float,
   tags_json: String,
+  operation: String,
 ) -> supervisor.ChildSpec(
-  #(String, String, String, Float, String),
+  #(String, String, String, Float, String, String),
   process.Subject(Message),
 ) {
   supervisor.ChildSpec(
     id: "metric_" <> account_id <> "_" <> metric_name,
     start_module: atom.create("Elixir.MetricActorBridge"),
     start_function: atom.create("start_link"),
-    start_args: #(account_id, metric_name, tick_type, initial_value, tags_json),
+    start_args: #(
+      account_id,
+      metric_name,
+      tick_type,
+      initial_value,
+      tags_json,
+      operation,
+    ),
     restart: supervisor.Permanent,
     shutdown_timeout: 5000,
     child_type: supervisor.Worker,
@@ -274,13 +329,29 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
   case message {
     RecordMetric(metric) -> {
-      logging.log(
-        logging.Debug,
-        "[MetricActor] Recording: " <> metric.metric_name,
-      )
-      actor.continue(State(..state, current_metric: metric))
+      // Store in ETS instead of just state
+      case
+        metric_store.add_value(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          metric.value,
+        )
+      {
+        Ok(new_value) -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] Value updated: " <> float.to_string(new_value),
+          )
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[MetricActor] Store error: " <> string.inspect(e),
+          )
+        }
+      }
+      actor.continue(state)
     }
-
     Tick(timestamp, tick_type) -> {
       logging.log(
         logging.Info,
@@ -315,6 +386,11 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
   logging.log(
     logging.Info,
     "[MetricActor] 📊 Flushing metrics: " <> state.default_metric.metric_name,
+  )
+  metric_store.reset_metric(
+    state.default_metric.account_id,
+    state.default_metric.metric_name,
+    state.default_metric.value,
   )
   actor.continue(State(..state, current_metric: state.default_metric))
 }

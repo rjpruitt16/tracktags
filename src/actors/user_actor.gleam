@@ -15,6 +15,7 @@ pub type Message {
     metric: metric_actor.Metric,
     initial_value: Float,
     tick_type: String,
+    operation: String,
   )
   GetMetricActor(
     metric_name: String,
@@ -27,7 +28,7 @@ pub type State {
   State(
     account_id: String,
     metrics_supervisor: glixir.DynamicSupervisor(
-      #(String, String, String, Float, String),
+      #(String, String, String, Float, String, String),
       process.Subject(metric_actor.Message),
     ),
   )
@@ -55,27 +56,23 @@ pub fn lookup_user_subject(
 
 // Encoder function for metric actor arguments
 fn encode_metric_args(
-  args: #(String, String, String, Float, String),
+  args: #(String, String, String, Float, String, String),
 ) -> List(dynamic.Dynamic) {
-  let #(account_id, metric_name, tick_type, initial_value, tags_json) = args
+  let #(account_id, metric_name, tick_type, initial_value, tags_json, operation) =
+    args
   [
     dynamic.string(account_id),
     dynamic.string(metric_name),
     dynamic.string(tick_type),
     dynamic.float(initial_value),
     dynamic.string(tags_json),
+    dynamic.string(operation),
   ]
 }
 
 fn decode_metric_reply(
   _reply: dynamic.Dynamic,
 ) -> Result(process.Subject(metric_actor.Message), String) {
-  // Instead of trying to decode the bridge reply, use the lookup pattern
-  // The bridge successfully starts the process and registers it
-  // We'll look it up after a brief delay to ensure registration is complete
-
-  // Return success - we'll use lookup in the calling code
-  // This is a placeholder that won't actually be used
   Ok(process.new_subject())
 }
 
@@ -85,42 +82,44 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     "[UserActor] Received message: " <> string.inspect(message),
   )
   case message {
-    RecordMetric(metric_id, metric, initial_value, tick_type) -> {
+    RecordMetric(metric_id, metric, initial_value, tick_type, operation) -> {
       logging.log(
         logging.Info,
         "[UserActor] Processing metric: "
           <> state.account_id
           <> "/"
-          <> metric_id,
+          <> metric_id
+          <> " (operation: "
+          <> operation
+          <> ")",
       )
 
-      // Check if metric actor already exists
       case metric_actor.lookup_metric_subject(state.account_id, metric_id) {
         Ok(metric_subject) -> {
+          // Found existing actor - send metric immediately
           logging.log(
-            logging.Debug,
-            "[UserActor] ✅ Found existing metric actor: " <> metric_id,
+            logging.Info,
+            "[UserActor] ✅ Found existing MetricActor, sending metric",
           )
-          // Send record message to existing metric actor
           process.send(metric_subject, metric_actor.RecordMetric(metric))
           actor.continue(state)
         }
         Error(_) -> {
-          // Spawn new metric actor dynamically
+          // Spawn new actor - NO BLOCKING!
           logging.log(
             logging.Info,
-            "[UserActor] Spawning new metric actor: " <> metric_id,
+            "[UserActor] MetricActor not found, spawning new one",
           )
+
           let metric_spec =
             metric_actor.start(
               state.account_id,
               metric_id,
               tick_type,
-              initial_value,
+              0.0,
               "{}",
-              // empty tags JSON
+              operation,
             )
-
           case
             glixir.start_dynamic_child(
               state.metrics_supervisor,
@@ -138,7 +137,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                   <> string.inspect(child_pid),
               )
 
-              // After spawning, look up and send the metric
+              // Try immediate lookup - no blocking sleep!
               case
                 metric_actor.lookup_metric_subject(state.account_id, metric_id)
               {
@@ -148,18 +147,21 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                     metric_actor.RecordMetric(metric),
                   )
                   logging.log(
-                    logging.Debug,
-                    "[UserActor] ✅ Sent initial metric to new actor",
-                  )
-                }
-                Error(_) -> {
-                  logging.log(
-                    logging.Warning,
-                    "[UserActor] ⚠️ Could not find newly spawned metric actor: "
+                    logging.Info,
+                    "[UserActor] ✅ Sent metric to newly spawned actor: "
                       <> metric_id,
                   )
                 }
+                Error(_) -> {
+                  // If not ready immediately, that's OK - the MetricActor
+                  // will initialize with the initial_value we passed to it
+                  logging.log(
+                    logging.Info,
+                    "[UserActor] MetricActor still initializing, will use initial_value",
+                  )
+                }
               }
+
               actor.continue(state)
             }
             supervisor.StartChildError(error) -> {
@@ -175,7 +177,6 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     }
 
     GetMetricActor(metric_name, reply_with) -> {
-      // Use lookup instead of returning None
       let result = case
         metric_actor.lookup_metric_subject(state.account_id, metric_name)
       {

@@ -128,6 +128,7 @@ fn validate_metric_request(
             [],
           ),
         ])
+
       True -> Ok(Nil)
     }
   })
@@ -174,6 +175,14 @@ fn get_application_actor() -> Result(
 
 // Main handler function
 pub fn create_metric(req: Request) -> Response {
+  let request_id = string.inspect(system_time())
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 REQUEST START - ID: "
+      <> request_id
+      <> " POST /api/v1/metrics",
+  )
+
   logging.log(logging.Info, "[MetricHandler] POST /api/v1/metrics")
 
   use <- wisp.require_method(req, http.Post)
@@ -201,6 +210,11 @@ pub fn create_metric(req: Request) -> Response {
               #("error", json.string("Unauthorized")),
               #("message", json.string(error)),
             ])
+
+          logging.log(
+            logging.Info,
+            "[MetricHandler] 🔍 REQUEST END - ID: " <> request_id,
+          )
           wisp.json_response(json.to_string_tree(error_json), 401)
         }
         Ok(account_id) -> {
@@ -219,6 +233,10 @@ pub fn create_metric(req: Request) -> Response {
             Ok(process_metric(account_id, validated_req))
           }
 
+          logging.log(
+            logging.Info,
+            "[MetricHandler] 🔍 REQUEST END - ID: " <> request_id,
+          )
           case result {
             Ok(response) -> response
             Error(decode_errors) -> {
@@ -265,7 +283,12 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
           <> " with tick_type: "
           <> tick_type,
       )
-
+      let message_id = string.inspect(system_time())
+      // Simple unique ID
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🎯 Sending message ID: " <> message_id,
+      )
       // Send SendMetricToUser message to application actor
       process.send(
         app_actor,
@@ -274,9 +297,10 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
           metric_name: req.metric_name,
           value: req.value,
           tick_type: tick_type,
+          operation: req.operation,
+          // ADD this line
         ),
       )
-
       logging.log(
         logging.Info,
         "[MetricHandler] ✅ Metric sent to application: "

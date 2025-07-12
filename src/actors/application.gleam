@@ -1,4 +1,4 @@
-// Refactored application.gleam - Clean and stateless with lookup pattern
+// Fixed application.gleam - Simple non-blocking approach
 import actors/clock_actor
 import actors/metric_actor
 import actors/user_actor
@@ -13,18 +13,18 @@ import glixir
 import glixir/supervisor
 import logging
 
-// Simplified application messages - removed GetOrSpawnUser since we use direct lookup
 pub type ApplicationMessage {
   SendMetricToUser(
     account_id: String,
     metric_name: String,
     value: Float,
     tick_type: String,
+    operation: String,
   )
   Shutdown
 }
 
-// Simplified state - phantom-typed supervisor
+// Simplified state - phantom-typed supervisor  
 pub type ApplicationState {
   ApplicationState(
     supervisor: glixir.DynamicSupervisor(
@@ -43,13 +43,11 @@ fn encode_user_args(account_id: String) -> List(dynamic.Dynamic) {
 fn decode_user_reply(
   reply: dynamic.Dynamic,
 ) -> Result(process.Subject(user_actor.Message), String) {
-  // The bridge actually returns the subject directly
-  // For now, let's just assume success and use lookup instead
   Ok(process.new_subject())
 }
 
-// Helper function to get or spawn a user using lookup pattern
-fn get_or_spawn_user(
+// Simple helper to get or spawn a user - NO BLOCKING!
+fn get_or_spawn_user_simple(
   supervisor: glixir.DynamicSupervisor(
     String,
     process.Subject(user_actor.Message),
@@ -66,7 +64,7 @@ fn get_or_spawn_user(
       Ok(user_subject)
     }
     Error(_) -> {
-      // Need to spawn new user
+      // Spawn new user WITHOUT blocking
       logging.log(
         logging.Debug,
         "[Application] Spawning new user: " <> account_id,
@@ -90,9 +88,8 @@ fn get_or_spawn_user(
               <> string.inspect(child_pid),
           )
 
-          // Give it a moment to register, then look it up
-          process.sleep(100)
-          // Increased sleep time
+          // Instead of blocking, just try lookup immediately
+          // The UserActor will handle the "first metric send" internally
           case user_actor.lookup_user_subject(account_id) {
             Ok(user_subject) -> {
               logging.log(
@@ -102,28 +99,12 @@ fn get_or_spawn_user(
               Ok(user_subject)
             }
             Error(_) -> {
+              // If not ready yet, that's OK - the UserActor will handle first metric
               logging.log(
-                logging.Warning,
-                "[Application] ⚠️ User spawned but not found in registry, trying again...",
+                logging.Info,
+                "[Application] User spawning, will receive metric via UserActor",
               )
-              // Try one more time after another brief pause
-              process.sleep(50)
-              case user_actor.lookup_user_subject(account_id) {
-                Ok(user_subject) -> {
-                  logging.log(
-                    logging.Info,
-                    "[Application] ✅ Found user on retry: " <> account_id,
-                  )
-                  Ok(user_subject)
-                }
-                Error(_) -> {
-                  let error_msg =
-                    "User spawned but not found in registry after retries: "
-                    <> account_id
-                  logging.log(logging.Error, "[Application] ❌ " <> error_msg)
-                  Error(error_msg)
-                }
-              }
+              Error("User still registering")
             }
           }
         }
@@ -139,68 +120,109 @@ fn get_or_spawn_user(
   }
 }
 
-// Simplified application actor message handler
+// Much simpler application actor message handler
 fn handle_application_message(
   state: ApplicationState,
   message: ApplicationMessage,
 ) -> actor.Next(ApplicationState, ApplicationMessage) {
+  let processing_id = string.inspect(system_time())
   logging.log(
     logging.Info,
-    "[ApplicationActor] Received message: " <> string.inspect(message),
+    "[ApplicationActor] 🔍 PROCESSING START - ID: " <> processing_id,
   )
 
   case message {
-    SendMetricToUser(account_id, metric_name, value, tick_type) -> {
+    SendMetricToUser(account_id, metric_name, value, tick_type, operation) -> {
+      let message_id = string.inspect(system_time())
       logging.log(
         logging.Info,
-        "[ApplicationActor] 🚀 Processing metric: "
-          <> account_id
-          <> "/"
-          <> metric_name
-          <> " (tick_type: "
-          <> tick_type
-          <> ")",
+        "[ApplicationActor] 🎯 Processing SendMetricToUser ID: " <> message_id,
       )
 
-      // Get or spawn the user
-      case get_or_spawn_user(state.supervisor, account_id) {
-        Ok(user_subject) -> {
-          // Create the metric
-          let test_metric =
-            metric_actor.Metric(
-              account_id: account_id,
-              metric_name: metric_name,
-              value: value,
-              tags: dict.new(),
-              timestamp: current_timestamp(),
-            )
+      // Create the metric once
+      let test_metric =
+        metric_actor.Metric(
+          account_id: account_id,
+          metric_name: metric_name,
+          value: value,
+          tags: dict.new(),
+          timestamp: current_timestamp(),
+        )
 
-          // Send RecordMetric to the user actor
+      // Try to get existing user first
+      case user_actor.lookup_user_subject(account_id) {
+        Ok(user_subject) -> {
           logging.log(
             logging.Info,
-            "[ApplicationActor] 📤 Sending RecordMetric to user: " <> account_id,
+            "[ApplicationActor] ✅ Found existing user, sending metric: "
+              <> account_id,
           )
 
+          // Send RecordMetric to the existing user actor
           process.send(
             user_subject,
-            user_actor.RecordMetric(metric_name, test_metric, value, tick_type),
+            user_actor.RecordMetric(
+              metric_name,
+              test_metric,
+              value,
+              tick_type,
+              operation,
+            ),
           )
 
           logging.log(
             logging.Info,
-            "[ApplicationActor] ✅ Sent RecordMetric to user " <> account_id,
+            "[ApplicationActor] ✅ Metric sent to existing user: " <> account_id,
+          )
+        }
+        Error(_) -> {
+          // User doesn't exist - spawn it AND send metric to its mailbox
+          logging.log(
+            logging.Info,
+            "[ApplicationActor] User not found, spawning: " <> account_id,
           )
 
-          actor.continue(state)
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[ApplicationActor] ❌ Failed to get user for metric: " <> error,
-          )
-          actor.continue(state)
+          case get_or_spawn_user_simple(state.supervisor, account_id) {
+            Ok(user_subject) -> {
+              logging.log(
+                logging.Info,
+                "[ApplicationActor] ✅ User spawned, sending metric to mailbox: "
+                  <> account_id,
+              )
+
+              // Send metric to newly spawned user - it will queue in mailbox
+              process.send(
+                user_subject,
+                user_actor.RecordMetric(
+                  metric_name,
+                  test_metric,
+                  value,
+                  tick_type,
+                  operation,
+                ),
+              )
+
+              logging.log(
+                logging.Info,
+                "[ApplicationActor] ✅ Metric queued in new user's mailbox: "
+                  <> account_id,
+              )
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Error,
+                "[ApplicationActor] ❌ Failed to spawn user: " <> error,
+              )
+            }
+          }
         }
       }
+
+      logging.log(
+        logging.Info,
+        "[ApplicationActor] 🔍 PROCESSING END - ID: " <> processing_id,
+      )
+      actor.continue(state)
     }
 
     Shutdown -> {

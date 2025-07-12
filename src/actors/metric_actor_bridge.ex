@@ -4,7 +4,7 @@ defmodule MetricActorBridge do
   Converts simple Elixir arguments to complex Gleam state structures.
   """
 
-  def start_link(account_id, metric_name, tick_type, initial_value, tags_json)
+  def start_link(account_id, metric_name, tick_type, initial_value, tags_json, operation)
       when is_binary(account_id) and is_binary(metric_name) and is_binary(tick_type) and
              is_number(initial_value) and is_binary(tags_json) do
     # Call the Gleam start_link function with all the arguments
@@ -13,7 +13,8 @@ defmodule MetricActorBridge do
            metric_name,
            tick_type,
            initial_value,
-           tags_json
+           tags_json,
+           operation
          ) do
       {:ok, {:subject, pid, _ref}} ->
         # Register the process with a predictable name for registry pattern
