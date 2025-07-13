@@ -13,6 +13,11 @@ import glixir/supervisor
 import logging
 import storage/metric_store
 
+pub type MetricType {
+  Reset
+  Checkpoint
+}
+
 pub type Message {
   RecordMetric(metric: Metric)
   FlushTick(timestamp: String, tick_type: String)
@@ -39,15 +44,30 @@ pub type State {
     current_metric: Metric,
     tick_type: String,
     last_accessed: Int,
-    // NEW: Unix timestamp of last activity
     cleanup_after_seconds: Int,
-    // NEW: Auto-cleanup threshold
+    metric_type: MetricType,
+    initial_value: Float,
   )
 }
 
 // Tick data type for JSON decoding
 pub type TickData {
   TickData(tick_name: String, timestamp: String)
+}
+
+pub fn metric_type_to_string(metric_type: MetricType) -> String {
+  case metric_type {
+    Reset -> "reset"
+    Checkpoint -> "checkpoint"
+  }
+}
+
+pub fn string_to_metric_type(metric_type: String) -> MetricType {
+  case metric_type {
+    "reset" -> Reset
+    "checkpoint" -> Checkpoint
+    _ -> Checkpoint
+  }
 }
 
 // Helper functions for consistent naming
@@ -173,6 +193,7 @@ pub fn start_link(
   tags_json: String,
   operation: String,
   cleanup_after_seconds: Int,
+  metric_type: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -182,6 +203,11 @@ pub fn start_link(
       <> metric_name
       <> " (flush: "
       <> tick_type
+      <> int.to_string(cleanup_after_seconds)
+      <> ", metric_type: "
+      <> metric_type
+      <> ", initial value: "
+      <> float.to_string(initial_value)
       <> ", cleanup_after: "
       <> int.to_string(cleanup_after_seconds)
       <> "s)",
@@ -206,6 +232,8 @@ pub fn start_link(
       tick_type: tick_type,
       last_accessed: timestamp,
       cleanup_after_seconds: cleanup_after_seconds,
+      metric_type: string_to_metric_type(metric_type),
+      initial_value: initial_value,
     )
 
   let metric_operation = case string.uppercase(operation) {
@@ -539,9 +567,9 @@ pub fn start(
   tags_json: String,
   operation: String,
   cleanup_after_seconds: Int,
-  // NEW: Add cleanup parameter
+  metric_type: String,
 ) -> supervisor.ChildSpec(
-  #(String, String, String, Float, String, String, Int),
+  #(String, String, String, Float, String, String, Int, String),
   process.Subject(Message),
 ) {
   supervisor.ChildSpec(
@@ -556,7 +584,7 @@ pub fn start(
       tags_json,
       operation,
       cleanup_after_seconds,
-      // NEW: Pass cleanup parameter
+      metric_type,
     ),
     restart: supervisor.Permanent,
     shutdown_timeout: 5000,
@@ -564,16 +592,40 @@ pub fn start(
   )
 }
 
+// Updated flush_metrics function to respect metric type
 fn flush_metrics(state: State) -> actor.Next(State, Message) {
   logging.log(
     logging.Info,
     "[MetricActor] 📊 Flushing metrics: " <> state.default_metric.metric_name,
   )
-  metric_store.reset_metric(
-    state.default_metric.account_id,
-    state.default_metric.metric_name,
-    state.default_metric.value,
-  )
+
+  case state.metric_type {
+    Reset -> {
+      // Reset to initial value
+      logging.log(
+        logging.Info,
+        "[MetricActor] 🔄 Reset metric to initial value: "
+          <> float.to_string(state.initial_value),
+      )
+      let _ =
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          state.initial_value,
+        )
+      Nil
+    }
+    Checkpoint -> {
+      // Keep current value (just flush, don't reset)
+      logging.log(
+        logging.Info,
+        "[MetricActor] ✅ Checkpoint metric (keeping current value)",
+      )
+      // No reset needed - just continue with current state
+      Nil
+    }
+  }
+
   actor.continue(State(..state, current_metric: state.default_metric))
 }
 

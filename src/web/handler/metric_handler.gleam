@@ -25,7 +25,8 @@ pub type MetricRequest {
     operation: String,
     flush_interval: String,
     cleanup_after: String,
-    // NEW: Auto-cleanup configuration
+    metric_type: String,
+    initial_value: Float,
     tags: Dict(String, String),
   )
 }
@@ -45,6 +46,8 @@ const valid_cleanup_periods = [
   "5s", "1m", "1h", "6h", "1d", "7d", "30d", "never",
 ]
 
+const valid_metric_types = ["reset", "checkpoint"]
+
 // Convert cleanup_after to seconds for comparison
 fn cleanup_to_seconds(cleanup_period: String) -> Int {
   case cleanup_period {
@@ -59,6 +62,13 @@ fn cleanup_to_seconds(cleanup_period: String) -> Int {
     // Special value for no cleanup
     _ -> 86_400
     // Default to 1 day
+  }
+}
+
+fn string_to_metric_type(type_str: String) -> metric_actor.MetricType {
+  case type_str {
+    "checkpoint" -> metric_actor.Checkpoint
+    _ -> metric_actor.Reset
   }
 }
 
@@ -155,12 +165,21 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     decode.dict(decode.string, decode.string),
   )
 
+  use initial_value <- decode.optional_field("initial_value", 0.0, decode.float)
+  use metric_type <- decode.optional_field(
+    "metric_type",
+    "checkpoint",
+    decode.string,
+  )
+  // NEW
   decode.success(MetricRequest(
     metric_name: metric_name,
     value: value,
     operation: operation,
     flush_interval: flush_interval,
     cleanup_after: cleanup_after,
+    metric_type: metric_type,
+    initial_value: initial_value,
     tags: tags,
   ))
 }
@@ -231,6 +250,21 @@ fn validate_metric_request(
           ),
         ])
       True -> Ok(Nil)
+    }
+  })
+  |> result.try(fn(_) {
+    // Validate metric_type
+    case list.contains(valid_metric_types, req.metric_type) {
+      False ->
+        Error([
+          decode.DecodeError(
+            "Invalid",
+            "Invalid metric_type. Must be one of: "
+              <> string.join(valid_metric_types, ", "),
+            [],
+          ),
+        ])
+      True -> Ok(req)
     }
   })
   |> result.try(fn(_) {
@@ -478,6 +512,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
   let operation = req.operation
   let interval = req.flush_interval
   let cleanup_after = req.cleanup_after
+  let metric_type = string_to_metric_type(req.metric_type)
+  let initial_value = req.initial_value
   let tags = req.tags
   let tick_type = interval_to_tick_type(interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
@@ -512,7 +548,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
           tick_type: tick_type,
           operation: req.operation,
           cleanup_after_seconds: cleanup_seconds,
-          // NEW: Pass cleanup config
+          metric_type: metric_type,
+          initial_value: initial_value,
         ),
       )
 
@@ -534,6 +571,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
           #("flush_interval", json.string(interval)),
           #("cleanup_after", json.string(cleanup_after)),
           #("tick_type", json.string(tick_type)),
+          #("metric_type", json.string(req.metric_type)),
+          #("initial_value", json.float(initial_value)),
         ])
 
       wisp.json_response(json.to_string_tree(success_json), 201)

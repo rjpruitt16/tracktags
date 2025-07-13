@@ -20,6 +20,8 @@ pub type ApplicationMessage {
     tick_type: String,
     operation: String,
     cleanup_after_seconds: Int,
+    metric_type: metric_actor.MetricType,
+    initial_value: Float,
   )
   Shutdown
 }
@@ -139,6 +141,8 @@ fn handle_application_message(
       tick_type,
       operation,
       cleanup_after_seconds,
+      metric_type,
+      initial_value,
     ) -> {
       let message_id = string.inspect(system_time())
       logging.log(
@@ -165,17 +169,16 @@ fn handle_application_message(
               <> account_id,
           )
 
-          // Send RecordMetric to the existing user actor
           process.send(
             user_subject,
             user_actor.RecordMetric(
               metric_name,
               test_metric,
-              value,
+              initial_value,
               tick_type,
               operation,
               cleanup_after_seconds,
-              // NEW: Pass cleanup config
+              metric_type,
             ),
           )
 
@@ -199,17 +202,16 @@ fn handle_application_message(
                   <> account_id,
               )
 
-              // Send metric to newly spawned user - it will queue in mailbox
               process.send(
                 user_subject,
                 user_actor.RecordMetric(
                   metric_name,
                   test_metric,
-                  value,
+                  initial_value,
                   tick_type,
                   operation,
                   cleanup_after_seconds,
-                  // NEW: Pass cleanup config
+                  metric_type,
                 ),
               )
 
@@ -235,7 +237,6 @@ fn handle_application_message(
       )
       actor.continue(state)
     }
-
     Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
       actor.stop()
