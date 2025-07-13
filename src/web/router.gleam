@@ -1,4 +1,4 @@
-import gleam/http.{Get, Post}
+import gleam/http.{Delete, Get, Post, Put}
 import web/handler/metric_handler
 import wisp.{type Request, type Response}
 
@@ -15,11 +15,20 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
-    // Metrics API
+    // Metrics CRUD API
     ["api", "v1", "metrics"] ->
       case req.method {
         Post -> metric_handler.create_metric(req)
         _ -> wisp.method_not_allowed([Post])
+      }
+
+    // Individual metric operations
+    ["api", "v1", "metrics", metric_name] ->
+      case req.method {
+        Get -> metric_handler.get_metric(req, metric_name)
+        Put -> metric_handler.update_metric(req, metric_name)
+        Delete -> metric_handler.delete_metric(req, metric_name)
+        _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 
     // 404 for everything else

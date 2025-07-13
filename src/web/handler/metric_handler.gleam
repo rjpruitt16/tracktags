@@ -13,9 +13,10 @@ import gleam/result
 import gleam/string
 import glixir
 import logging
+import storage/metric_store
 import wisp.{type Request, type Response}
 
-// Request body structure
+// Request body structures
 pub type MetricRequest {
   MetricRequest(
     metric_name: String,
@@ -24,6 +25,10 @@ pub type MetricRequest {
     flush_interval: String,
     tags: Dict(String, String),
   )
+}
+
+pub type UpdateMetricRequest {
+  UpdateMetricRequest(value: Float)
 }
 
 // Valid operations and intervals
@@ -46,11 +51,10 @@ fn interval_to_tick_type(interval: String) -> String {
     "6h" -> "tick_6h"
     "1d" -> "tick_1d"
     _ -> "tick_1s"
-    // Default fallback
   }
 }
 
-// Mock API key validation - replace with Supabase later
+// TODO: Update to validate key. 
 fn validate_api_key(api_key: String) -> Result(String, String) {
   case api_key {
     "tk_live_test123" -> Ok("test_user_001")
@@ -73,7 +77,39 @@ fn extract_api_key(req: Request) -> Result(String, String) {
   }
 }
 
-// JSON decoder for metric request using modern decode API
+// Common auth wrapper
+fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
+  case extract_api_key(req) {
+    Error(error) -> {
+      logging.log(logging.Warning, "[MetricHandler] Auth failed: " <> error)
+      let error_json =
+        json.object([
+          #("error", json.string("Unauthorized")),
+          #("message", json.string(error)),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 401)
+    }
+    Ok(api_key) -> {
+      case validate_api_key(api_key) {
+        Error(error) -> {
+          logging.log(
+            logging.Warning,
+            "[MetricHandler] Invalid API key: " <> api_key,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Unauthorized")),
+              #("message", json.string(error)),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 401)
+        }
+        Ok(account_id) -> handler(account_id)
+      }
+    }
+  }
+}
+
+// JSON decoders
 fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
   use metric_name <- decode.field("metric_name", decode.string)
   use value <- decode.field("value", decode.float)
@@ -96,6 +132,11 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     flush_interval: flush_interval,
     tags: tags,
   ))
+}
+
+fn update_metric_request_decoder() -> decode.Decoder(UpdateMetricRequest) {
+  use value <- decode.field("value", decode.float)
+  decode.success(UpdateMetricRequest(value: value))
 }
 
 // Validate the parsed request
@@ -128,7 +169,6 @@ fn validate_metric_request(
             [],
           ),
         ])
-
       True -> Ok(Nil)
     }
   })
@@ -151,7 +191,6 @@ fn validate_metric_request(
     // Validate value is not zero (simple validation)
     case req.value {
       _ -> Ok(req)
-      // Accept all float values for now
     }
   })
 }
@@ -173,93 +212,226 @@ fn get_application_actor() -> Result(
   }
 }
 
-// Main handler function
+// ===== CRUD ENDPOINTS =====
+
+// CREATE (POST /api/v1/metrics)
 pub fn create_metric(req: Request) -> Response {
   let request_id = string.inspect(system_time())
   logging.log(
     logging.Info,
-    "[MetricHandler] 🔍 REQUEST START - ID: "
-      <> request_id
-      <> " POST /api/v1/metrics",
+    "[MetricHandler] 🔍 CREATE REQUEST START - ID: " <> request_id,
   )
-
-  logging.log(logging.Info, "[MetricHandler] POST /api/v1/metrics")
 
   use <- wisp.require_method(req, http.Post)
 
-  // Extract and validate API key
-  case extract_api_key(req) {
-    Error(error) -> {
-      logging.log(logging.Warning, "[MetricHandler] Auth failed: " <> error)
+  use account_id <- with_auth(req)
+
+  // Parse JSON body
+  use json_data <- wisp.require_json(req)
+
+  let result = {
+    use metric_req <- result.try(decode.run(json_data, metric_request_decoder()))
+    use validated_req <- result.try(validate_metric_request(metric_req))
+    Ok(process_create_metric(account_id, validated_req))
+  }
+
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 CREATE REQUEST END - ID: " <> request_id,
+  )
+
+  case result {
+    Ok(response) -> response
+    Error(decode_errors) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Bad request: " <> string.inspect(decode_errors),
+      )
       let error_json =
         json.object([
-          #("error", json.string("Unauthorized")),
-          #("message", json.string(error)),
+          #("error", json.string("Bad Request")),
+          #("message", json.string("Invalid request data")),
         ])
-      wisp.json_response(json.to_string_tree(error_json), 401)
-    }
-    Ok(api_key) -> {
-      case validate_api_key(api_key) {
-        Error(error) -> {
-          logging.log(
-            logging.Warning,
-            "[MetricHandler] Invalid API key: " <> api_key,
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Unauthorized")),
-              #("message", json.string(error)),
-            ])
-
-          logging.log(
-            logging.Info,
-            "[MetricHandler] 🔍 REQUEST END - ID: " <> request_id,
-          )
-          wisp.json_response(json.to_string_tree(error_json), 401)
-        }
-        Ok(account_id) -> {
-          // Parse JSON body using modern wisp
-          use json_data <- wisp.require_json(req)
-
-          let result = {
-            // Decode the JSON into our MetricRequest type
-            use metric_req <- result.try(decode.run(
-              json_data,
-              metric_request_decoder(),
-            ))
-            use validated_req <- result.try(validate_metric_request(metric_req))
-
-            // Process the metric
-            Ok(process_metric(account_id, validated_req))
-          }
-
-          logging.log(
-            logging.Info,
-            "[MetricHandler] 🔍 REQUEST END - ID: " <> request_id,
-          )
-          case result {
-            Ok(response) -> response
-            Error(decode_errors) -> {
-              logging.log(
-                logging.Warning,
-                "[MetricHandler] Bad request: " <> string.inspect(decode_errors),
-              )
-              let error_json =
-                json.object([
-                  #("error", json.string("Bad Request")),
-                  #("message", json.string("Invalid request data")),
-                ])
-              wisp.json_response(json.to_string_tree(error_json), 400)
-            }
-          }
-        }
-      }
+      wisp.json_response(json.to_string_tree(error_json), 400)
     }
   }
 }
 
-// Process the validated metric request
-fn process_metric(account_id: String, req: MetricRequest) -> Response {
+// READ (GET /api/v1/metrics/{metric_name})
+pub fn get_metric(req: Request, metric_name: String) -> Response {
+  let request_id = string.inspect(system_time())
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 GET REQUEST START - ID: "
+      <> request_id
+      <> " metric: "
+      <> metric_name,
+  )
+
+  use <- wisp.require_method(req, http.Get)
+
+  use account_id <- with_auth(req)
+
+  case metric_store.get_value(account_id, metric_name) {
+    Ok(value) -> {
+      let success_json =
+        json.object([
+          #("metric_name", json.string(metric_name)),
+          #("account_id", json.string(account_id)),
+          #("current_value", json.float(value)),
+          #("timestamp", json.int(current_timestamp())),
+        ])
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Retrieved metric: "
+          <> metric_name
+          <> " = "
+          <> float.to_string(value),
+      )
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🔍 GET REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(success_json), 200)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Not Found")),
+          #("message", json.string("Metric not found: " <> metric_name)),
+        ])
+
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Metric not found: " <> metric_name,
+      )
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🔍 GET REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(error_json), 404)
+    }
+  }
+}
+
+// UPDATE (PUT /api/v1/metrics/{metric_name})
+pub fn update_metric(req: Request, metric_name: String) -> Response {
+  let request_id = string.inspect(system_time())
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 UPDATE REQUEST START - ID: "
+      <> request_id
+      <> " metric: "
+      <> metric_name,
+  )
+
+  use <- wisp.require_method(req, http.Put)
+
+  use account_id <- with_auth(req)
+
+  // Parse JSON body
+  use json_data <- wisp.require_json(req)
+
+  let result = {
+    use update_req <- result.try(decode.run(
+      json_data,
+      update_metric_request_decoder(),
+    ))
+    Ok(process_update_metric(account_id, metric_name, update_req.value))
+  }
+
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 UPDATE REQUEST END - ID: " <> request_id,
+  )
+
+  case result {
+    Ok(response) -> response
+    Error(decode_errors) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Bad update request: " <> string.inspect(decode_errors),
+      )
+      let error_json =
+        json.object([
+          #("error", json.string("Bad Request")),
+          #("message", json.string("Invalid update data")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 400)
+    }
+  }
+}
+
+// DELETE (DELETE /api/v1/metrics/{metric_name})
+pub fn delete_metric(req: Request, metric_name: String) -> Response {
+  let request_id = string.inspect(system_time())
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 DELETE REQUEST START - ID: "
+      <> request_id
+      <> " metric: "
+      <> metric_name,
+  )
+
+  use <- wisp.require_method(req, http.Delete)
+
+  use account_id <- with_auth(req)
+
+  // Try to find and stop the metric actor
+  case metric_actor.lookup_metric_subject(account_id, metric_name) {
+    Ok(metric_subject) -> {
+      // Send shutdown message to metric actor
+      process.send(metric_subject, metric_actor.Shutdown)
+
+      // Clean up ETS entry
+      // Note: MetricStore doesn't have delete yet, we'll add it
+
+      let success_json =
+        json.object([
+          #("message", json.string("Metric deleted successfully")),
+          #("metric_name", json.string(metric_name)),
+          #("account_id", json.string(account_id)),
+        ])
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Deleted metric: " <> metric_name,
+      )
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🔍 DELETE REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(success_json), 200)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Not Found")),
+          #("message", json.string("Metric not found: " <> metric_name)),
+        ])
+
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Delete failed - metric not found: " <> metric_name,
+      )
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🔍 DELETE REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(error_json), 404)
+    }
+  }
+}
+
+// ===== PROCESSING FUNCTIONS =====
+
+// Process the validated metric request (CREATE)
+fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
   let operation = req.operation
   let interval = req.flush_interval
   let tags = req.tags
@@ -267,29 +439,20 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
 
   logging.log(
     logging.Info,
-    "[MetricHandler] Processing metric: "
+    "[MetricHandler] Processing CREATE metric: "
       <> account_id
       <> "/"
       <> req.metric_name,
   )
 
-  // 🔥 NEW: Send the metric to the application actor to spawn MetricActor!
   case get_application_actor() {
     Ok(app_actor) -> {
       logging.log(
         logging.Info,
-        "[MetricHandler] 🚀 Sending to application actor: "
-          <> req.metric_name
-          <> " with tick_type: "
-          <> tick_type,
+        "[MetricHandler] 🚀 Sending CREATE to application actor: "
+          <> req.metric_name,
       )
-      let message_id = string.inspect(system_time())
-      // Simple unique ID
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🎯 Sending message ID: " <> message_id,
-      )
-      // Send SendMetricToUser message to application actor
+
       process.send(
         app_actor,
         application.SendMetricToUser(
@@ -298,18 +461,17 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
           value: req.value,
           tick_type: tick_type,
           operation: req.operation,
-          // ADD this line
         ),
       )
+
       logging.log(
         logging.Info,
-        "[MetricHandler] ✅ Metric sent to application: "
+        "[MetricHandler] ✅ CREATE metric sent to application: "
           <> req.metric_name
           <> " = "
           <> float.to_string(req.value),
       )
 
-      // Return success response
       let success_json =
         json.object([
           #("status", json.string("created")),
@@ -334,6 +496,58 @@ fn process_metric(account_id: String, req: MetricRequest) -> Response {
           #("message", json.string("Failed to process metric")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
+}
+
+// Process UPDATE metric (set absolute value)
+fn process_update_metric(
+  account_id: String,
+  metric_name: String,
+  new_value: Float,
+) -> Response {
+  logging.log(
+    logging.Info,
+    "[MetricHandler] Processing UPDATE metric: "
+      <> account_id
+      <> "/"
+      <> metric_name
+      <> " to "
+      <> float.to_string(new_value),
+  )
+
+  case metric_store.reset_metric(account_id, metric_name, new_value) {
+    Ok(_) -> {
+      let success_json =
+        json.object([
+          #("status", json.string("updated")),
+          #("account_id", json.string(account_id)),
+          #("metric_name", json.string(metric_name)),
+          #("new_value", json.float(new_value)),
+          #("timestamp", json.int(current_timestamp())),
+        ])
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Updated metric: "
+          <> metric_name
+          <> " = "
+          <> float.to_string(new_value),
+      )
+      wisp.json_response(json.to_string_tree(success_json), 200)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Not Found")),
+          #("message", json.string("Metric not found: " <> metric_name)),
+        ])
+
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Update failed - metric not found: " <> metric_name,
+      )
+      wisp.json_response(json.to_string_tree(error_json), 404)
     }
   }
 }

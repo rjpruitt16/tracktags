@@ -377,6 +377,28 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         logging.Info,
         "[MetricActor] Shutting down: " <> state.default_metric.metric_name,
       )
+
+      // NEW: Unregister from registry before stopping
+      let key =
+        state.default_metric.account_id
+        <> "_"
+        <> state.default_metric.metric_name
+      case
+        glixir.unregister_subject(
+          atom.create("tracktags_actors"),
+          atom.create(key),
+          glixir.atom_key_encoder,
+        )
+      {
+        Ok(_) ->
+          logging.log(logging.Info, "[MetricActor] ✅ Unregistered: " <> key)
+        Error(_) ->
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ Failed to unregister: " <> key,
+          )
+      }
+
       actor.stop()
     }
   }
