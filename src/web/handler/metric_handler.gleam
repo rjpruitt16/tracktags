@@ -6,6 +6,7 @@ import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/float
 import gleam/http
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option}
@@ -23,6 +24,8 @@ pub type MetricRequest {
     value: Float,
     operation: String,
     flush_interval: String,
+    cleanup_after: String,
+    // NEW: Auto-cleanup configuration
     tags: Dict(String, String),
   )
 }
@@ -31,12 +34,33 @@ pub type UpdateMetricRequest {
   UpdateMetricRequest(value: Float)
 }
 
-// Valid operations and intervals
+// Valid operations, intervals, and cleanup periods
 const valid_operations = ["SUM", "AVG", "MAX", "MIN", "COUNT"]
 
 const valid_intervals = [
   "1s", "5s", "30s", "1m", "15m", "30m", "1h", "6h", "1d",
 ]
+
+const valid_cleanup_periods = [
+  "5s", "1m", "1h", "6h", "1d", "7d", "30d", "never",
+]
+
+// Convert cleanup_after to seconds for comparison
+fn cleanup_to_seconds(cleanup_period: String) -> Int {
+  case cleanup_period {
+    "5s" -> 5
+    "1m" -> 60
+    "1h" -> 3600
+    "6h" -> 21_600
+    "1d" -> 86_400
+    "7d" -> 604_800
+    "30d" -> 2_592_000
+    "never" -> -1
+    // Special value for no cleanup
+    _ -> 86_400
+    // Default to 1 day
+  }
+}
 
 // Convert flush_interval to tick_type for internal use
 fn interval_to_tick_type(interval: String) -> String {
@@ -54,7 +78,7 @@ fn interval_to_tick_type(interval: String) -> String {
   }
 }
 
-// TODO: Update to validate key. 
+// TODO: Update to validate key and get real account data
 fn validate_api_key(api_key: String) -> Result(String, String) {
   case api_key {
     "tk_live_test123" -> Ok("test_user_001")
@@ -119,6 +143,12 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     "1h",
     decode.string,
   )
+  use cleanup_after <- decode.optional_field(
+    "cleanup_after",
+    "1d",
+    // Default to 1 day cleanup
+    decode.string,
+  )
   use tags <- decode.optional_field(
     "tags",
     dict.new(),
@@ -130,6 +160,7 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     value: value,
     operation: operation,
     flush_interval: flush_interval,
+    cleanup_after: cleanup_after,
     tags: tags,
   ))
 }
@@ -188,7 +219,22 @@ fn validate_metric_request(
     }
   })
   |> result.try(fn(_) {
-    // Validate value is not zero (simple validation)
+    // Validate cleanup_after
+    case list.contains(valid_cleanup_periods, req.cleanup_after) {
+      False ->
+        Error([
+          decode.DecodeError(
+            "Invalid",
+            "Invalid cleanup_after. Must be one of: "
+              <> string.join(valid_cleanup_periods, ", "),
+            [],
+          ),
+        ])
+      True -> Ok(Nil)
+    }
+  })
+  |> result.try(fn(_) {
+    // Validate value
     case req.value {
       _ -> Ok(req)
     }
@@ -386,9 +432,6 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
       // Send shutdown message to metric actor
       process.send(metric_subject, metric_actor.Shutdown)
 
-      // Clean up ETS entry
-      // Note: MetricStore doesn't have delete yet, we'll add it
-
       let success_json =
         json.object([
           #("message", json.string("Metric deleted successfully")),
@@ -434,15 +477,22 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
 fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
   let operation = req.operation
   let interval = req.flush_interval
+  let cleanup_after = req.cleanup_after
   let tags = req.tags
   let tick_type = interval_to_tick_type(interval)
+  let cleanup_seconds = cleanup_to_seconds(cleanup_after)
 
   logging.log(
     logging.Info,
     "[MetricHandler] Processing CREATE metric: "
       <> account_id
       <> "/"
-      <> req.metric_name,
+      <> req.metric_name
+      <> " (cleanup_after: "
+      <> cleanup_after
+      <> " = "
+      <> int.to_string(cleanup_seconds)
+      <> "s)",
   )
 
   case get_application_actor() {
@@ -461,6 +511,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
           value: req.value,
           tick_type: tick_type,
           operation: req.operation,
+          cleanup_after_seconds: cleanup_seconds,
+          // NEW: Pass cleanup config
         ),
       )
 
@@ -480,6 +532,7 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
           #("value", json.float(req.value)),
           #("operation", json.string(operation)),
           #("flush_interval", json.string(interval)),
+          #("cleanup_after", json.string(cleanup_after)),
           #("tick_type", json.string(tick_type)),
         ])
 

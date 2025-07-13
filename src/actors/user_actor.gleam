@@ -16,6 +16,7 @@ pub type Message {
     initial_value: Float,
     tick_type: String,
     operation: String,
+    cleanup_after_seconds: Int,
   )
   GetMetricActor(
     metric_name: String,
@@ -28,8 +29,11 @@ pub type State {
   State(
     account_id: String,
     metrics_supervisor: glixir.DynamicSupervisor(
-      #(String, String, String, Float, String, String),
-      process.Subject(metric_actor.Message),
+      #(String, String, String, Float, String, String, Int),
+      process.Subject(
+        metric_actor.Message,
+        // NEW: Add Int for cleanup
+      ),
     ),
   )
 }
@@ -54,12 +58,19 @@ pub fn lookup_user_subject(
   }
 }
 
-// Encoder function for metric actor arguments
+// Encoder function for metric actor arguments - NOW WITH CLEANUP
 fn encode_metric_args(
-  args: #(String, String, String, Float, String, String),
+  args: #(String, String, String, Float, String, String, Int),
 ) -> List(dynamic.Dynamic) {
-  let #(account_id, metric_name, tick_type, initial_value, tags_json, operation) =
-    args
+  let #(
+    account_id,
+    metric_name,
+    tick_type,
+    initial_value,
+    tags_json,
+    operation,
+    cleanup_after_seconds,
+  ) = args
   [
     dynamic.string(account_id),
     dynamic.string(metric_name),
@@ -67,6 +78,8 @@ fn encode_metric_args(
     dynamic.float(initial_value),
     dynamic.string(tags_json),
     dynamic.string(operation),
+    dynamic.int(cleanup_after_seconds),
+    // NEW: Pass cleanup seconds
   ]
 }
 
@@ -82,7 +95,14 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     "[UserActor] Received message: " <> string.inspect(message),
   )
   case message {
-    RecordMetric(metric_id, metric, initial_value, tick_type, operation) -> {
+    RecordMetric(
+      metric_id,
+      metric,
+      initial_value,
+      tick_type,
+      operation,
+      cleanup_after_seconds,
+    ) -> {
       logging.log(
         logging.Info,
         "[UserActor] Processing metric: "
@@ -91,7 +111,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           <> metric_id
           <> " (operation: "
           <> operation
-          <> ")",
+          <> ", cleanup_after: "
+          <> string.inspect(cleanup_after_seconds)
+          <> "s)",
       )
 
       case metric_actor.lookup_metric_subject(state.account_id, metric_id) {
@@ -119,6 +141,8 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               0.0,
               "{}",
               operation,
+              cleanup_after_seconds,
+              // NEW: Pass cleanup seconds
             )
           case
             glixir.start_dynamic_child(
@@ -153,8 +177,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                   )
                 }
                 Error(_) -> {
-                  // If not ready immediately, that's OK - the MetricActor
-                  // will initialize with the initial_value we passed to it
+                  // If not ready immediately, that's OK
                   logging.log(
                     logging.Info,
                     "[UserActor] MetricActor still initializing, will use initial_value",
@@ -272,4 +295,11 @@ pub fn start(
     child_type: glixir.worker,
     encode: encode_user_args,
   )
+}
+
+@external(erlang, "os", "system_time")
+fn system_time() -> Int
+
+fn current_timestamp() -> Int {
+  system_time() / 1_000_000_000
 }

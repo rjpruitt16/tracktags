@@ -1,4 +1,3 @@
-// Fixed application.gleam - Simple non-blocking approach
 import actors/clock_actor
 import actors/metric_actor
 import actors/user_actor
@@ -20,6 +19,7 @@ pub type ApplicationMessage {
     value: Float,
     tick_type: String,
     operation: String,
+    cleanup_after_seconds: Int,
   )
   Shutdown
 }
@@ -132,7 +132,14 @@ fn handle_application_message(
   )
 
   case message {
-    SendMetricToUser(account_id, metric_name, value, tick_type, operation) -> {
+    SendMetricToUser(
+      account_id,
+      metric_name,
+      value,
+      tick_type,
+      operation,
+      cleanup_after_seconds,
+    ) -> {
       let message_id = string.inspect(system_time())
       logging.log(
         logging.Info,
@@ -167,6 +174,8 @@ fn handle_application_message(
               value,
               tick_type,
               operation,
+              cleanup_after_seconds,
+              // NEW: Pass cleanup config
             ),
           )
 
@@ -199,6 +208,8 @@ fn handle_application_message(
                   value,
                   tick_type,
                   operation,
+                  cleanup_after_seconds,
+                  // NEW: Pass cleanup config
                 ),
               )
 
