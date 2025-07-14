@@ -1,5 +1,4 @@
 import actors/application
-import actors/clock_actor
 import envoy
 import gleam/erlang/process
 import gleam/int
@@ -22,17 +21,37 @@ pub fn get_env_or(key: String, default: String) -> String {
   )
 }
 
+/// Require an environment variable or crash
+pub fn require_env(key: String) -> String {
+  case envoy.get(key) {
+    Ok(val) -> val
+    Error(_) -> {
+      logging.log(
+        logging.Error,
+        "[Main] Required environment variable '" <> key <> "' was not present",
+      )
+      panic as "Required environment variable missing"
+    }
+  }
+}
+
 pub fn main() {
-  // Configure logging
+  // Configure logging first
   logging.configure()
 
-  // Get configuration from environment
+  io.println("[Main] 🚀 Starting TrackTags")
+
+  // Check all required environment variables first
+  let supabase_url = require_env("SUPABASE_URL")
+  let supabase_key = require_env("SUPABASE_KEY")
+
+  // Optional variables with defaults
   let clockwork_url =
     get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
   let port = 8080
 
-  io.println("[Main] 🚀 Starting TrackTags")
   io.println("[Main] Using Clockwork URL: " <> clockwork_url)
+  io.println("[Main] Using Supabase URL: " <> supabase_url)
   io.println("[Main] API will be available on port: " <> int.to_string(port))
 
   // Start the TrackTags application (actors, registry, etc.)
@@ -42,44 +61,21 @@ pub fn main() {
         logging.Info,
         "[Main] ✅ TrackTags application started successfully!",
       )
-
       // Configure Wisp
       wisp.configure_logger()
       let secret_key_base = wisp.random_string(64)
-
       // Create the Wisp handler for Mist using wisp_mist submodule
       let handler = wisp_mist.handler(router.handle_request, secret_key_base)
-
       // Start the web server
       let assert Ok(_) =
         handler
         |> mist.new
         |> mist.port(port)
         |> mist.start
-
       logging.log(logging.Info, "[Main] ✅ Web server started successfully!")
 
-      io.println("")
       io.println("🎉 TrackTags is running!")
-      io.println(
-        "📡 Metrics API: http://localhost:"
-        <> int.to_string(port)
-        <> "/api/v1/metrics",
-      )
-      io.println(
-        "❤️  Health Check: http://localhost:" <> int.to_string(port) <> "/health",
-      )
-      io.println("")
-      io.println("📖 Test with curl:")
-      io.println(
-        "curl -X POST http://localhost:"
-        <> int.to_string(port)
-        <> "/api/v1/metrics \\",
-      )
-      io.println("  -H \"Authorization: Bearer tk_live_test123\" \\")
-      io.println("  -H \"Content-Type: application/json\" \\")
-      io.println("  -d '{\"metric_name\": \"api_calls\", \"value\": 1.0}'")
-      io.println("")
+      io.println("📡 API: http://localhost:" <> int.to_string(port))
 
       process.sleep_forever()
     }
@@ -89,6 +85,10 @@ pub fn main() {
         "[Main] ❌ Failed to start application: " <> string.inspect(e),
       )
       io.println("[Main] Failed to start: " <> string.inspect(e))
+      panic as "Failed to start TrackTags application"
     }
   }
 }
+
+@external(erlang, "erlang", "halt")
+fn halt(exit_code: Int) -> Nil

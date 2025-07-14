@@ -26,13 +26,14 @@ pub type ApplicationMessage {
   Shutdown
 }
 
-// Simplified state - phantom-typed supervisor  
+// Updated state to include ClockActor reference
 pub type ApplicationState {
   ApplicationState(
     supervisor: glixir.DynamicSupervisor(
       String,
       process.Subject(user_actor.Message),
     ),
+    clock_actor: process.Subject(clock_actor.Message),
   )
 }
 
@@ -239,19 +240,23 @@ fn handle_application_message(
     }
     Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
+      // Shutdown ClockActor gracefully
+      process.send(state.clock_actor, clock_actor.Shutdown)
       actor.stop()
     }
   }
 }
 
-// Start application actor that manages the supervisor
+// Start application actor that manages the supervisor AND clock actor
 pub fn start_application_actor(
   supervisor: glixir.DynamicSupervisor(
     String,
     process.Subject(user_actor.Message),
   ),
+  clock_actor_subject: process.Subject(clock_actor.Message),
 ) -> Result(process.Subject(ApplicationMessage), actor.StartError) {
-  let initial_state = ApplicationState(supervisor: supervisor)
+  let initial_state =
+    ApplicationState(supervisor: supervisor, clock_actor: clock_actor_subject)
 
   case
     actor.new(initial_state)
@@ -295,7 +300,7 @@ pub fn start_application_actor(
   }
 }
 
-// Update the start_app function
+// Updated start_app function that manages ClockActor internally
 pub fn start_app(
   sse_url: String,
 ) -> Result(process.Subject(ApplicationMessage), String) {
@@ -313,13 +318,13 @@ pub fn start_app(
     Ok(glixir_supervisor) -> {
       logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
-      // Start ClockActor (pure Gleam version)
+      // Start ClockActor (now managed by application)
       case clock_actor.start(sse_url) {
-        Ok(_clock_subject) -> {
+        Ok(clock_subject) -> {
           logging.log(logging.Info, "[Application] ✅ ClockActor started")
 
-          // Start application actor to manage state
-          case start_application_actor(glixir_supervisor) {
+          // Start application actor to manage both supervisor and clock
+          case start_application_actor(glixir_supervisor, clock_subject) {
             Ok(app_actor) -> {
               logging.log(
                 logging.Info,

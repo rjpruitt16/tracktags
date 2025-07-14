@@ -1,4 +1,4 @@
-// src/actors/clock_actor.gleam - Enhanced with debug logging
+// src/actors/clock_actor.gleam - Enhanced with debug logging and shutdown
 import clients/clockwork_client
 import gleam/dynamic
 import gleam/erlang/atom
@@ -17,6 +17,8 @@ pub type Message {
   SseClosed(reason: String)
   RetryConnect
   StoreSubject(subject: process.Subject(Message))
+  Shutdown
+  // NEW: For graceful shutdown
 }
 
 // ───────────── State ─────────────
@@ -226,6 +228,12 @@ fn handle_message(st: State, msg: Message) -> actor.Next(State, Message) {
     StoreSubject(subject) -> {
       logging.log(logging.Info, "[ClockActor] 📝 Storing self subject reference")
       actor.continue(State(..st, self_subject: Some(subject)))
+    }
+
+    Shutdown -> {
+      logging.log(logging.Info, "[ClockActor] 🛑 Graceful shutdown requested")
+      // TODO: Stop SSE connection if needed
+      actor.stop()
     }
   }
 }
