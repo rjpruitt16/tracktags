@@ -1,5 +1,6 @@
 import actors/application
 import actors/metric_actor
+import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/atom
@@ -88,13 +89,56 @@ fn interval_to_tick_type(interval: String) -> String {
   }
 }
 
-// TODO: Update to validate key and get real account data
+// NEW: Real API key validation using Supabase
 fn validate_api_key(api_key: String) -> Result(String, String) {
-  case api_key {
-    "tk_live_test123" -> Ok("test_user_001")
-    "tk_live_test456" -> Ok("test_user_002")
-    "tk_live_test789" -> Ok("test_user_003")
-    _ -> Error("Invalid API key")
+  logging.log(
+    logging.Info,
+    "[MetricHandler] Validating API key via Supabase: "
+      <> string.slice(api_key, 0, 10)
+      <> "...",
+  )
+
+  case supabase_client.validate_api_key(api_key) {
+    Ok(business_id) -> {
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ API key validated for business: " <> business_id,
+      )
+      Ok(business_id)
+    }
+    Error(supabase_client.NotFound) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] ❌ API key not found in database",
+      )
+      Error("Invalid API key")
+    }
+    Error(supabase_client.Unauthorized) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] ❌ Unauthorized access to Supabase",
+      )
+      Error("Database access denied")
+    }
+    Error(supabase_client.HttpError(_)) -> {
+      logging.log(
+        logging.Error,
+        "[MetricHandler] ❌ Network error connecting to Supabase",
+      )
+      Error("Service temporarily unavailable")
+    }
+    Error(supabase_client.DatabaseError(msg)) -> {
+      logging.log(logging.Error, "[MetricHandler] ❌ Database error: " <> msg)
+      Error("Database error")
+    }
+    Error(supabase_client.ParseError(msg)) -> {
+      logging.log(logging.Error, "[MetricHandler] ❌ Parse error: " <> msg)
+      Error("Invalid response format")
+    }
+    Error(supabase_client.NetworkError(msg)) -> {
+      logging.log(logging.Error, "[MetricHandler] ❌ Network error: " <> msg)
+      Error("Network error")
+    }
   }
 }
 
@@ -128,7 +172,9 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
         Error(error) -> {
           logging.log(
             logging.Warning,
-            "[MetricHandler] Invalid API key: " <> api_key,
+            "[MetricHandler] Invalid API key: "
+              <> string.slice(api_key, 0, 10)
+              <> "...",
           )
           let error_json =
             json.object([
@@ -137,7 +183,8 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
             ])
           wisp.json_response(json.to_string_tree(error_json), 401)
         }
-        Ok(account_id) -> handler(account_id)
+        Ok(business_id) -> handler(business_id)
+        // Now returns business_id instead of account_id
       }
     }
   }
@@ -304,7 +351,8 @@ pub fn create_metric(req: Request) -> Response {
 
   use <- wisp.require_method(req, http.Post)
 
-  use account_id <- with_auth(req)
+  use business_id <- with_auth(req)
+  // Now called business_id instead of account_id
 
   // Parse JSON body
   use json_data <- wisp.require_json(req)
@@ -312,7 +360,7 @@ pub fn create_metric(req: Request) -> Response {
   let result = {
     use metric_req <- result.try(decode.run(json_data, metric_request_decoder()))
     use validated_req <- result.try(validate_metric_request(metric_req))
-    Ok(process_create_metric(account_id, validated_req))
+    Ok(process_create_metric(business_id, validated_req))
   }
 
   logging.log(
@@ -350,14 +398,16 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
 
   use <- wisp.require_method(req, http.Get)
 
-  use account_id <- with_auth(req)
+  use business_id <- with_auth(req)
+  // Now called business_id
 
-  case metric_store.get_value(account_id, metric_name) {
+  case metric_store.get_value(business_id, metric_name) {
     Ok(value) -> {
       let success_json =
         json.object([
           #("metric_name", json.string(metric_name)),
-          #("account_id", json.string(account_id)),
+          #("business_id", json.string(business_id)),
+          // Updated field name
           #("current_value", json.float(value)),
           #("timestamp", json.int(current_timestamp())),
         ])
@@ -410,7 +460,8 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
 
   use <- wisp.require_method(req, http.Put)
 
-  use account_id <- with_auth(req)
+  use business_id <- with_auth(req)
+  // Now called business_id
 
   // Parse JSON body
   use json_data <- wisp.require_json(req)
@@ -420,7 +471,7 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
       json_data,
       update_metric_request_decoder(),
     ))
-    Ok(process_update_metric(account_id, metric_name, update_req.value))
+    Ok(process_update_metric(business_id, metric_name, update_req.value))
   }
 
   logging.log(
@@ -458,10 +509,11 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
 
   use <- wisp.require_method(req, http.Delete)
 
-  use account_id <- with_auth(req)
+  use business_id <- with_auth(req)
+  // Now called business_id
 
   // Try to find and stop the metric actor
-  case metric_actor.lookup_metric_subject(account_id, metric_name) {
+  case metric_actor.lookup_metric_subject(business_id, metric_name) {
     Ok(metric_subject) -> {
       // Send shutdown message to metric actor
       process.send(metric_subject, metric_actor.Shutdown)
@@ -470,7 +522,8 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
         json.object([
           #("message", json.string("Metric deleted successfully")),
           #("metric_name", json.string(metric_name)),
-          #("account_id", json.string(account_id)),
+          #("business_id", json.string(business_id)),
+          // Updated field name
         ])
 
       logging.log(
@@ -508,7 +561,8 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
 // ===== PROCESSING FUNCTIONS =====
 
 // Process the validated metric request (CREATE)
-fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
+fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
+  // Updated parameter name
   let operation = req.operation
   let interval = req.flush_interval
   let cleanup_after = req.cleanup_after
@@ -521,7 +575,7 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
   logging.log(
     logging.Info,
     "[MetricHandler] Processing CREATE metric: "
-      <> account_id
+      <> business_id
       <> "/"
       <> req.metric_name
       <> " (cleanup_after: "
@@ -542,7 +596,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
       process.send(
         app_actor,
         application.SendMetricToUser(
-          account_id: account_id,
+          account_id: business_id,
+          // Using business_id for now, might need to update application.gleam
           metric_name: req.metric_name,
           value: req.value,
           tick_type: tick_type,
@@ -564,7 +619,8 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
       let success_json =
         json.object([
           #("status", json.string("created")),
-          #("account_id", json.string(account_id)),
+          #("business_id", json.string(business_id)),
+          // Updated field name
           #("metric_name", json.string(req.metric_name)),
           #("value", json.float(req.value)),
           #("operation", json.string(operation)),
@@ -594,26 +650,28 @@ fn process_create_metric(account_id: String, req: MetricRequest) -> Response {
 
 // Process UPDATE metric (set absolute value)
 fn process_update_metric(
-  account_id: String,
+  business_id: String,
+  // Updated parameter name
   metric_name: String,
   new_value: Float,
 ) -> Response {
   logging.log(
     logging.Info,
     "[MetricHandler] Processing UPDATE metric: "
-      <> account_id
+      <> business_id
       <> "/"
       <> metric_name
       <> " to "
       <> float.to_string(new_value),
   )
 
-  case metric_store.reset_metric(account_id, metric_name, new_value) {
+  case metric_store.reset_metric(business_id, metric_name, new_value) {
     Ok(_) -> {
       let success_json =
         json.object([
           #("status", json.string("updated")),
-          #("account_id", json.string(account_id)),
+          #("business_id", json.string(business_id)),
+          // Updated field name
           #("metric_name", json.string(metric_name)),
           #("new_value", json.float(new_value)),
           #("timestamp", json.int(current_timestamp())),
