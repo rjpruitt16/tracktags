@@ -1,8 +1,7 @@
-// src/storage/supabase_client.gleam
+// src/clients/supabase_client.gleam
 import envoy
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
-import gleam/float
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -14,13 +13,13 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import logging
+import utils/utils
 
 // ============================================================================
 // TYPES
 // ============================================================================
 
 pub type SupabaseError {
-
   NetworkError(String)
   DatabaseError(String)
   ParseError(String)
@@ -72,15 +71,10 @@ pub type MetricRecord {
 // ============================================================================
 
 fn get_supabase_config() -> Result(#(String, String), SupabaseError) {
-  case envoy.get("SUPABASE_URL") {
-    Error(_) -> Error(DatabaseError("SUPABASE_URL not configured"))
-    Ok(url) -> {
-      case envoy.get("SUPABASE_KEY") {
-        Error(_) -> Error(DatabaseError("SUPABASE_KEY not configured"))
-        Ok(key) -> Ok(#(url, key))
-      }
-    }
-  }
+  // Much cleaner - will panic on startup if missing
+  let url = utils.require_env("SUPABASE_URL")
+  let key = utils.require_env("SUPABASE_KEY")
+  Ok(#(url, key))
 }
 
 // Remove unused function

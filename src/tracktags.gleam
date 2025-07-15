@@ -7,33 +7,10 @@ import gleam/option.{None, Some}
 import gleam/string
 import logging
 import mist
+import utils/utils
 import web/router
 import wisp
 import wisp/wisp_mist
-
-pub fn get_env_or(key: String, default: String) -> String {
-  option.unwrap(
-    case envoy.get(key) {
-      Ok(val) -> Some(val)
-      Error(_) -> None
-    },
-    default,
-  )
-}
-
-/// Require an environment variable or crash
-pub fn require_env(key: String) -> String {
-  case envoy.get(key) {
-    Ok(val) -> val
-    Error(_) -> {
-      logging.log(
-        logging.Error,
-        "[Main] Required environment variable '" <> key <> "' was not present",
-      )
-      panic as "Required environment variable missing"
-    }
-  }
-}
 
 pub fn main() {
   // Configure logging first
@@ -41,13 +18,13 @@ pub fn main() {
 
   io.println("[Main] 🚀 Starting TrackTags")
 
-  // Check all required environment variables first
-  let supabase_url = require_env("SUPABASE_URL")
-  let supabase_key = require_env("SUPABASE_KEY")
+  // Check all required environment variables first using utils
+  let supabase_url = utils.require_env("SUPABASE_URL")
+  let supabase_key = utils.require_env("SUPABASE_KEY")
 
-  // Optional variables with defaults
+  // Optional variables with defaults using utils
   let clockwork_url =
-    get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
+    utils.get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
   let port = 8080
 
   io.println("[Main] Using Clockwork URL: " <> clockwork_url)
@@ -89,6 +66,3 @@ pub fn main() {
     }
   }
 }
-
-@external(erlang, "erlang", "halt")
-fn halt(exit_code: Int) -> Nil

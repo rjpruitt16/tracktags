@@ -16,6 +16,7 @@ import gleam/string
 import glixir
 import logging
 import storage/metric_store
+import utils/utils
 import wisp.{type Request, type Response}
 
 // Request body structures
@@ -498,7 +499,7 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
 
 // DELETE (DELETE /api/v1/metrics/{metric_name})
 pub fn delete_metric(req: Request, metric_name: String) -> Response {
-  let request_id = string.inspect(system_time())
+  let request_id = utils.generate_request_id()
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 DELETE REQUEST START - ID: "
@@ -556,6 +557,33 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
       wisp.json_response(json.to_string_tree(error_json), 404)
     }
   }
+}
+
+// TODO: LIST - GET /api/v1/metrics
+pub fn list_metrics(req: Request) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use business_id <- with_auth(req)
+
+  let todo_json =
+    json.object([
+      #("message", json.string("List metrics - TODO")),
+      #("business_id", json.string(business_id)),
+    ])
+  wisp.json_response(json.to_string_tree(todo_json), 200)
+}
+
+// TODO: HISTORY - GET /api/v1/metrics/{metric_name}/history
+pub fn get_metric_history(req: Request, metric_name: String) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use business_id <- with_auth(req)
+
+  let todo_json =
+    json.object([
+      #("message", json.string("Get metric history - TODO")),
+      #("metric_name", json.string(metric_name)),
+      #("business_id", json.string(business_id)),
+    ])
+  wisp.json_response(json.to_string_tree(todo_json), 200)
 }
 
 // ===== PROCESSING FUNCTIONS =====
