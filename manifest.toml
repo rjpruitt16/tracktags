@@ -42,6 +42,7 @@ packages = [
 
 [requirements]
 envoy = { version = ">= 1.0.2 and < 2.0.0" }
+gleam_crypto = { version = ">= 1.5.1 and < 2.0.0" }
 gleam_erlang = { version = ">= 1.0.0 and < 2.0.0" }
 gleam_http = { version = ">= 4.0.0 and < 5.0.0" }
 gleam_httpc = { version = ">= 5.0.0 and < 6.0.0" }

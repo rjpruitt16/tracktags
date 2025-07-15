@@ -9,7 +9,10 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import logging
+import utils/crypto
 import utils/utils
+
+// NEW: Import crypto module
 import wisp.{type Request, type Response}
 
 // ============================================================================
@@ -127,12 +130,26 @@ fn validate_credentials(
   }
 }
 
-fn encrypt_credentials(credentials: Dict(String, String)) -> String {
-  credentials
-  |> dict.to_list()
-  |> list.map(fn(pair) { #(pair.0, json.string(pair.1)) })
-  |> json.object()
-  |> json.to_string()
+// UPDATED: Now encrypts credentials instead of plain JSON
+fn encrypt_credentials(
+  credentials: Dict(String, String),
+) -> Result(String, String) {
+  // Convert credentials to JSON first
+  let credentials_json =
+    credentials
+    |> dict.to_list()
+    |> list.map(fn(pair) { #(pair.0, json.string(pair.1)) })
+    |> json.object()
+    |> json.to_string()
+
+  // Encrypt the JSON
+  case crypto.encrypt_to_json(credentials_json) {
+    Ok(encrypted_json) -> Ok(encrypted_json)
+    Error(crypto.EncryptionFailed(msg)) -> Error("Encryption failed: " <> msg)
+    Error(crypto.KeyDerivationFailed(msg)) ->
+      Error("Key derivation failed: " <> msg)
+    Error(_) -> Error("Encryption error")
+  }
 }
 
 // ============================================================================
@@ -495,53 +512,71 @@ fn process_create_integration(
       <> req.key_name,
   )
 
-  let encrypted_credentials = encrypt_credentials(req.credentials)
-
-  case
-    supabase_client.store_integration_key(
-      business_id,
-      req.integration_type,
-      req.key_name,
-      encrypted_credentials,
-      None,
-    )
-  {
-    Ok(integration_key) -> {
-      let success_json =
-        json.object([
-          #("status", json.string("created")),
-          #("integration_id", json.string(integration_key.id)),
-          #("business_id", json.string(business_id)),
-          #("integration_type", json.string(req.integration_type)),
-          #("key_name", json.string(req.key_name)),
-          #("is_active", json.bool(integration_key.is_active)),
-        ])
-
-      logging.log(
-        logging.Info,
-        "[IntegrationHandler] ✅ Integration created: " <> integration_key.id,
-      )
-      wisp.json_response(json.to_string_tree(success_json), 201)
-    }
-    Error(supabase_client.DatabaseError(msg)) -> {
+  // UPDATED: Now uses encryption
+  case encrypt_credentials(req.credentials) {
+    Error(encryption_error) -> {
       logging.log(
         logging.Error,
-        "[IntegrationHandler] ❌ Database error: " <> msg,
+        "[IntegrationHandler] ❌ Encryption failed: " <> encryption_error,
       )
       let error_json =
         json.object([
           #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to store integration")),
+          #("message", json.string("Failed to encrypt credentials")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
-    Error(_) -> {
-      let error_json =
-        json.object([
-          #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to create integration")),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 500)
+    Ok(encrypted_credentials) -> {
+      case
+        supabase_client.store_integration_key(
+          business_id,
+          req.integration_type,
+          req.key_name,
+          encrypted_credentials,
+          None,
+        )
+      {
+        Ok(integration_key) -> {
+          let success_json =
+            json.object([
+              #("status", json.string("created")),
+              #("integration_id", json.string(integration_key.id)),
+              #("business_id", json.string(business_id)),
+              #("integration_type", json.string(req.integration_type)),
+              #("key_name", json.string(req.key_name)),
+              #("is_active", json.bool(integration_key.is_active)),
+              #("encrypted", json.bool(True)),
+              // NEW: Indicate encryption is used
+            ])
+
+          logging.log(
+            logging.Info,
+            "[IntegrationHandler] ✅ Integration created with encryption: "
+              <> integration_key.id,
+          )
+          wisp.json_response(json.to_string_tree(success_json), 201)
+        }
+        Error(supabase_client.DatabaseError(msg)) -> {
+          logging.log(
+            logging.Error,
+            "[IntegrationHandler] ❌ Database error: " <> msg,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Internal Server Error")),
+              #("message", json.string("Failed to store integration")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 500)
+        }
+        Error(_) -> {
+          let error_json =
+            json.object([
+              #("error", json.string("Internal Server Error")),
+              #("message", json.string("Failed to create integration")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 500)
+        }
+      }
     }
   }
 }
