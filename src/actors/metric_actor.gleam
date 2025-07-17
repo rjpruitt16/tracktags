@@ -1,27 +1,25 @@
+import actors/supabase_actor
+import clients/supabase_client
 import gleam/dict.{type Dict}
-import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
+import gleam/option.{type Option, None}
 import gleam/otp/actor
 import gleam/string
 import glixir
 import glixir/supervisor
 import logging
 import storage/metric_store
-
-pub type MetricType {
-  Reset
-  Checkpoint
-}
+import types/metric_types.{type MetricMetadata, type MetricType}
+import utils/utils
 
 pub type Message {
   RecordMetric(metric: Metric)
   FlushTick(timestamp: String, tick_type: String)
-  CleanupTick(timestamp: String, tick_type: String)
   ForceFlush
   GetStatus(reply_with: process.Subject(Metric))
   Shutdown
@@ -43,31 +41,20 @@ pub type State {
     default_metric: Metric,
     current_metric: Metric,
     tick_type: String,
+    supabase_tick_type: String,
     last_accessed: Int,
     cleanup_after_seconds: Int,
     metric_type: MetricType,
     initial_value: Float,
+    metadata: Option(MetricMetadata),
+    metric_operation: metric_store.Operation,
+    last_flushed_value: Float,
   )
 }
 
 // Tick data type for JSON decoding
 pub type TickData {
   TickData(tick_name: String, timestamp: String)
-}
-
-pub fn metric_type_to_string(metric_type: MetricType) -> String {
-  case metric_type {
-    Reset -> "reset"
-    Checkpoint -> "checkpoint"
-  }
-}
-
-pub fn string_to_metric_type(metric_type: String) -> MetricType {
-  case metric_type {
-    "reset" -> Reset
-    "checkpoint" -> Checkpoint
-    _ -> Checkpoint
-  }
 }
 
 // Helper functions for consistent naming
@@ -80,13 +67,7 @@ pub fn lookup_metric_subject(
   metric_name: String,
 ) -> Result(process.Subject(Message), String) {
   let key = account_id <> "_" <> metric_name
-  case
-    glixir.lookup_subject(
-      atom.create("tracktags_actors"),
-      atom.create(key),
-      glixir.atom_key_encoder,
-    )
-  {
+  case glixir.lookup_subject_string(utils.tracktags_registry(), key) {
     Ok(subject) -> Ok(subject)
     Error(_) ->
       Error("Metric actor not found: " <> account_id <> "/" <> metric_name)
@@ -95,6 +76,10 @@ pub fn lookup_metric_subject(
 
 // Direct tick handler for PubSub
 pub fn handle_tick_direct(registry_key: String, json_message: String) -> Nil {
+  logging.log(
+    logging.Info,
+    "[MetricActor] 🎯 DEBUG: handle_tick_direct called for: " <> registry_key,
+  )
   // Parse account_id and metric_name - split only on FIRST underscore
   case string.split_once(registry_key, "_") {
     Ok(#(account_id, metric_name)) -> {
@@ -116,36 +101,18 @@ pub fn handle_tick_direct(registry_key: String, json_message: String) -> Nil {
           case lookup_metric_subject(account_id, metric_name) {
             Ok(subject) -> {
               // Route based on tick type
-              case tick_data.tick_name {
-                "tick_5s" -> {
-                  // Always send cleanup ticks for 5-second intervals
-                  process.send(
-                    subject,
-                    CleanupTick(tick_data.timestamp, tick_data.tick_name),
-                  )
-                  logging.log(
-                    logging.Debug,
-                    "[MetricActor] ✅ Cleanup tick sent to: "
-                      <> account_id
-                      <> "/"
-                      <> metric_name,
-                  )
-                }
-                _ -> {
-                  // All other ticks are flush ticks (if they match the metric's flush interval)
-                  process.send(
-                    subject,
-                    FlushTick(tick_data.timestamp, tick_data.tick_name),
-                  )
-                  logging.log(
-                    logging.Debug,
-                    "[MetricActor] ✅ Flush tick sent to: "
-                      <> account_id
-                      <> "/"
-                      <> metric_name,
-                  )
-                }
-              }
+              // All other ticks are flush ticks (if they match the metric's flush interval)
+              process.send(
+                subject,
+                FlushTick(tick_data.timestamp, tick_data.tick_name),
+              )
+              logging.log(
+                logging.Debug,
+                "[MetricActor] ✅ Flush tick sent to: "
+                  <> account_id
+                  <> "/"
+                  <> metric_name,
+              )
             }
             Error(_) -> {
               logging.log(
@@ -158,7 +125,7 @@ pub fn handle_tick_direct(registry_key: String, json_message: String) -> Nil {
             }
           }
         }
-        Error(decode_error) -> {
+        Error(_decode_error) -> {
           logging.log(
             logging.Warning,
             "[MetricActor] ❌ Invalid tick JSON: " <> json_message,
@@ -189,11 +156,13 @@ pub fn start_link(
   account_id: String,
   metric_name: String,
   tick_type: String,
+  supabase_tick_type: String,
   initial_value: Float,
-  tags_json: String,
+  tags_string: String,
   operation: String,
   cleanup_after_seconds: Int,
   metric_type: String,
+  metadata_json: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -203,18 +172,25 @@ pub fn start_link(
       <> metric_name
       <> " (flush: "
       <> tick_type
+      <> ", supabase_tick_type: "
+      <> supabase_tick_type
+      <> ", initial value: "
+      <> float.to_string(initial_value)
+      <> ", tags value: "
+      <> tags_string
+      <> ", cleanup_after_seconds: "
       <> int.to_string(cleanup_after_seconds)
       <> ", metric_type: "
       <> metric_type
-      <> ", initial value: "
-      <> float.to_string(initial_value)
       <> ", cleanup_after: "
       <> int.to_string(cleanup_after_seconds)
-      <> "s)",
+      <> ")"
+      <> ", metric_json: "
+      <> metadata_json,
   )
 
-  let tags = parse_tags_json(tags_json)
-  let timestamp = current_timestamp()
+  let tags = parse_tags_json(tags_string)
+  let timestamp = utils.current_timestamp()
 
   let default_metric =
     Metric(
@@ -223,17 +199,6 @@ pub fn start_link(
       value: initial_value,
       tags: tags,
       timestamp: timestamp,
-    )
-
-  let temp_state =
-    State(
-      default_metric: default_metric,
-      current_metric: default_metric,
-      tick_type: tick_type,
-      last_accessed: timestamp,
-      cleanup_after_seconds: cleanup_after_seconds,
-      metric_type: string_to_metric_type(metric_type),
-      initial_value: initial_value,
     )
 
   let metric_operation = case string.uppercase(operation) {
@@ -245,6 +210,20 @@ pub fn start_link(
     "LAST" -> metric_store.Last
     _ -> metric_store.Sum
   }
+  let state =
+    State(
+      default_metric: default_metric,
+      current_metric: default_metric,
+      tick_type: tick_type,
+      supabase_tick_type: supabase_tick_type,
+      last_accessed: timestamp,
+      cleanup_after_seconds: cleanup_after_seconds,
+      metric_type: metric_types.string_to_metric_type(metric_type),
+      initial_value: initial_value,
+      metadata: metric_types.decode_metadata_from_string(metadata_json),
+      metric_operation: metric_operation,
+      last_flushed_value: initial_value,
+    )
 
   case metric_store.init_store(account_id) {
     Ok(_) -> {
@@ -262,13 +241,83 @@ pub fn start_link(
   }
 
   // Create the metric in ETS
+  let restored_value = case state.metric_type {
+    metric_types.Checkpoint -> {
+      case
+        metric_types.should_send_to_supabase(state.metric_type, state.metadata)
+      {
+        True -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] 🔍 Attempting to restore checkpoint from Supabase: "
+              <> metric_name,
+          )
+          case
+            supabase_client.get_latest_metric_value(account_id, metric_name)
+          {
+            Ok(restored_value) -> {
+              logging.log(
+                logging.Info,
+                "[MetricActor] ✅ Restored from Supabase: "
+                  <> float.to_string(restored_value),
+              )
+              restored_value
+            }
+            Error(supabase_client.NotFound(_)) -> {
+              logging.log(
+                logging.Info,
+                "[MetricActor] 📋 No previous value in Supabase, using initial: "
+                  <> float.to_string(initial_value),
+              )
+              initial_value
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Warning,
+                "[MetricActor] ⚠️ Supabase restore failed: "
+                  <> string.inspect(error)
+                  <> ", using initial value",
+              )
+              initial_value
+            }
+          }
+        }
+        False -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] 💰 Supabase disabled for this checkpoint (saving money!), using initial: "
+              <> float.to_string(initial_value),
+          )
+          initial_value
+        }
+      }
+    }
+    metric_types.Reset -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] 🔄 Reset metric, using initial value: "
+          <> float.to_string(initial_value),
+      )
+      initial_value
+    }
+  }
+
+  // Create the metric in ETS with the restored/initial value
   case
-    metric_store.create_metric(account_id, metric_name, metric_operation, 0.0)
+    metric_store.create_metric(
+      account_id,
+      metric_name,
+      metric_operation,
+      restored_value,
+    )
   {
     Ok(_) -> {
       logging.log(
         logging.Info,
-        "[MetricActor] ✅ Metric created in store: " <> metric_name,
+        "[MetricActor] ✅ Metric created in store: "
+          <> metric_name
+          <> " = "
+          <> float.to_string(restored_value),
       )
     }
     Error(e) -> {
@@ -280,24 +329,21 @@ pub fn start_link(
     }
   }
 
-  case
-    actor.new(temp_state) |> actor.on_message(handle_message) |> actor.start
-  {
+  case actor.new(state) |> actor.on_message(handle_message) |> actor.start {
     Ok(started) -> {
       let subject = started.data
 
       // Register in registry for lookup
       let key = account_id <> "_" <> metric_name
       case
-        glixir.register_subject(
-          atom.create("tracktags_actors"),
-          atom.create(key),
+        glixir.register_subject_string(
+          utils.tracktags_registry(),
+          key,
           started.data,
-          glixir.atom_key_encoder,
         )
       {
         Ok(_) ->
-          logging.log(logging.Info, "[MetricActor] ✅ Registered: " <> key)
+          logging.log(logging.Info, "[MetricActor] ✅ eegistered: " <> key)
         Error(_) ->
           logging.log(
             logging.Error,
@@ -392,7 +438,7 @@ pub fn start_link(
 
 // Clean message handler with lazy cleanup support
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
-  let current_time = current_timestamp()
+  let current_time = utils.current_timestamp()
 
   // Update last_accessed timestamp for relevant operations
   let updated_state = case message {
@@ -445,29 +491,28 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           <> " at "
           <> timestamp,
       )
-      flush_metrics(updated_state)
-    }
 
-    CleanupTick(timestamp, tick_type) -> {
-      // Dedicated cleanup logic - check if we should self-destruct
-      case updated_state.cleanup_after_seconds {
+      // ✅ Call flush_metrics_and_get_state to get the updated state
+      let flushed_state = flush_metrics_and_get_state(updated_state)
+
+      case flushed_state.cleanup_after_seconds {
         -1 -> {
-          // Should not happen since we don't subscribe to cleanup ticks when disabled
           logging.log(
             logging.Debug,
             "[MetricActor] Ignoring cleanup tick (cleanup disabled): "
-              <> updated_state.default_metric.metric_name,
+              <> flushed_state.default_metric.metric_name,
           )
-          actor.continue(updated_state)
+          actor.continue(flushed_state)
+          // ✅ Use flushed_state
         }
         cleanup_threshold -> {
-          let inactive_duration = current_time - updated_state.last_accessed
+          let inactive_duration = current_time - flushed_state.last_accessed
           case inactive_duration > cleanup_threshold {
             True -> {
               logging.log(
                 logging.Info,
                 "[MetricActor] 🧹 Auto-cleanup triggered for: "
-                  <> updated_state.default_metric.metric_name
+                  <> flushed_state.default_metric.metric_name
                   <> " (inactive for "
                   <> int.to_string(inactive_duration)
                   <> "s, threshold: "
@@ -475,16 +520,14 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                   <> "s)",
               )
 
-              // Unregister from registry before self-destructing
               let key =
-                updated_state.default_metric.account_id
+                flushed_state.default_metric.account_id
                 <> "_"
-                <> updated_state.default_metric.metric_name
+                <> flushed_state.default_metric.metric_name
               case
-                glixir.unregister_subject(
-                  atom.create("tracktags_actors"),
-                  atom.create(key),
-                  glixir.atom_key_encoder,
+                glixir.unregister_subject_string(
+                  utils.tracktags_registry(),
+                  key,
                 )
               {
                 Ok(_) ->
@@ -499,26 +542,25 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                       <> key,
                   )
               }
-
-              // Self-destruct
               actor.stop()
             }
             False -> {
               logging.log(
                 logging.Debug,
                 "[MetricActor] Still active: "
-                  <> updated_state.default_metric.metric_name
+                  <> flushed_state.default_metric.metric_name
                   <> " (inactive for "
                   <> int.to_string(inactive_duration)
                   <> "s)",
               )
-              actor.continue(updated_state)
+              actor.continue(flushed_state)
+              // ✅ Use flushed_state
             }
           }
         }
       }
     }
-
+    // Dedicated cleanup logic - check if we should self-destruct
     ForceFlush -> flush_metrics(updated_state)
 
     GetStatus(reply_with) -> {
@@ -538,13 +580,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         updated_state.default_metric.account_id
         <> "_"
         <> updated_state.default_metric.metric_name
-      case
-        glixir.unregister_subject(
-          atom.create("tracktags_actors"),
-          atom.create(key),
-          glixir.atom_key_encoder,
-        )
-      {
+      case glixir.unregister_subject_string(utils.tracktags_registry(), key) {
         Ok(_) ->
           logging.log(logging.Info, "[MetricActor] ✅ Unregistered: " <> key)
         Error(_) ->
@@ -560,16 +596,18 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 }
 
 pub fn start(
-  account_id: String,
-  metric_name: String,
-  tick_type: String,
-  initial_value: Float,
-  tags_json: String,
-  operation: String,
-  cleanup_after_seconds: Int,
-  metric_type: String,
+  account_id account_id: String,
+  metric_name metric_name: String,
+  tick_type tick_type: String,
+  supabase_tick_type supabase_tick_type: String,
+  initial_value initial_value: Float,
+  tags tags: String,
+  operation operation: String,
+  cleanup_after_seconds cleanup_after_seconds: Int,
+  metric_type metric_type: String,
+  metadata metadata: String,
 ) -> supervisor.ChildSpec(
-  #(String, String, String, Float, String, String, Int, String),
+  #(String, String, String, String, Float, String, String, Int, String, String),
   process.Subject(Message),
 ) {
   supervisor.ChildSpec(
@@ -580,11 +618,13 @@ pub fn start(
       account_id,
       metric_name,
       tick_type,
+      supabase_tick_type,
       initial_value,
-      tags_json,
+      tags,
       operation,
       cleanup_after_seconds,
       metric_type,
+      metadata,
     ),
     restart: supervisor.Permanent,
     shutdown_timeout: 5000,
@@ -592,46 +632,274 @@ pub fn start(
   )
 }
 
-// Updated flush_metrics function to respect metric type
+// FIXED: Updated flush_metrics function for MetricActor
 fn flush_metrics(state: State) -> actor.Next(State, Message) {
   logging.log(
     logging.Info,
     "[MetricActor] 📊 Flushing metrics: " <> state.default_metric.metric_name,
   )
 
+  // Get current value from metric store
+  let current_value = case
+    metric_store.get_value(
+      state.default_metric.account_id,
+      state.default_metric.metric_name,
+    )
+  {
+    Ok(value) -> value
+    Error(_) -> state.initial_value
+  }
+
+  // Calculate diff since last flush
+  let diff = current_value -. state.last_flushed_value
+
+  logging.log(
+    logging.Info,
+    "[MetricActor] 🔍 Flush diff: current="
+      <> float.to_string(current_value)
+      <> ", last_flushed="
+      <> float.to_string(state.last_flushed_value)
+      <> ", diff="
+      <> float.to_string(diff),
+  )
+
+  // Determine new last_flushed_value based on whether we send to Supabase
+  let new_last_flushed_value = case
+    metric_types.should_send_to_supabase(state.metric_type, state.metadata)
+  {
+    True -> {
+      case diff {
+        0.0 -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] 📊 No change since last flush, skipping Supabase",
+          )
+          state.last_flushed_value
+          // No change
+        }
+        _ -> {
+          // Send the diff
+          let batch =
+            metric_types.MetricBatch(
+              business_id: state.default_metric.account_id,
+              client_id: None,
+              metric_name: state.default_metric.metric_name,
+              aggregated_value: diff,
+              // ✅ Send only the diff
+              operation_count: 1,
+              metric_type: metric_types.metric_type_to_string(state.metric_type),
+              window_start: utils.current_timestamp(),
+              window_end: utils.current_timestamp(),
+              flush_interval: state.supabase_tick_type,
+              scope: "business",
+              adapters: None,
+              metric_mode: metric_types.Simple(
+                convert_metric_store_operation_to_simple(state.metric_operation),
+              ),
+            )
+
+          case supabase_actor.send_metric_batch(batch) {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[MetricActor] ✅ Sent diff to SupabaseActor: "
+                  <> float.to_string(diff),
+              )
+              current_value
+              // ✅ Update to current value on success
+            }
+            Error(e) -> {
+              logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
+              state.last_flushed_value
+              // Keep old value on failure
+            }
+          }
+        }
+      }
+    }
+    False -> {
+      logging.log(
+        logging.Debug,
+        "[MetricActor] Skipping Supabase for this metric type",
+      )
+      state.last_flushed_value
+      // No change when not sending to Supabase
+    }
+  }
+
+  // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
-    Reset -> {
-      // Reset to initial value
+    metric_types.Checkpoint -> {
       logging.log(
         logging.Info,
-        "[MetricActor] 🔄 Reset metric to initial value: "
-          <> float.to_string(state.initial_value),
+        "[MetricActor] ✅ Checkpoint metric (keeping current value)",
       )
-      let _ =
+    }
+    metric_types.Reset -> {
+      logging.log(logging.Info, "[MetricActor] 🔄 Reset metric to initial value")
+      case
         metric_store.reset_metric(
           state.default_metric.account_id,
           state.default_metric.metric_name,
           state.initial_value,
         )
-      Nil
+      {
+        Ok(_) -> logging.log(logging.Info, "[MetricActor] ✅ Reset successful")
+        Error(e) ->
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ Reset failed: " <> string.inspect(e),
+          )
+      }
     }
-    Checkpoint -> {
-      // Keep current value (just flush, don't reset)
+  }
+
+  // ✅ Update state with new last_flushed_value
+  actor.continue(
+    State(
+      ..state,
+      current_metric: state.default_metric,
+      last_flushed_value: new_last_flushed_value,
+    ),
+  )
+}
+
+/// Convert metric_store.Operation to metric_types.SimpleOperation
+fn convert_metric_store_operation_to_simple(
+  operation: metric_store.Operation,
+) -> metric_types.SimpleOperation {
+  case operation {
+    metric_store.Sum -> metric_types.Sum
+    metric_store.Min -> metric_types.Min
+    metric_store.Max -> metric_types.Max
+    metric_store.Average -> metric_types.Average
+    metric_store.Count -> metric_types.Count
+    metric_store.Last -> metric_types.Sum
+    // Fallback
+  }
+}
+
+// Helper function to flush metrics and return just the state
+fn flush_metrics_and_get_state(state: State) -> State {
+  logging.log(
+    logging.Info,
+    "[MetricActor] 📊 Flushing metrics: " <> state.default_metric.metric_name,
+  )
+
+  // Get current value from metric store
+  let current_value = case
+    metric_store.get_value(
+      state.default_metric.account_id,
+      state.default_metric.metric_name,
+    )
+  {
+    Ok(value) -> value
+    Error(_) -> state.initial_value
+  }
+
+  // Calculate diff since last flush
+  let diff = current_value -. state.last_flushed_value
+
+  logging.log(
+    logging.Info,
+    "[MetricActor] 🔍 Flush diff: current="
+      <> float.to_string(current_value)
+      <> ", last_flushed="
+      <> float.to_string(state.last_flushed_value)
+      <> ", diff="
+      <> float.to_string(diff),
+  )
+
+  // Determine new last_flushed_value based on whether we send to Supabase
+  let new_last_flushed_value = case
+    metric_types.should_send_to_supabase(state.metric_type, state.metadata)
+  {
+    True -> {
+      case diff {
+        0.0 -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] 📊 No change since last flush, skipping Supabase",
+          )
+          state.last_flushed_value
+        }
+        _ -> {
+          // Send the diff
+          let batch =
+            metric_types.MetricBatch(
+              business_id: state.default_metric.account_id,
+              client_id: None,
+              metric_name: state.default_metric.metric_name,
+              aggregated_value: diff,
+              operation_count: 1,
+              metric_type: metric_types.metric_type_to_string(state.metric_type),
+              window_start: utils.current_timestamp(),
+              window_end: utils.current_timestamp(),
+              flush_interval: state.supabase_tick_type,
+              scope: "business",
+              adapters: None,
+              metric_mode: metric_types.Simple(
+                convert_metric_store_operation_to_simple(state.metric_operation),
+              ),
+            )
+
+          case supabase_actor.send_metric_batch(batch) {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[MetricActor] ✅ Sent diff to SupabaseActor: "
+                  <> float.to_string(diff),
+              )
+              current_value
+            }
+            Error(e) -> {
+              logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
+              state.last_flushed_value
+            }
+          }
+        }
+      }
+    }
+    False -> {
+      logging.log(
+        logging.Debug,
+        "[MetricActor] Skipping Supabase for this metric type",
+      )
+      state.last_flushed_value
+    }
+  }
+
+  // Handle metric type specific behavior (reset vs checkpoint)
+  case state.metric_type {
+    metric_types.Checkpoint -> {
       logging.log(
         logging.Info,
         "[MetricActor] ✅ Checkpoint metric (keeping current value)",
       )
-      // No reset needed - just continue with current state
-      Nil
+    }
+    metric_types.Reset -> {
+      logging.log(logging.Info, "[MetricActor] 🔄 Reset metric to initial value")
+      case
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          state.initial_value,
+        )
+      {
+        Ok(_) -> logging.log(logging.Info, "[MetricActor] ✅ Reset successful")
+        Error(e) ->
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ Reset failed: " <> string.inspect(e),
+          )
+      }
     }
   }
 
-  actor.continue(State(..state, current_metric: state.default_metric))
-}
-
-@external(erlang, "os", "system_time")
-fn system_time() -> Int
-
-fn current_timestamp() -> Int {
-  system_time() / 1_000_000_000
+  // ✅ Return the updated state
+  State(
+    ..state,
+    current_metric: state.default_metric,
+    last_flushed_value: new_last_flushed_value,
+  )
 }

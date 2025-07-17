@@ -4,15 +4,15 @@ defmodule HttpoisonSse do
   """
   require Logger
 
-  def start_sse(url, _parent_pid) when is_binary(url) do
+  def start_sse(url, _parent_pid, retry_count) when is_binary(url) do
     Logger.debug("[HttpoisonSse] Starting SSE connection to: #{url}")
 
-    pid = spawn_link(fn -> sse_stream_loop(url) end)
+    pid = spawn_link(fn -> sse_stream_loop(url, retry_count) end)
 
     {:sse_started, pid}
   end
 
-  defp sse_stream_loop(url) do
+  defp sse_stream_loop(url, retry_count \\ 0) do
     Logger.info("[HttpoisonSse] Starting HTTPoison stream to: #{url}")
 
     headers = [
@@ -33,14 +33,16 @@ defmodule HttpoisonSse do
     case HTTPoison.get(url, headers, options) do
       {:ok, %HTTPoison.AsyncResponse{id: ref}} ->
         Logger.info("[HttpoisonSse] Got AsyncResponse with ref: #{inspect(ref)}")
-        sse_receive_loop(ref, "")
+        sse_receive_loop(ref, "", retry_count)
 
       {:error, reason} ->
         Logger.error("[HttpoisonSse] Connection failed: #{inspect(reason)}")
+
+        :actors@clock_actor.reconnect(retry_count + 1) 
     end
   end
 
-  defp sse_receive_loop(ref, buffer) do
+  defp sse_receive_loop(ref, buffer, retry_count) do
     Logger.debug("[HttpoisonSse] Waiting for messages... Buffer size: #{byte_size(buffer)}")
 
     receive do
@@ -48,13 +50,13 @@ defmodule HttpoisonSse do
         Logger.info("[HttpoisonSse] Received AsyncStatus: #{code}")
         if code == 200 do
           HTTPoison.stream_next(%HTTPoison.AsyncResponse{id: ref})
-          sse_receive_loop(ref, buffer)
+          sse_receive_loop(ref, buffer, retry_count)
         end
 
       %HTTPoison.AsyncHeaders{id: ^ref, headers: headers} ->
         Logger.info("[HttpoisonSse] Received headers: #{inspect(headers)}")
         HTTPoison.stream_next(%HTTPoison.AsyncResponse{id: ref})
-        sse_receive_loop(ref, buffer)
+        sse_receive_loop(ref, buffer, retry_count)
 
       %HTTPoison.AsyncChunk{id: ^ref, chunk: chunk} ->
         Logger.info("[HttpoisonSse] 🎯 Received chunk (#{byte_size(chunk)} bytes): #{inspect(String.slice(chunk, 0..100))}...")
@@ -74,21 +76,23 @@ defmodule HttpoisonSse do
         end)
 
         HTTPoison.stream_next(%HTTPoison.AsyncResponse{id: ref})
-        sse_receive_loop(ref, remaining_buffer)
+        sse_receive_loop(ref, remaining_buffer, retry_count)
 
       %HTTPoison.AsyncEnd{id: ^ref} ->
         Logger.info("[HttpoisonSse] Stream ended")
+        :actors@clock_actor.reconnect(retry_count)  
 
       %HTTPoison.Error{id: ^ref, reason: reason} ->
         Logger.error("[HttpoisonSse] Stream error: #{inspect(reason)}")
+        :actors@clock_actor.reconnect(retry_count)  
 
       other ->
         Logger.warning("[HttpoisonSse] Unexpected message: #{inspect(other)}")
-        sse_receive_loop(ref, buffer)
+        sse_receive_loop(ref, buffer, retry_count)
     after
       5_000 ->
         Logger.debug("[HttpoisonSse] No message received in 5 seconds, still waiting...")
-        sse_receive_loop(ref, buffer)
+        sse_receive_loop(ref, buffer, retry_count)
     end
   end
 

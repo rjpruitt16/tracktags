@@ -1,7 +1,7 @@
 // src/clients/supabase_client.gleam
-import envoy
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/float
 import gleam/http
 import gleam/http/request
 import gleam/http/response
@@ -23,7 +23,7 @@ pub type SupabaseError {
   NetworkError(String)
   DatabaseError(String)
   ParseError(String)
-  NotFound
+  NotFound(String)
   Unauthorized
   HttpError(httpc.HttpError)
 }
@@ -44,7 +44,6 @@ pub type IntegrationKey {
     business_id: String,
     key_type: String,
     key_name: String,
-    // Changed from Option(String) to String
     encrypted_key: String,
     metadata: Option(Dict(String, json.Json)),
     is_active: Bool,
@@ -58,7 +57,6 @@ pub type MetricRecord {
     client_id: Option(String),
     metric_name: String,
     value: String,
-    // Changed from Float to String to handle JSON parsing
     metric_type: String,
     scope: String,
     adapters: Option(Dict(String, json.Json)),
@@ -76,9 +74,6 @@ fn get_supabase_config() -> Result(#(String, String), SupabaseError) {
   let key = utils.require_env("SUPABASE_KEY")
   Ok(#(url, key))
 }
-
-// Remove unused function
-// fn create_headers was not being used
 
 // ============================================================================
 // HTTP HELPERS
@@ -139,6 +134,21 @@ fn make_request(
   }
 }
 
+/// Make request with query parameters
+fn make_request_with_params(
+  method: http.Method,
+  path: String,
+  body: Option(String),
+  params: List(#(String, String)),
+) -> Result(response.Response(String), SupabaseError) {
+  let query_string = case params {
+    [] -> ""
+    _ -> "?" <> string.join(list.map(params, fn(p) { p.0 <> "=" <> p.1 }), "&")
+  }
+
+  make_request(method, path <> query_string, body)
+}
+
 // ============================================================================
 // JSON DECODERS
 // ============================================================================
@@ -168,7 +178,7 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
   use key_name <- decode.field("key_name", decode.string)
   // Now expects a string, not optional
   use encrypted_key <- decode.field("encrypted_key", decode.string)
-  use metadata <- decode.field("metadata", decode.optional(decode.dynamic))
+  use _metadata <- decode.field("metadata", decode.optional(decode.dynamic))
   use is_active <- decode.field("is_active", decode.bool)
   decode.success(IntegrationKey(
     id: id,
@@ -207,7 +217,7 @@ pub fn validate_api_key(api_key: String) -> Result(String, SupabaseError) {
       case json.parse(response.body, decode.list(integration_key_decoder())) {
         Ok([]) -> {
           logging.log(logging.Warning, "[SupabaseClient] API key not found")
-          Error(NotFound)
+          Error(NotFound("API key not found"))
         }
         Ok([integration_key, ..]) -> {
           logging.log(
@@ -253,7 +263,7 @@ pub fn get_business(business_id: String) -> Result(Business, SupabaseError) {
   case response.status {
     200 -> {
       case json.parse(response.body, decode.list(business_decoder())) {
-        Ok([]) -> Error(NotFound)
+        Ok([]) -> Error(NotFound("Business not found"))
         Ok([business, ..]) -> Ok(business)
         Error(_) -> Error(ParseError("Invalid business format"))
       }
@@ -412,9 +422,130 @@ pub fn store_metric(
   }
 }
 
+// Add to supabase_client.gleam
+pub fn store_metrics_batch(
+  metrics: List(MetricRecord),
+) -> Result(List(MetricRecord), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Batch storing "
+      <> string.inspect(list.length(metrics))
+      <> " metrics",
+  )
+
+  // Convert list to JSON array
+  let metrics_json =
+    metrics
+    |> list.map(metric_record_to_json)
+    |> json.array(from: _, of: fn(item) { item })
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/metrics",
+    Some(json.to_string(metrics_json)),
+  ))
+
+  case response.status {
+    200 | 201 -> {
+      logging.log(logging.Info, "[SupabaseClient] ✅ Batch insert successful")
+      Ok(metrics)
+      // Return the original metrics for now
+    }
+    _ -> Error(DatabaseError("Failed to batch store metrics"))
+  }
+}
+
+// Helper to convert MetricRecord to JSON
+fn metric_record_to_json(record: MetricRecord) -> json.Json {
+  // Parse the string value back to float for storage
+  let float_value = case float.parse(record.value) {
+    Ok(val) -> val
+    Error(_) -> 0.0
+    // Fallback
+  }
+
+  json.object([
+    #("business_id", json.string(record.business_id)),
+    #("metric_name", json.string(record.metric_name)),
+    #("value", json.float(float_value)),
+    #("metric_type", json.string(record.metric_type)),
+    #("scope", json.string(record.scope)),
+  ])
+}
+
 // ============================================================================
 // QUERY METRICS HISTORY
 // ============================================================================
+
+/// Get the latest metric value from Supabase for restoration on startup
+pub fn get_latest_metric_value(
+  business_id: String,
+  metric_name: String,
+) -> Result(Float, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting latest value for: "
+      <> business_id
+      <> "/"
+      <> metric_name,
+  )
+
+  let query_params = [
+    #("business_id", "eq." <> business_id),
+    #("metric_name", "eq." <> metric_name),
+    #("order", "flushed_at.desc"),
+    #("limit", "1"),
+  ]
+
+  use response <- result.try(make_request_with_params(
+    http.Get,
+    "/metrics",
+    None,
+    query_params,
+  ))
+
+  case response.status {
+    200 -> {
+      // ✅ CORRECT: or: takes a LIST of decoders
+      let value_decoder =
+        decode.one_of(decode.field("value", decode.float, decode.success), or: [
+          decode.field("value", decode.int, fn(i) {
+            decode.success(int.to_float(i))
+          }),
+        ])
+
+      let decoder = decode.list(value_decoder)
+
+      case json.parse(response.body, decoder) {
+        Ok([value]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Restored value: " <> float.to_string(value),
+          )
+          Ok(value)
+        }
+        Ok([]) -> {
+          logging.log(logging.Info, "[SupabaseClient] No previous value found")
+          Error(NotFound("No previous metric value"))
+        }
+        Ok(_) -> Error(DatabaseError("Unexpected response format"))
+        Error(decode_errors) -> {
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] 🔍 Parse error: " <> string.inspect(decode_errors),
+          )
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] 🔍 Response body: " <> response.body,
+          )
+          Error(DatabaseError("Failed to parse response"))
+        }
+      }
+    }
+    404 -> Error(NotFound("Metric not found"))
+    _ -> Error(DatabaseError("Failed to fetch metric value"))
+  }
+}
 
 /// Query metric history for analytics/dashboards
 pub fn get_metric_history(

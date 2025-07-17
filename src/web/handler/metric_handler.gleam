@@ -1,3 +1,4 @@
+// src/web/handler/metric_handler.gleam - COMPLETE VERSION
 import actors/application
 import actors/metric_actor
 import clients/supabase_client
@@ -10,26 +11,31 @@ import gleam/http
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option}
+import gleam/option.{type Option, None}
 import gleam/result
 import gleam/string
 import glixir
 import logging
 import storage/metric_store
+import types/metric_types.{type MetricMetadata}
 import utils/utils
 import wisp.{type Request, type Response}
 
-// Request body structures
+// ============================================================================
+// TYPES
+// ============================================================================
+
 pub type MetricRequest {
   MetricRequest(
     metric_name: String,
-    value: Float,
     operation: String,
     flush_interval: String,
+    supabase_interval: String,
     cleanup_after: String,
     metric_type: String,
     initial_value: Float,
     tags: Dict(String, String),
+    metadata: Option(MetricMetadata),
   )
 }
 
@@ -50,7 +56,10 @@ const valid_cleanup_periods = [
 
 const valid_metric_types = ["reset", "checkpoint"]
 
-// Convert cleanup_after to seconds for comparison
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
 fn cleanup_to_seconds(cleanup_period: String) -> Int {
   case cleanup_period {
     "5s" -> 5
@@ -61,20 +70,10 @@ fn cleanup_to_seconds(cleanup_period: String) -> Int {
     "7d" -> 604_800
     "30d" -> 2_592_000
     "never" -> -1
-    // Special value for no cleanup
     _ -> 86_400
-    // Default to 1 day
   }
 }
 
-fn string_to_metric_type(type_str: String) -> metric_actor.MetricType {
-  case type_str {
-    "checkpoint" -> metric_actor.Checkpoint
-    _ -> metric_actor.Reset
-  }
-}
-
-// Convert flush_interval to tick_type for internal use
 fn interval_to_tick_type(interval: String) -> String {
   case interval {
     "1s" -> "tick_1s"
@@ -90,7 +89,10 @@ fn interval_to_tick_type(interval: String) -> String {
   }
 }
 
-// NEW: Real API key validation using Supabase
+// ============================================================================
+// AUTHENTICATION
+// ============================================================================
+
 fn validate_api_key(api_key: String) -> Result(String, String) {
   logging.log(
     logging.Info,
@@ -107,7 +109,7 @@ fn validate_api_key(api_key: String) -> Result(String, String) {
       )
       Ok(business_id)
     }
-    Error(supabase_client.NotFound) -> {
+    Error(supabase_client.NotFound(_)) -> {
       logging.log(
         logging.Warning,
         "[MetricHandler] ❌ API key not found in database",
@@ -143,7 +145,6 @@ fn validate_api_key(api_key: String) -> Result(String, String) {
   }
 }
 
-// Extract API key from Authorization header
 fn extract_api_key(req: Request) -> Result(String, String) {
   case list.key_find(req.headers, "authorization") {
     Ok(auth_header) -> {
@@ -156,7 +157,6 @@ fn extract_api_key(req: Request) -> Result(String, String) {
   }
 }
 
-// Common auth wrapper
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
   case extract_api_key(req) {
     Error(error) -> {
@@ -185,16 +185,17 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
           wisp.json_response(json.to_string_tree(error_json), 401)
         }
         Ok(business_id) -> handler(business_id)
-        // Now returns business_id instead of account_id
       }
     }
   }
 }
 
-// JSON decoders
+// ============================================================================
+// JSON DECODERS
+// ============================================================================
+
 fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
   use metric_name <- decode.field("metric_name", decode.string)
-  use value <- decode.field("value", decode.float)
   use operation <- decode.optional_field("operation", "SUM", decode.string)
   use flush_interval <- decode.optional_field(
     "flush_interval",
@@ -204,7 +205,6 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
   use cleanup_after <- decode.optional_field(
     "cleanup_after",
     "1d",
-    // Default to 1 day cleanup
     decode.string,
   )
   use tags <- decode.optional_field(
@@ -212,23 +212,34 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     dict.new(),
     decode.dict(decode.string, decode.string),
   )
-
   use initial_value <- decode.optional_field("initial_value", 0.0, decode.float)
   use metric_type <- decode.optional_field(
     "metric_type",
     "checkpoint",
     decode.string,
   )
-  // NEW
+
+  use metadata <- decode.optional_field(
+    "metadata",
+    None,
+    decode.optional(metric_types.metadata_decoder()),
+  )
+  use supabase_interval <- decode.optional_field(
+    "supabase_interval",
+    "15s",
+    decode.string,
+  )
+
   decode.success(MetricRequest(
     metric_name: metric_name,
-    value: value,
     operation: operation,
     flush_interval: flush_interval,
     cleanup_after: cleanup_after,
     metric_type: metric_type,
     initial_value: initial_value,
     tags: tags,
+    metadata: metadata,
+    supabase_interval: supabase_interval,
   ))
 }
 
@@ -237,7 +248,10 @@ fn update_metric_request_decoder() -> decode.Decoder(UpdateMetricRequest) {
   decode.success(UpdateMetricRequest(value: value))
 }
 
-// Validate the parsed request
+// ============================================================================
+// VALIDATION
+// ============================================================================
+
 fn validate_metric_request(
   req: MetricRequest,
 ) -> Result(MetricRequest, List(decode.DecodeError)) {
@@ -315,22 +329,19 @@ fn validate_metric_request(
       True -> Ok(req)
     }
   })
-  |> result.try(fn(_) {
-    // Validate value
-    case req.value {
-      _ -> Ok(req)
-    }
-  })
 }
 
-// Helper to get the application actor from registry
+// ============================================================================
+// REGISTRY HELPERS
+// ============================================================================
+
 fn get_application_actor() -> Result(
   process.Subject(application.ApplicationMessage),
   String,
 ) {
   case
     glixir.lookup_subject(
-      atom.create("tracktags_actors"),
+      utils.tracktags_registry(),
       atom.create("application_actor"),
       glixir.atom_key_encoder,
     )
@@ -340,22 +351,19 @@ fn get_application_actor() -> Result(
   }
 }
 
-// ===== CRUD ENDPOINTS =====
+// ============================================================================
+// CRUD ENDPOINTS
+// ============================================================================
 
-// CREATE (POST /api/v1/metrics)
 pub fn create_metric(req: Request) -> Response {
-  let request_id = string.inspect(system_time())
+  let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 CREATE REQUEST START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Post)
-
   use business_id <- with_auth(req)
-  // Now called business_id instead of account_id
-
-  // Parse JSON body
   use json_data <- wisp.require_json(req)
 
   let result = {
@@ -386,9 +394,8 @@ pub fn create_metric(req: Request) -> Response {
   }
 }
 
-// READ (GET /api/v1/metrics/{metric_name})
 pub fn get_metric(req: Request, metric_name: String) -> Response {
-  let request_id = string.inspect(system_time())
+  let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 GET REQUEST START - ID: "
@@ -398,9 +405,7 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
   )
 
   use <- wisp.require_method(req, http.Get)
-
   use business_id <- with_auth(req)
-  // Now called business_id
 
   case metric_store.get_value(business_id, metric_name) {
     Ok(value) -> {
@@ -408,9 +413,8 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
         json.object([
           #("metric_name", json.string(metric_name)),
           #("business_id", json.string(business_id)),
-          // Updated field name
           #("current_value", json.float(value)),
-          #("timestamp", json.int(current_timestamp())),
+          #("timestamp", json.int(utils.current_timestamp())),
         ])
 
       logging.log(
@@ -448,9 +452,8 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
   }
 }
 
-// UPDATE (PUT /api/v1/metrics/{metric_name})
 pub fn update_metric(req: Request, metric_name: String) -> Response {
-  let request_id = string.inspect(system_time())
+  let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 UPDATE REQUEST START - ID: "
@@ -460,11 +463,7 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
   )
 
   use <- wisp.require_method(req, http.Put)
-
   use business_id <- with_auth(req)
-  // Now called business_id
-
-  // Parse JSON body
   use json_data <- wisp.require_json(req)
 
   let result = {
@@ -497,7 +496,6 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
   }
 }
 
-// DELETE (DELETE /api/v1/metrics/{metric_name})
 pub fn delete_metric(req: Request, metric_name: String) -> Response {
   let request_id = utils.generate_request_id()
   logging.log(
@@ -509,14 +507,10 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
   )
 
   use <- wisp.require_method(req, http.Delete)
-
   use business_id <- with_auth(req)
-  // Now called business_id
 
-  // Try to find and stop the metric actor
   case metric_actor.lookup_metric_subject(business_id, metric_name) {
     Ok(metric_subject) -> {
-      // Send shutdown message to metric actor
       process.send(metric_subject, metric_actor.Shutdown)
 
       let success_json =
@@ -524,7 +518,6 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
           #("message", json.string("Metric deleted successfully")),
           #("metric_name", json.string(metric_name)),
           #("business_id", json.string(business_id)),
-          // Updated field name
         ])
 
       logging.log(
@@ -559,7 +552,6 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
   }
 }
 
-// TODO: LIST - GET /api/v1/metrics
 pub fn list_metrics(req: Request) -> Response {
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
@@ -572,7 +564,6 @@ pub fn list_metrics(req: Request) -> Response {
   wisp.json_response(json.to_string_tree(todo_json), 200)
 }
 
-// TODO: HISTORY - GET /api/v1/metrics/{metric_name}/history
 pub fn get_metric_history(req: Request, metric_name: String) -> Response {
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
@@ -586,18 +577,18 @@ pub fn get_metric_history(req: Request, metric_name: String) -> Response {
   wisp.json_response(json.to_string_tree(todo_json), 200)
 }
 
-// ===== PROCESSING FUNCTIONS =====
+// ============================================================================
+// PROCESSING FUNCTIONS
+// ============================================================================
 
-// Process the validated metric request (CREATE)
 fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
-  // Updated parameter name
   let operation = req.operation
   let interval = req.flush_interval
   let cleanup_after = req.cleanup_after
-  let metric_type = string_to_metric_type(req.metric_type)
+  let metric_type = metric_types.string_to_metric_type(req.metric_type)
   let initial_value = req.initial_value
-  let tags = req.tags
   let tick_type = interval_to_tick_type(interval)
+  let supabase_tick_type = interval_to_tick_type(req.supabase_interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
 
   logging.log(
@@ -625,14 +616,15 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
         app_actor,
         application.SendMetricToUser(
           account_id: business_id,
-          // Using business_id for now, might need to update application.gleam
           metric_name: req.metric_name,
-          value: req.value,
           tick_type: tick_type,
+          supabase_tick_type: supabase_tick_type,
           operation: req.operation,
           cleanup_after_seconds: cleanup_seconds,
           metric_type: metric_type,
           initial_value: initial_value,
+          tags: req.tags,
+          metadata: req.metadata,
         ),
       )
 
@@ -641,16 +633,14 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
         "[MetricHandler] ✅ CREATE metric sent to application: "
           <> req.metric_name
           <> " = "
-          <> float.to_string(req.value),
+          <> float.to_string(req.initial_value),
       )
 
       let success_json =
         json.object([
           #("status", json.string("created")),
           #("business_id", json.string(business_id)),
-          // Updated field name
           #("metric_name", json.string(req.metric_name)),
-          #("value", json.float(req.value)),
           #("operation", json.string(operation)),
           #("flush_interval", json.string(interval)),
           #("cleanup_after", json.string(cleanup_after)),
@@ -676,10 +666,8 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
   }
 }
 
-// Process UPDATE metric (set absolute value)
 fn process_update_metric(
   business_id: String,
-  // Updated parameter name
   metric_name: String,
   new_value: Float,
 ) -> Response {
@@ -693,21 +681,31 @@ fn process_update_metric(
       <> float.to_string(new_value),
   )
 
-  case metric_store.reset_metric(business_id, metric_name, new_value) {
-    Ok(_) -> {
+  case metric_actor.lookup_metric_subject(business_id, metric_name) {
+    Ok(metric_subject) -> {
+      let metric =
+        metric_actor.Metric(
+          account_id: business_id,
+          metric_name: metric_name,
+          value: new_value,
+          tags: dict.new(),
+          timestamp: utils.current_timestamp(),
+        )
+
+      process.send(metric_subject, metric_actor.RecordMetric(metric))
+
       let success_json =
         json.object([
           #("status", json.string("updated")),
           #("business_id", json.string(business_id)),
-          // Updated field name
           #("metric_name", json.string(metric_name)),
           #("new_value", json.float(new_value)),
-          #("timestamp", json.int(current_timestamp())),
+          #("timestamp", json.int(utils.current_timestamp())),
         ])
 
       logging.log(
         logging.Info,
-        "[MetricHandler] ✅ Updated metric: "
+        "[MetricHandler] ✅ Updated metric via MetricActor: "
           <> metric_name
           <> " = "
           <> float.to_string(new_value),
@@ -728,11 +726,4 @@ fn process_update_metric(
       wisp.json_response(json.to_string_tree(error_json), 404)
     }
   }
-}
-
-@external(erlang, "os", "system_time")
-fn system_time() -> Int
-
-fn current_timestamp() -> Int {
-  system_time() / 1_000_000_000
 }

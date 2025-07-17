@@ -1,11 +1,13 @@
+// src/actors/user_actor.gleam 
 import actors/metric_actor
+import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process
-import gleam/float
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/string
@@ -13,19 +15,22 @@ import glixir
 import glixir/supervisor
 import logging
 import storage/metric_store
+import types/metric_types.{type MetricMetadata, type MetricType}
+import utils/utils
 
 pub type Message {
   RecordMetric(
-    metric_id: String,
-    metric: metric_actor.Metric,
+    metric_name: String,
     initial_value: Float,
     tick_type: String,
+    supabase_tick_type: String,
     operation: String,
     cleanup_after_seconds: Int,
-    metric_type: metric_actor.MetricType,
+    metric_type: MetricType,
+    tags: Dict(String, String),
+    metadata: Option(MetricMetadata),
   )
   CleanupTick(timestamp: String, tick_type: String)
-  // NEW: For user cleanup
   GetMetricActor(
     metric_name: String,
     reply_with: process.Subject(Option(process.Subject(metric_actor.Message))),
@@ -36,14 +41,24 @@ pub type Message {
 pub type State {
   State(
     account_id: String,
+    // FIXED: Updated tuple type to match bridge (10 args)
     metrics_supervisor: glixir.DynamicSupervisor(
-      #(String, String, String, Float, String, String, Int, String),
+      #(
+        String,
+        String,
+        String,
+        String,
+        Float,
+        String,
+        String,
+        Int,
+        String,
+        String,
+      ),
       process.Subject(metric_actor.Message),
     ),
     last_accessed: Int,
-    // NEW: Track user activity
     user_cleanup_threshold: Int,
-    // NEW: Cleanup after 1 hour of inactivity
   )
 }
 
@@ -55,67 +70,76 @@ pub fn user_subject_name(account_id: String) -> String {
 pub fn lookup_user_subject(
   account_id: String,
 ) -> Result(process.Subject(Message), String) {
-  case
-    glixir.lookup_subject(
-      atom.create("tracktags_actors"),
-      atom.create(account_id),
-      glixir.atom_key_encoder,
-    )
-  {
+  case glixir.lookup_subject_string(utils.tracktags_registry(), account_id) {
     Ok(subject) -> Ok(subject)
     Error(_) -> Error("User actor not found: " <> account_id)
   }
 }
 
-// Encoder function for metric actor arguments - NOW WITH CLEANUP
+pub fn dict_to_string(tags: Dict(String, String)) -> String {
+  dict.fold(tags, "", fn(accumulator, key, value) {
+    string.append(accumulator, "key: " <> key <> " value: " <> value)
+  })
+}
+
+// FIXED: Updated encoder function to match bridge signature (10 args)
 fn encode_metric_args(
-  args: #(String, String, String, Float, String, String, Int, String),
+  args: #(
+    String,
+    String,
+    String,
+    String,
+    Float,
+    String,
+    String,
+    Int,
+    String,
+    String,
+  ),
 ) -> List(dynamic.Dynamic) {
   let #(
     account_id,
     metric_name,
     tick_type,
+    supabase_tick_type,
     initial_value,
     tags_json,
     operation,
     cleanup_after_seconds,
     metric_type,
+    metadata,
   ) = args
   [
     dynamic.string(account_id),
     dynamic.string(metric_name),
     dynamic.string(tick_type),
+    dynamic.string(supabase_tick_type),
     dynamic.float(initial_value),
     dynamic.string(tags_json),
     dynamic.string(operation),
     dynamic.int(cleanup_after_seconds),
     dynamic.string(metric_type),
+    dynamic.string(metadata),
   ]
 }
 
-fn decode_metric_reply(
-  _reply: dynamic.Dynamic,
-) -> Result(process.Subject(metric_actor.Message), String) {
-  Ok(process.new_subject())
-}
-
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
-  let current_time = current_timestamp()
+  let current_time = utils.current_timestamp()
 
   // Update last_accessed for user activity
   let updated_state = case message {
-    RecordMetric(_, _, _, _, _, _, _) ->
+    RecordMetric(_, _, _, _, _, _, _, _, _) ->
       State(..state, last_accessed: current_time)
     _ -> state
   }
 
   logging.log(
     logging.Debug,
-    "[UserActor] Received message: " <> string.inspect(message),
+    "[UserActor] Processing message for: " <> updated_state.account_id,
   )
 
   case message {
-    CleanupTick(timestamp, tick_type) -> {
+    CleanupTick(_timestamp, _tick_type) -> {
       // Check if user should be cleaned up due to inactivity
       let inactive_duration = current_time - updated_state.last_accessed
 
@@ -149,10 +173,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
           // Unregister and self-destruct
           case
-            glixir.unregister_subject(
-              atom.create("tracktags_actors"),
-              atom.create(updated_state.account_id),
-              glixir.atom_key_encoder,
+            glixir.unregister_subject_string(
+              utils.tracktags_registry(),
+              updated_state.account_id,
             )
           {
             Ok(_) ->
@@ -185,21 +208,153 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     }
 
     RecordMetric(
-      metric_id,
-      metric,
+      metric_name,
       initial_value,
       tick_type,
+      supabase_tick_type,
       operation,
       cleanup_after_seconds,
       metric_type,
+      tags,
+      metadata,
     ) -> {
-      // ... existing RecordMetric logic stays the same ...
-      actor.continue(updated_state)
-      // Use updated_state with new last_accessed
+      logging.log(
+        logging.Info,
+        "[UserActor] Processing metric: "
+          <> updated_state.account_id
+          <> "/"
+          <> metric_name
+          <> " (operation: "
+          <> operation
+          <> ")",
+      )
+
+      // SIMPLIFIED: Use the standalone lookup function
+      case
+        metric_actor.lookup_metric_subject(
+          updated_state.account_id,
+          metric_name,
+        )
+      {
+        Ok(metric_subject) -> {
+          // Found existing actor - create a simple Metric and send it
+          let metric =
+            metric_actor.Metric(
+              account_id: updated_state.account_id,
+              metric_name: metric_name,
+              value: initial_value,
+              tags: tags,
+              timestamp: utils.current_timestamp(),
+            )
+
+          logging.log(
+            logging.Info,
+            "[UserActor] ✅ Found existing MetricActor, sending metric",
+          )
+          process.send(metric_subject, metric_actor.RecordMetric(metric))
+          actor.continue(updated_state)
+        }
+        Error(_) -> {
+          // Spawn new actor
+          logging.log(
+            logging.Info,
+            "[UserActor] MetricActor not found, spawning new one",
+          )
+
+          let metric_type_string =
+            metric_types.metric_type_to_string(metric_type)
+
+          // Use the actual parameters, not hardcoded values
+          let metric_spec =
+            metric_actor.start(
+              updated_state.account_id,
+              metric_name,
+              tick_type,
+              supabase_tick_type,
+              initial_value,
+              dict_to_string(tags),
+              operation,
+              cleanup_after_seconds,
+              metric_type_string,
+              metric_types.encode_metadata_to_string(metadata),
+            )
+
+          case
+            glixir.start_dynamic_child(
+              updated_state.metrics_supervisor,
+              metric_spec,
+              encode_metric_args,
+              fn(_) { Ok(process.new_subject()) },
+            )
+          {
+            supervisor.ChildStarted(child_pid, _reply) -> {
+              logging.log(
+                logging.Info,
+                "[UserActor] ✅ Spawned metric actor: "
+                  <> metric_name
+                  <> " PID: "
+                  <> string.inspect(child_pid),
+              )
+
+              // Try immediate lookup and send the metric
+              case
+                metric_actor.lookup_metric_subject(
+                  updated_state.account_id,
+                  metric_name,
+                )
+              {
+                Ok(metric_subject) -> {
+                  let metric =
+                    metric_actor.Metric(
+                      account_id: updated_state.account_id,
+                      metric_name: metric_name,
+                      value: initial_value,
+                      tags: tags,
+                      timestamp: utils.current_timestamp(),
+                    )
+
+                  process.send(
+                    metric_subject,
+                    metric_actor.RecordMetric(metric),
+                  )
+                  logging.log(
+                    logging.Info,
+                    "[UserActor] ✅ Sent metric to newly spawned actor: "
+                      <> metric_name,
+                  )
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[UserActor] MetricActor still initializing, will use initial_value",
+                  )
+                }
+              }
+              actor.continue(updated_state)
+            }
+            supervisor.StartChildError(error) -> {
+              logging.log(
+                logging.Error,
+                "[UserActor] ❌ Failed to spawn metric: " <> error,
+              )
+              actor.continue(updated_state)
+            }
+          }
+        }
+      }
     }
 
     GetMetricActor(metric_name, reply_with) -> {
-      // ... existing GetMetricActor logic stays the same ...
+      let result = case
+        metric_actor.lookup_metric_subject(
+          updated_state.account_id,
+          metric_name,
+        )
+      {
+        Ok(subject) -> option.Some(subject)
+        Error(_) -> option.None
+      }
+      process.send(reply_with, result)
       actor.continue(updated_state)
     }
 
@@ -250,25 +405,23 @@ pub fn start_link(
         "[UserActor] ✅ Metrics supervisor started for " <> account_id,
       )
 
-      let current_time = current_timestamp()
+      let current_time = utils.current_timestamp()
       let state =
         State(
           account_id: account_id,
           metrics_supervisor: metrics_supervisor,
           last_accessed: current_time,
           user_cleanup_threshold: 3600,
-          // 1 hour = 3600 seconds
         )
 
       case actor.new(state) |> actor.on_message(handle_message) |> actor.start {
         Ok(started) -> {
           // Register in registry for lookup
           case
-            glixir.register_subject(
-              atom.create("tracktags_actors"),
-              atom.create(account_id),
+            glixir.register_subject_string(
+              utils.tracktags_registry(),
+              account_id,
               started.data,
-              glixir.atom_key_encoder,
             )
           {
             Ok(_) ->
@@ -286,14 +439,11 @@ pub fn start_link(
           // Subscribe to cleanup ticks (5-second intervals for checking)
           case
             glixir.pubsub_subscribe_with_registry_key(
-              atom.create("clock_events"),
+              utils.clock_events_bus(),
               "tick:tick_5s",
               "actors@user_actor",
-              // NEW: Need user_actor handler
               "handle_user_cleanup_tick",
-              // NEW: Handler function
               account_id,
-              // Registry key = account_id
             )
           {
             Ok(_) -> {
@@ -382,11 +532,4 @@ pub fn start(
     child_type: glixir.worker,
     encode: encode_user_args,
   )
-}
-
-@external(erlang, "os", "system_time")
-fn system_time() -> Int
-
-fn current_timestamp() -> Int {
-  system_time() / 1_000_000_000
 }

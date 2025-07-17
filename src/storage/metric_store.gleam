@@ -3,7 +3,6 @@
 
 import gleam/erlang/atom
 import gleam/float
-import gleam/int
 import gleam/string
 import logging
 
@@ -56,7 +55,26 @@ pub type StoreCreateResult {
   MetricStoreCreateError(String)
 }
 
+pub type StoreDeleteResult {
+  MetricStoreDeleteOk
+  MetricStoreDeleteError(String)
+}
+
+pub type StoreScanResult {
+  MetricStoreScanOk(List(String))
+  MetricStoreScanError(String)
+}
+
 // ---- FFI TO ELIXIR ----
+
+@external(erlang, "Elixir.Storage.MetricStore", "scan_all_keys")
+fn scan_all_keys_ffi(table_name: String) -> StoreScanResult
+
+@external(erlang, "Elixir.Storage.MetricStore", "delete_metric")
+fn delete_metric_ffi(
+  account_id: String,
+  metric_name: String,
+) -> StoreDeleteResult
 
 @external(erlang, "Elixir.Storage.MetricStore", "init_store")
 fn init_store_ffi(account_id: String) -> StoreInitResult
@@ -91,6 +109,31 @@ fn cleanup_store_ffi(account_id: String) -> StoreCleanupResult
 
 // ---- PUBLIC API ----
 
+/// Scan all keys in an ETS table
+pub fn scan_all_keys(table_name: String) -> List(String) {
+  case scan_all_keys_ffi(table_name) {
+    MetricStoreScanOk(keys) -> keys
+    MetricStoreScanError(_) -> []
+  }
+}
+
+/// Delete a metric completely
+pub fn delete_metric(
+  account_id: String,
+  metric_name: String,
+) -> Result(Nil, StoreError) {
+  case delete_metric_ffi(account_id, metric_name) {
+    MetricStoreDeleteOk -> {
+      logging.log(
+        logging.Debug,
+        "[MetricStore] ✅ Deleted metric: " <> account_id <> "/" <> metric_name,
+      )
+      Ok(Nil)
+    }
+    MetricStoreDeleteError(reason) -> Error(EtsError(reason))
+  }
+}
+
 /// Initialize metric storage for an account
 pub fn init_store(account_id: String) -> Result(Nil, StoreError) {
   case init_store_ffi(account_id) {
@@ -123,7 +166,6 @@ pub fn create_metric(
   case
     create_metric_ffi(account_id, metric_name, operation_atom, initial_value)
   {
-    // CHANGE THIS LINE - use MetricStoreCreateOk instead of MetricStoreInitOk
     MetricStoreCreateOk -> {
       logging.log(
         logging.Debug,
@@ -131,7 +173,6 @@ pub fn create_metric(
       )
       Ok(Nil)
     }
-    // CHANGE THIS LINE - use MetricStoreCreateError instead of MetricStoreInitError  
     MetricStoreCreateError(reason) -> Error(EtsError(reason))
   }
 }

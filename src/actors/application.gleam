@@ -1,32 +1,38 @@
+// src/actors/application.gleam
 import actors/clock_actor
-import actors/metric_actor
+import actors/supabase_actor
 import actors/user_actor
-import gleam/dict
+import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/option.{type Option}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
 import glixir
 import glixir/supervisor
 import logging
+import types/metric_types.{type MetricMetadata, type MetricType}
+import utils/utils
 
 pub type ApplicationMessage {
   SendMetricToUser(
     account_id: String,
     metric_name: String,
-    value: Float,
     tick_type: String,
+    supabase_tick_type: String,
     operation: String,
     cleanup_after_seconds: Int,
-    metric_type: metric_actor.MetricType,
+    metric_type: MetricType,
     initial_value: Float,
+    tags: Dict(String, String),
+    metadata: Option(MetricMetadata),
   )
   Shutdown
 }
 
-// Updated state to include ClockActor reference
+// Updated state to include SupabaseActor reference
 pub type ApplicationState {
   ApplicationState(
     supervisor: glixir.DynamicSupervisor(
@@ -34,6 +40,7 @@ pub type ApplicationState {
       process.Subject(user_actor.Message),
     ),
     clock_actor: process.Subject(clock_actor.Message),
+    supabase_actor: process.Subject(supabase_actor.Message),
   )
 }
 
@@ -44,7 +51,7 @@ fn encode_user_args(account_id: String) -> List(dynamic.Dynamic) {
 
 // Decoder function for user actor replies
 fn decode_user_reply(
-  reply: dynamic.Dynamic,
+  _reply: dynamic.Dynamic,
 ) -> Result(process.Subject(user_actor.Message), String) {
   Ok(process.new_subject())
 }
@@ -128,7 +135,7 @@ fn handle_application_message(
   state: ApplicationState,
   message: ApplicationMessage,
 ) -> actor.Next(ApplicationState, ApplicationMessage) {
-  let processing_id = string.inspect(system_time())
+  let processing_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[ApplicationActor] 🔍 PROCESSING START - ID: " <> processing_id,
@@ -138,28 +145,20 @@ fn handle_application_message(
     SendMetricToUser(
       account_id,
       metric_name,
-      value,
       tick_type,
+      supabase_tick_type,
       operation,
       cleanup_after_seconds,
       metric_type,
       initial_value,
+      tags,
+      metadata,
     ) -> {
-      let message_id = string.inspect(system_time())
+      let message_id = string.inspect(utils.system_time())
       logging.log(
         logging.Info,
         "[ApplicationActor] 🎯 Processing SendMetricToUser ID: " <> message_id,
       )
-
-      // Create the metric once
-      let test_metric =
-        metric_actor.Metric(
-          account_id: account_id,
-          metric_name: metric_name,
-          value: value,
-          tags: dict.new(),
-          timestamp: current_timestamp(),
-        )
 
       // Try to get existing user first
       case user_actor.lookup_user_subject(account_id) {
@@ -174,15 +173,16 @@ fn handle_application_message(
             user_subject,
             user_actor.RecordMetric(
               metric_name,
-              test_metric,
               initial_value,
               tick_type,
+              supabase_tick_type,
               operation,
               cleanup_after_seconds,
               metric_type,
+              tags,
+              metadata,
             ),
           )
-
           logging.log(
             logging.Info,
             "[ApplicationActor] ✅ Metric sent to existing user: " <> account_id,
@@ -207,15 +207,16 @@ fn handle_application_message(
                 user_subject,
                 user_actor.RecordMetric(
                   metric_name,
-                  test_metric,
                   initial_value,
                   tick_type,
+                  supabase_tick_type,
                   operation,
                   cleanup_after_seconds,
                   metric_type,
+                  tags,
+                  metadata,
                 ),
               )
-
               logging.log(
                 logging.Info,
                 "[ApplicationActor] ✅ Metric queued in new user's mailbox: "
@@ -240,23 +241,29 @@ fn handle_application_message(
     }
     Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
-      // Shutdown ClockActor gracefully
+      // Shutdown all actors gracefully
       process.send(state.clock_actor, clock_actor.Shutdown)
+      process.send(state.supabase_actor, supabase_actor.Shutdown)
       actor.stop()
     }
   }
 }
 
-// Start application actor that manages the supervisor AND clock actor
+// Start application actor that manages supervisor, clock, AND supabase actors
 pub fn start_application_actor(
   supervisor: glixir.DynamicSupervisor(
     String,
     process.Subject(user_actor.Message),
   ),
   clock_actor_subject: process.Subject(clock_actor.Message),
+  supabase_actor_subject: process.Subject(supabase_actor.Message),
 ) -> Result(process.Subject(ApplicationMessage), actor.StartError) {
   let initial_state =
-    ApplicationState(supervisor: supervisor, clock_actor: clock_actor_subject)
+    ApplicationState(
+      supervisor: supervisor,
+      clock_actor: clock_actor_subject,
+      supabase_actor: supabase_actor_subject,
+    )
 
   case
     actor.new(initial_state)
@@ -273,7 +280,7 @@ pub fn start_application_actor(
       )
       case
         glixir.register_subject(
-          atom.create("tracktags_actors"),
+          utils.tracktags_registry(),
           atom.create("application_actor"),
           subject,
           glixir.atom_key_encoder,
@@ -300,7 +307,7 @@ pub fn start_application_actor(
   }
 }
 
-// Updated start_app function that manages ClockActor internally
+// Updated start_app function with proper actor startup sequence
 pub fn start_app(
   sse_url: String,
 ) -> Result(process.Subject(ApplicationMessage), String) {
@@ -310,59 +317,50 @@ pub fn start_app(
   )
 
   // Start the registry with phantom types
-  let assert Ok(_) = glixir.start_registry(atom.create("tracktags_actors"))
+  use _registry <- result.try(
+    glixir.start_registry(utils.tracktags_registry())
+    |> result.map_error(fn(e) { "Registry start failed: " <> string.inspect(e) }),
+  )
   logging.log(logging.Info, "[Application] ✅ Registry started")
 
   // Start dynamic supervisor with phantom types
-  case glixir.start_dynamic_supervisor_named(atom.create("main_supervisor")) {
-    Ok(glixir_supervisor) -> {
-      logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
+  use glixir_supervisor <- result.try(
+    glixir.start_dynamic_supervisor_named(atom.create("main_supervisor"))
+    |> result.map_error(fn(e) {
+      "Supervisor start failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
-      // Start ClockActor (now managed by application)
-      case clock_actor.start(sse_url) {
-        Ok(clock_subject) -> {
-          logging.log(logging.Info, "[Application] ✅ ClockActor started")
+  // Start ClockActor
+  use clock_subject <- result.try(
+    clock_actor.start(sse_url)
+    |> result.map_error(fn(e) {
+      "ClockActor start failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ ClockActor started")
 
-          // Start application actor to manage both supervisor and clock
-          case start_application_actor(glixir_supervisor, clock_subject) {
-            Ok(app_actor) -> {
-              logging.log(
-                logging.Info,
-                "[Application] ✅ Application actor started and registered",
-              )
-              Ok(app_actor)
-            }
-            Error(_error) -> {
-              logging.log(
-                logging.Error,
-                "[Application] ❌ Failed to start application actor",
-              )
-              Error("Failed to start application actor")
-            }
-          }
-        }
-        Error(e) -> {
-          logging.log(
-            logging.Error,
-            "[Application] ❌ Failed to start ClockActor: " <> string.inspect(e),
-          )
-          Error("Failed to start ClockActor")
-        }
-      }
-    }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[Application] ❌ Supervisor start failed: " <> string.inspect(error),
-      )
-      Error("Failed to start supervisor: " <> string.inspect(error))
-    }
-  }
-}
+  // Start SupabaseActor FIRST (metrics will need it)
+  use supabase_subject <- result.try(
+    supabase_actor.start()
+    |> result.map_error(fn(e) {
+      "SupabaseActor start failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ SupabaseActor started")
 
-@external(erlang, "os", "system_time")
-fn system_time() -> Int
+  // Start application actor to manage all actors
+  use app_actor <- result.try(
+    start_application_actor(glixir_supervisor, clock_subject, supabase_subject)
+    |> result.map_error(fn(e) {
+      "ApplicationActor start failed: " <> string.inspect(e)
+    }),
+  )
 
-fn current_timestamp() -> Int {
-  system_time() / 1_000_000_000
+  logging.log(
+    logging.Info,
+    "[Application] ✅ Application actor started and registered",
+  )
+  Ok(app_actor)
 }

@@ -1,7 +1,36 @@
 // src/utils/utils.gleam
 import envoy
+import gleam/erlang/atom
 import gleam/option.{None, Some}
 import logging
+
+// ============================================================================
+// COMMON ATOMS - Centralized to avoid typos and easy updates
+// ============================================================================
+
+/// Main registry for all TrackTags actors
+pub fn tracktags_registry() -> atom.Atom {
+  atom.create("tracktags_actors")
+}
+
+/// PubSub bus for clock events
+pub fn clock_events_bus() -> atom.Atom {
+  atom.create("clock_events")
+}
+
+/// Supabase actor registry key
+pub fn supabase_actor_key() -> atom.Atom {
+  atom.create("supabase_actor")
+}
+
+/// Clock actor registry key  
+pub fn clock_actor_key() -> atom.Atom {
+  atom.create("clock_actor")
+}
+
+// ============================================================================
+// ENVIRONMENT HELPERS
+// ============================================================================
 
 /// Require an environment variable or crash
 pub fn require_env(key: String) -> String {
@@ -27,6 +56,10 @@ pub fn get_env_or(key: String, default: String) -> String {
     default,
   )
 }
+
+// ============================================================================
+// TIME HELPERS
+// ============================================================================
 
 /// Get current system time in nanoseconds
 @external(erlang, "os", "system_time")

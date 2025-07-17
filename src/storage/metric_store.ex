@@ -157,4 +157,26 @@ defmodule Storage.MetricStore do
       last_updated: System.system_time(:millisecond)
     }
   end
+
+  def delete_metric(account_id, metric_name) do
+    table_name = String.to_atom("metrics_#{account_id}")
+    try do
+      :ets.delete(table_name, metric_name)
+      :metric_store_delete_ok
+    rescue
+      error -> {:metric_store_delete_error, inspect(error)}
+    end
+  end
+  
+  def scan_all_keys(account_id) when is_binary(account_id) do
+    table_name = String.to_atom("metrics_#{account_id}")
+    
+    try do
+      keys = :ets.tab2list(table_name) |> Enum.map(fn {key, _value} -> key end)
+      {:metric_store_scan_ok, keys}
+    rescue
+      error ->
+        {:metric_store_scan_error, inspect(error)}
+    end
+  end
 end
