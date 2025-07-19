@@ -1,0 +1,506 @@
+// src/actors/client_actor.gleam
+import actors/metric_actor
+import gleam/dict.{type Dict}
+import gleam/dynamic
+import gleam/dynamic/decode
+import gleam/erlang/atom
+import gleam/erlang/process
+import gleam/int
+import gleam/json
+import gleam/option.{type Option}
+import gleam/otp/actor
+import gleam/string
+import glixir
+import glixir/supervisor
+import logging
+import storage/metric_store
+import types/metric_types.{type MetricMetadata, type MetricType}
+import utils/utils
+
+pub type Message {
+  RecordMetric(
+    metric_name: String,
+    initial_value: Float,
+    tick_type: String,
+    operation: String,
+    cleanup_after_seconds: Int,
+    metric_type: MetricType,
+    tags: Dict(String, String),
+    metadata: Option(MetricMetadata),
+  )
+  CleanupTick(timestamp: String, tick_type: String)
+  GetMetricActor(
+    metric_name: String,
+    reply_with: process.Subject(Option(process.Subject(metric_actor.Message))),
+  )
+  Shutdown
+}
+
+pub type State {
+  State(
+    business_id: String,
+    client_id: String,
+    metrics_supervisor: glixir.DynamicSupervisor(
+      #(String, String, String, Float, String, String, Int, String, String),
+      process.Subject(metric_actor.Message),
+    ),
+    last_accessed: Int,
+    client_cleanup_threshold: Int,
+  )
+}
+
+pub fn lookup_client_subject(
+  business_id: String,
+  client_id: String,
+) -> Result(process.Subject(Message), String) {
+  let key = "client:" <> business_id <> ":" <> client_id
+  case glixir.lookup_subject_string(utils.tracktags_registry(), key) {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Client actor not found: " <> key)
+  }
+}
+
+pub fn dict_to_string(tags: Dict(String, String)) -> String {
+  dict.fold(tags, "", fn(accumulator, key, value) {
+    string.append(accumulator, "key: " <> key <> " value: " <> value)
+  })
+}
+
+fn encode_metric_args(
+  args: #(String, String, String, Float, String, String, Int, String, String),
+) -> List(dynamic.Dynamic) {
+  let #(
+    account_id,
+    metric_name,
+    tick_type,
+    initial_value,
+    tags_json,
+    operation,
+    cleanup_after_seconds,
+    metric_type,
+    metadata,
+  ) = args
+  [
+    dynamic.string(account_id),
+    dynamic.string(metric_name),
+    dynamic.string(tick_type),
+    dynamic.float(initial_value),
+    dynamic.string(tags_json),
+    dynamic.string(operation),
+    dynamic.int(cleanup_after_seconds),
+    dynamic.string(metric_type),
+    dynamic.string(metadata),
+  ]
+}
+
+fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
+  let current_time = utils.current_timestamp()
+
+  let updated_state = case message {
+    RecordMetric(_, _, _, _, _, _, _, _) ->
+      State(..state, last_accessed: current_time)
+    _ -> state
+  }
+
+  logging.log(
+    logging.Debug,
+    "[ClientActor] Processing message for: "
+      <> updated_state.business_id
+      <> "/"
+      <> updated_state.client_id,
+  )
+
+  case message {
+    CleanupTick(_timestamp, _tick_type) -> {
+      let inactive_duration = current_time - updated_state.last_accessed
+
+      case inactive_duration > updated_state.client_cleanup_threshold {
+        True -> {
+          logging.log(
+            logging.Info,
+            "[ClientActor] 🧹 Client cleanup triggered: "
+              <> updated_state.business_id
+              <> "/"
+              <> updated_state.client_id
+              <> " (inactive for "
+              <> int.to_string(inactive_duration)
+              <> "s)",
+          )
+
+          let client_key =
+            updated_state.business_id <> ":" <> updated_state.client_id
+          case metric_store.cleanup_store(client_key) {
+            Ok(_) ->
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Store cleanup successful: " <> client_key,
+              )
+            Error(error) ->
+              logging.log(
+                logging.Error,
+                "[ClientActor] ❌ Store cleanup failed: "
+                  <> string.inspect(error),
+              )
+          }
+
+          let registry_key =
+            "client:"
+            <> updated_state.business_id
+            <> ":"
+            <> updated_state.client_id
+          case
+            glixir.unregister_subject_string(
+              utils.tracktags_registry(),
+              registry_key,
+            )
+          {
+            Ok(_) ->
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Unregistered client: " <> registry_key,
+              )
+            Error(_) ->
+              logging.log(
+                logging.Warning,
+                "[ClientActor] ⚠️ Failed to unregister client: " <> registry_key,
+              )
+          }
+
+          actor.stop()
+        }
+        False -> {
+          logging.log(
+            logging.Debug,
+            "[ClientActor] Client still active: "
+              <> updated_state.business_id
+              <> "/"
+              <> updated_state.client_id,
+          )
+          actor.continue(updated_state)
+        }
+      }
+    }
+
+    RecordMetric(
+      metric_name,
+      initial_value,
+      tick_type,
+      operation,
+      cleanup_after_seconds,
+      metric_type,
+      tags,
+      metadata,
+    ) -> {
+      logging.log(
+        logging.Info,
+        "[ClientActor] Processing metric: "
+          <> updated_state.business_id
+          <> "/"
+          <> updated_state.client_id
+          <> "/"
+          <> metric_name,
+      )
+
+      let client_metric_key =
+        updated_state.business_id <> ":" <> updated_state.client_id
+      case metric_actor.lookup_metric_subject(client_metric_key, metric_name) {
+        Ok(metric_subject) -> {
+          let metric =
+            metric_actor.Metric(
+              account_id: client_metric_key,
+              metric_name: metric_name,
+              value: initial_value,
+              tags: tags,
+              timestamp: utils.current_timestamp(),
+            )
+
+          logging.log(
+            logging.Info,
+            "[ClientActor] ✅ Found existing MetricActor, sending metric",
+          )
+          process.send(metric_subject, metric_actor.RecordMetric(metric))
+          actor.continue(updated_state)
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Info,
+            "[ClientActor] MetricActor not found, spawning new one",
+          )
+
+          let metric_type_string =
+            metric_types.metric_type_to_string(metric_type)
+
+          let metric_spec =
+            metric_actor.start(
+              client_metric_key,
+              metric_name,
+              tick_type,
+              initial_value,
+              dict_to_string(tags),
+              operation,
+              cleanup_after_seconds,
+              metric_type_string,
+              metric_types.encode_metadata_to_string(metadata),
+            )
+
+          case
+            glixir.start_dynamic_child(
+              updated_state.metrics_supervisor,
+              metric_spec,
+              encode_metric_args,
+              fn(_) { Ok(process.new_subject()) },
+            )
+          {
+            supervisor.ChildStarted(child_pid, _reply) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Spawned metric actor: "
+                  <> metric_name
+                  <> " PID: "
+                  <> string.inspect(child_pid),
+              )
+
+              case
+                metric_actor.lookup_metric_subject(
+                  client_metric_key,
+                  metric_name,
+                )
+              {
+                Ok(metric_subject) -> {
+                  let metric =
+                    metric_actor.Metric(
+                      account_id: client_metric_key,
+                      metric_name: metric_name,
+                      value: initial_value,
+                      tags: tags,
+                      timestamp: utils.current_timestamp(),
+                    )
+
+                  process.send(
+                    metric_subject,
+                    metric_actor.RecordMetric(metric),
+                  )
+                  logging.log(
+                    logging.Info,
+                    "[ClientActor] ✅ Sent metric to newly spawned actor: "
+                      <> metric_name,
+                  )
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[ClientActor] MetricActor still initializing, will use initial_value",
+                  )
+                }
+              }
+              actor.continue(updated_state)
+            }
+            supervisor.StartChildError(error) -> {
+              logging.log(
+                logging.Error,
+                "[ClientActor] ❌ Failed to spawn metric: " <> error,
+              )
+              actor.continue(updated_state)
+            }
+          }
+        }
+      }
+    }
+
+    GetMetricActor(metric_name, reply_with) -> {
+      let client_metric_key =
+        updated_state.business_id <> ":" <> updated_state.client_id
+      let result = case
+        metric_actor.lookup_metric_subject(client_metric_key, metric_name)
+      {
+        Ok(subject) -> option.Some(subject)
+        Error(_) -> option.None
+      }
+      process.send(reply_with, result)
+      actor.continue(updated_state)
+    }
+
+    Shutdown -> {
+      logging.log(
+        logging.Info,
+        "[ClientActor] Shutting down: "
+          <> updated_state.business_id
+          <> "/"
+          <> updated_state.client_id,
+      )
+
+      let client_key =
+        updated_state.business_id <> ":" <> updated_state.client_id
+      case metric_store.cleanup_store(client_key) {
+        Ok(_) ->
+          logging.log(
+            logging.Info,
+            "[ClientActor] ✅ Store cleanup on shutdown: " <> client_key,
+          )
+        Error(error) ->
+          logging.log(
+            logging.Error,
+            "[ClientActor] ❌ Store cleanup failed on shutdown: "
+              <> string.inspect(error),
+          )
+      }
+
+      actor.stop()
+    }
+  }
+}
+
+pub fn encode_client_args(args: #(String, String)) -> List(dynamic.Dynamic) {
+  let #(business_id, client_id) = args
+  [dynamic.string(business_id), dynamic.string(client_id)]
+}
+
+pub fn start_link(
+  business_id: String,
+  client_id: String,
+) -> Result(process.Subject(Message), actor.StartError) {
+  logging.log(
+    logging.Info,
+    "[ClientActor] Starting for: " <> business_id <> "/" <> client_id,
+  )
+
+  case
+    glixir.start_dynamic_supervisor_named(atom.create(
+      "client_metrics_" <> business_id <> "_" <> client_id,
+    ))
+  {
+    Ok(metrics_supervisor) -> {
+      logging.log(
+        logging.Debug,
+        "[ClientActor] ✅ Metrics supervisor started for "
+          <> business_id
+          <> "/"
+          <> client_id,
+      )
+
+      let current_time = utils.current_timestamp()
+      let state =
+        State(
+          business_id: business_id,
+          client_id: client_id,
+          metrics_supervisor: metrics_supervisor,
+          last_accessed: current_time,
+          client_cleanup_threshold: 1800,
+          // 30 minutes for clients
+        )
+
+      case actor.new(state) |> actor.on_message(handle_message) |> actor.start {
+        Ok(started) -> {
+          let registry_key = "client:" <> business_id <> ":" <> client_id
+          case
+            glixir.register_subject_string(
+              utils.tracktags_registry(),
+              registry_key,
+              started.data,
+            )
+          {
+            Ok(_) ->
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Registered: " <> registry_key,
+              )
+            Error(_) ->
+              logging.log(
+                logging.Error,
+                "[ClientActor] ❌ Failed to register: " <> registry_key,
+              )
+          }
+
+          case
+            glixir.pubsub_subscribe_with_registry_key(
+              utils.clock_events_bus(),
+              "tick:tick_5s",
+              "actors@client_actor",
+              "handle_client_cleanup_tick",
+              registry_key,
+            )
+          {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Client cleanup subscription for: "
+                  <> registry_key,
+              )
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Error,
+                "[ClientActor] ❌ Failed client cleanup subscription: "
+                  <> string.inspect(e),
+              )
+            }
+          }
+
+          Ok(started.data)
+        }
+        Error(error) -> Error(error)
+      }
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[ClientActor] ❌ Failed to start metrics supervisor: "
+          <> string.inspect(error),
+      )
+      Error(actor.InitFailed("Failed to start metrics supervisor"))
+    }
+  }
+}
+
+pub fn handle_client_cleanup_tick(
+  registry_key: String,
+  json_message: String,
+) -> Nil {
+  logging.log(
+    logging.Debug,
+    "[ClientActor] 🎯 Cleanup tick for client: " <> registry_key,
+  )
+
+  case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
+    Ok(client_subject) -> {
+      let tick_decoder = {
+        use tick_name <- decode.field("tick_name", decode.string)
+        use timestamp <- decode.field("timestamp", decode.string)
+        decode.success(#(tick_name, timestamp))
+      }
+
+      case json.parse(json_message, tick_decoder) {
+        Ok(#(tick_name, timestamp)) -> {
+          process.send(client_subject, CleanupTick(timestamp, tick_name))
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Warning,
+            "[ClientActor] ❌ Invalid cleanup tick JSON for: " <> registry_key,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Debug,
+        "[ClientActor] Client not found for cleanup tick: " <> registry_key,
+      )
+    }
+  }
+}
+
+pub fn start(
+  business_id: String,
+  client_id: String,
+) -> glixir.ChildSpec(#(String, String), process.Subject(Message)) {
+  glixir.child_spec(
+    id: "client_" <> business_id <> "_" <> client_id,
+    module: "Elixir.ClientActorBridge",
+    function: "start_link",
+    args: #(business_id, client_id),
+    restart: glixir.permanent,
+    shutdown_timeout: 5000,
+    child_type: glixir.worker,
+  )
+}

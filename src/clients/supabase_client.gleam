@@ -366,7 +366,6 @@ pub fn store_metric(
   client_id: Option(String),
   metric_name: String,
   value: String,
-  // Changed to String for simplicity
   metric_type: String,
   scope: String,
   adapters: Option(Dict(String, json.Json)),
@@ -380,7 +379,6 @@ pub fn store_metric(
     #("business_id", json.string(business_id)),
     #("metric_name", json.string(metric_name)),
     #("value", json.string(value)),
-    // Changed to json.string
     #("metric_type", json.string(metric_type)),
     #("scope", json.string(scope)),
   ]
@@ -456,21 +454,35 @@ pub fn store_metrics_batch(
 }
 
 // Helper to convert MetricRecord to JSON
+// In metric_record_to_json function
 fn metric_record_to_json(record: MetricRecord) -> json.Json {
-  // Parse the string value back to float for storage
   let float_value = case float.parse(record.value) {
     Ok(val) -> val
     Error(_) -> 0.0
-    // Fallback
   }
 
-  json.object([
+  let base_fields = [
     #("business_id", json.string(record.business_id)),
     #("metric_name", json.string(record.metric_name)),
     #("value", json.float(float_value)),
     #("metric_type", json.string(record.metric_type)),
     #("scope", json.string(record.scope)),
-  ])
+  ]
+
+  let all_fields = case record.client_id {
+    Some(cid) -> [#("client_id", json.string(cid)), ..base_fields]
+    None -> base_fields
+  }
+
+  let result = json.object(all_fields)
+
+  // ✅ DEBUG: Log what we're sending to Supabase
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 🔍 Sending JSON: " <> json.to_string(result),
+  )
+
+  result
 }
 
 // ============================================================================
@@ -544,6 +556,43 @@ pub fn get_latest_metric_value(
     }
     404 -> Error(NotFound("Metric not found"))
     _ -> Error(DatabaseError("Failed to fetch metric value"))
+  }
+}
+
+/// Create a new client for a business
+pub fn create_client(
+  business_id: String,
+  client_id: String,
+  client_name: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating client: " <> business_id <> "/" <> client_id,
+  )
+
+  let client_data =
+    json.object([
+      #("client_id", json.string(client_id)),
+      #("business_id", json.string(business_id)),
+      #("client_name", json.string(client_name)),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/clients",
+    Some(json.to_string(client_data)),
+  ))
+
+  case response.status {
+    201 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Client created successfully",
+      )
+      Ok(Nil)
+    }
+    409 -> Error(DatabaseError("Client already exists"))
+    _ -> Error(DatabaseError("Failed to create client"))
   }
 }
 

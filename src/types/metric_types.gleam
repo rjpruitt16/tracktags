@@ -8,6 +8,7 @@ import gleam/float
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import logging
 import storage/metric_store
 
@@ -140,7 +141,6 @@ pub fn string_to_metric_type(metric_type: String) -> MetricType {
   }
 }
 
-/// Get Supabase batch interval from metadata (default: "15s")
 pub fn get_supabase_batch_interval(metadata: Option(MetricMetadata)) -> String {
   case metadata {
     Some(meta) -> {
@@ -149,19 +149,25 @@ pub fn get_supabase_batch_interval(metadata: Option(MetricMetadata)) -> String {
           case integrations.supabase {
             Some(supabase_config) -> {
               case supabase_config.batch_interval {
-                Some(interval) -> validate_batch_interval(interval)
-                None -> "15s"
-                // Default
+                Some(interval) ->
+                  interval_to_tick_format(validate_batch_interval(interval))
+                None -> "tick_15s"
+                // ← Default in tick format
               }
             }
-            None -> "15s"
+            None -> "tick_15s"
           }
         }
-        None -> "15s"
+        None -> "tick_15s"
       }
     }
-    None -> "15s"
+    None -> "tick_15s"
   }
+}
+
+// Add this helper function
+fn interval_to_tick_format(interval: String) -> String {
+  "tick_" <> interval
 }
 
 pub fn handle_metric_types_flush(
@@ -194,7 +200,7 @@ pub fn handle_metric_types_flush(
 /// Validate and constrain batch intervals
 fn validate_batch_interval(interval: String) -> String {
   case interval {
-    "1s" | "15s" | "30s" | "1m" | "5m" | "15m" | "30m" | "1h" -> interval
+    "1s" | "5s" | "15s" | "30s" | "1m" | "5m" | "15m" | "30m" | "1h" -> interval
     _ -> "15s"
     // Default for invalid values
   }
@@ -492,4 +498,60 @@ pub fn metadata_decoder() -> decode.Decoder(MetricMetadata) {
     billing: billing,
     custom: custom,
   ))
+}
+
+/// Parse account_id into components for MetricBatch creation
+pub fn parse_account_id(account_id: String) -> #(String, Option(String), String) {
+  case string.split_once(account_id, ":") {
+    Ok(#(client_id, _business_id)) -> #(account_id, Some(client_id), "client")
+    Error(_) -> #(account_id, None, "business")
+  }
+}
+
+/// Convert metadata to adapters field (comma-separated integrations)
+pub fn metadata_to_adapters(
+  metadata: Option(MetricMetadata),
+) -> Option(Dict(String, json.Json)) {
+  case metadata {
+    Some(meta) -> {
+      case meta.integrations {
+        Some(integrations) -> {
+          let enabled_integrations = []
+
+          let with_supabase = case integrations.supabase {
+            Some(config) if config.enabled -> [
+              "supabase",
+              ..enabled_integrations
+            ]
+            _ -> enabled_integrations
+          }
+
+          let with_stripe = case integrations.stripe {
+            Some(config) if config.enabled -> ["stripe", ..with_supabase]
+            _ -> with_supabase
+          }
+
+          let with_fly = case integrations.fly {
+            Some(config) if config.enabled -> ["fly", ..with_stripe]
+            _ -> with_stripe
+          }
+
+          case with_fly {
+            [] -> None
+            integrations_list -> {
+              let adapters_dict =
+                dict.new()
+                |> dict.insert(
+                  "enabled_integrations",
+                  json.string(string.join(integrations_list, ",")),
+                )
+              Some(adapters_dict)
+            }
+          }
+        }
+        None -> None
+      }
+    }
+    None -> None
+  }
 }

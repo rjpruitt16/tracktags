@@ -1,11 +1,11 @@
-// src/web/handler/integration_handler.gleam
+// src/web/handler/key_handler.gleam
 import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/http
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
@@ -19,15 +19,15 @@ import wisp.{type Request, type Response}
 // TYPES
 // ============================================================================
 
-pub type IntegrationType {
+pub type KeyType {
   Stripe
   Supabase
   Fly
 }
 
-pub type IntegrationRequest {
-  IntegrationRequest(
-    integration_type: String,
+pub type KeyRequest {
+  KeyRequest(
+    key_type: String,
     key_name: String,
     credentials: Dict(String, String),
     // Keep it simple for JSON parsing
@@ -38,7 +38,7 @@ pub type IntegrationRequest {
 // CONSTANTS
 // ============================================================================
 
-const valid_integration_types = ["stripe", "supabase", "fly"]
+const valid_key_types = ["stripe", "supabase", "fly"]
 
 // ============================================================================
 // VALIDATION & CONVERSION
@@ -51,13 +51,13 @@ fn validate_stripe_credentials(
     Ok("sk_live_" <> _) -> Ok(Nil)
     Ok("sk_test_" <> _) -> Ok(Nil)
     Ok(_) -> Error("Stripe secret key must start with sk_live_ or sk_test_")
-    Error(_) -> Error("Missing secret_key for Stripe integration")
+    Error(_) -> Error("Missing secret_key for Stripe key")
   }
   |> result.try(fn(_) {
     case dict.get(credentials, "webhook_endpoint") {
       Ok("https://" <> _) -> Ok(Nil)
       Ok(_) -> Error("Webhook URL must be HTTPS")
-      Error(_) -> Error("Missing webhook_endpoint for Stripe integration")
+      Error(_) -> Error("Missing webhook_endpoint for Stripe key")
     }
   })
 }
@@ -72,14 +72,14 @@ fn validate_supabase_credentials(
         False -> Error("URL must be a valid Supabase URL")
       }
     Ok(_) -> Error("Supabase URL must be HTTPS")
-    Error(_) -> Error("Missing url for Supabase integration")
+    Error(_) -> Error("Missing url for Supabase key")
   }
   |> result.try(fn(_) {
     case dict.get(credentials, "service_role_key") {
       Ok("eyJ" <> _) -> Ok(Nil)
       // JWT format
       Ok(_) -> Error("Invalid Supabase service role key format")
-      Error(_) -> Error("Missing service_role_key for Supabase integration")
+      Error(_) -> Error("Missing service_role_key for Supabase key")
     }
   })
 }
@@ -91,13 +91,13 @@ fn validate_fly_credentials(
     Ok("fo1_" <> _) -> Ok(Nil)
     // Fly.io token format
     Ok(_) -> Error("Invalid Fly.io API token format")
-    Error(_) -> Error("Missing api_token for Fly integration")
+    Error(_) -> Error("Missing api_token for Fly key")
   }
   |> result.try(fn(_) {
     case dict.get(credentials, "app_name") {
       Ok("") -> Error("App name cannot be empty")
       Ok(_) -> Ok(Nil)
-      Error(_) -> Error("Missing app_name for Fly integration")
+      Error(_) -> Error("Missing app_name for Fly key")
     }
   })
   |> result.try(fn(_) {
@@ -113,20 +113,20 @@ fn validate_fly_credentials(
               <> string.join(valid_regions, ", "),
             )
         }
-      Error(_) -> Error("Missing region for Fly integration")
+      Error(_) -> Error("Missing region for Fly key")
     }
   })
 }
 
 fn validate_credentials(
-  integration_type: String,
+  key_type: String,
   credentials: Dict(String, String),
 ) -> Result(Nil, String) {
-  case integration_type {
+  case key_type {
     "stripe" -> validate_stripe_credentials(credentials)
     "supabase" -> validate_supabase_credentials(credentials)
     "fly" -> validate_fly_credentials(credentials)
-    _ -> Error("Unknown integration type")
+    _ -> Error("Unknown key type")
   }
 }
 
@@ -169,14 +169,11 @@ fn extract_api_key(req: Request) -> Result(String, String) {
   }
 }
 
-// Auth wrapper for integration endpoints
+// Auth wrapper for key endpoints
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
   case extract_api_key(req) {
     Error(error) -> {
-      logging.log(
-        logging.Warning,
-        "[IntegrationHandler] Auth failed: " <> error,
-      )
+      logging.log(logging.Warning, "[KeyHandler] Auth failed: " <> error)
       let error_json =
         json.object([
           #("error", json.string("Unauthorized")),
@@ -189,7 +186,7 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
         Error(_) -> {
           logging.log(
             logging.Warning,
-            "[IntegrationHandler] Invalid API key: "
+            "[KeyHandler] Invalid API key: "
               <> string.slice(api_key, 0, 10)
               <> "...",
           )
@@ -210,15 +207,15 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
 // JSON DECODERS
 // ============================================================================
 
-fn integration_request_decoder() -> decode.Decoder(IntegrationRequest) {
-  use integration_type <- decode.field("integration_type", decode.string)
+fn key_request_decoder() -> decode.Decoder(KeyRequest) {
+  use key_type <- decode.field("integration_type", decode.string)
   use key_name <- decode.field("key_name", decode.string)
   use credentials <- decode.field(
     "credentials",
     decode.dict(decode.string, decode.string),
   )
-  decode.success(IntegrationRequest(
-    integration_type: integration_type,
+  decode.success(KeyRequest(
+    key_type: key_type,
     key_name: key_name,
     credentials: credentials,
   ))
@@ -228,12 +225,12 @@ fn integration_request_decoder() -> decode.Decoder(IntegrationRequest) {
 // API ENDPOINTS
 // ============================================================================
 
-/// CREATE - POST /api/v1/integrations
-pub fn create_integration(req: Request) -> Response {
+/// CREATE - POST /api/v1/key
+pub fn create_key(req: Request) -> Response {
   let request_id = utils.generate_request_id()
   logging.log(
     logging.Info,
-    "[IntegrationHandler] 🔍 CREATE INTEGRATION START - ID: " <> request_id,
+    "[KeyHandler] 🔍 CREATE key START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Post)
@@ -241,17 +238,14 @@ pub fn create_integration(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use integration_req <- result.try(decode.run(
-      json_data,
-      integration_request_decoder(),
-    ))
-    use _ <- result.try(validate_integration_request(integration_req))
-    Ok(process_create_integration(business_id, integration_req))
+    use key_req <- result.try(decode.run(json_data, key_request_decoder()))
+    use _ <- result.try(validate_key_request(key_req))
+    Ok(process_create_key(business_id, key_req))
   }
 
   logging.log(
     logging.Info,
-    "[IntegrationHandler] 🔍 CREATE INTEGRATION END - ID: " <> request_id,
+    "[KeyHandler] 🔍 CREATE key END - ID: " <> request_id,
   )
 
   case result {
@@ -259,24 +253,24 @@ pub fn create_integration(req: Request) -> Response {
     Error(decode_errors) -> {
       logging.log(
         logging.Warning,
-        "[IntegrationHandler] Bad request: " <> string.inspect(decode_errors),
+        "[KeyHandler] Bad request: " <> string.inspect(decode_errors),
       )
       let error_json =
         json.object([
           #("error", json.string("Bad Request")),
-          #("message", json.string("Invalid integration data")),
+          #("message", json.string("Invalid key data")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
   }
 }
 
-/// READ - GET /api/v1/integrations
-pub fn list_integrations(req: Request) -> Response {
+/// READ - GET /api/v1/key
+pub fn list_key(req: Request) -> Response {
   let request_id = utils.generate_request_id()
   logging.log(
     logging.Info,
-    "[IntegrationHandler] 🔍 LIST INTEGRATIONS START - ID: " <> request_id,
+    "[KeyHandler] 🔍 LIST key START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Get)
@@ -289,7 +283,7 @@ pub fn list_integrations(req: Request) -> Response {
         |> list.map(fn(key) {
           json.object([
             #("id", json.string(key.id)),
-            #("integration_type", json.string(key.key_type)),
+            #("key_type", json.string(key.key_type)),
             #("key_name", json.string(key.key_name)),
             #("is_active", json.bool(key.is_active)),
             // Don't return encrypted credentials for security
@@ -299,15 +293,13 @@ pub fn list_integrations(req: Request) -> Response {
 
       let success_json =
         json.object([
-          #("integrations", response_data),
+          #("key", response_data),
           #("count", json.int(list.length(keys))),
         ])
 
       logging.log(
         logging.Info,
-        "[IntegrationHandler] ✅ Listed "
-          <> string.inspect(list.length(keys))
-          <> " integrations",
+        "[KeyHandler] ✅ Listed " <> string.inspect(list.length(keys)) <> " key",
       )
 
       wisp.json_response(json.to_string_tree(success_json), 200)
@@ -316,32 +308,29 @@ pub fn list_integrations(req: Request) -> Response {
       let error_json =
         json.object([
           #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to fetch integrations")),
+          #("message", json.string("Failed to fetch key")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
   }
 }
 
-/// READ - GET /api/v1/integrations/{integration_type}
-pub fn get_integrations_by_type(
-  req: Request,
-  integration_type: String,
-) -> Response {
+/// READ - GET /api/v1/key/{key_type}
+pub fn get_key_by_type(req: Request, key_type: String) -> Response {
   let request_id = utils.generate_request_id()
   logging.log(
     logging.Info,
-    "[IntegrationHandler] 🔍 GET INTEGRATIONS BY TYPE START - ID: "
+    "[KeyHandler] 🔍 GET key BY TYPE START - ID: "
       <> request_id
       <> " type: "
-      <> integration_type,
+      <> key_type,
   )
 
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
 
-  // Validate integration type
-  case list.contains(valid_integration_types, integration_type) {
+  // Validate key type
+  case list.contains(valid_key_types, key_type) {
     False -> {
       let error_json =
         json.object([
@@ -349,20 +338,15 @@ pub fn get_integrations_by_type(
           #(
             "message",
             json.string(
-              "Invalid integration type. Must be one of: "
-              <> string.join(valid_integration_types, ", "),
+              "Invalid key type. Must be one of: "
+              <> string.join(valid_key_types, ", "),
             ),
           ),
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
     True -> {
-      case
-        supabase_client.get_integration_keys(
-          business_id,
-          Some(integration_type),
-        )
-      {
+      case supabase_client.get_integration_keys(business_id, Some(key_type)) {
         Ok(keys) -> {
           let response_data =
             keys
@@ -377,8 +361,8 @@ pub fn get_integrations_by_type(
 
           let success_json =
             json.object([
-              #("integration_type", json.string(integration_type)),
-              #("integrations", response_data),
+              #("key_type", json.string(key_type)),
+              #("key", response_data),
               #("count", json.int(list.length(keys))),
             ])
 
@@ -388,7 +372,7 @@ pub fn get_integrations_by_type(
           let error_json =
             json.object([
               #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to fetch integrations")),
+              #("message", json.string("Failed to fetch key")),
             ])
           wisp.json_response(json.to_string_tree(error_json), 500)
         }
@@ -397,60 +381,48 @@ pub fn get_integrations_by_type(
   }
 }
 
-/// READ - GET /api/v1/integrations/{integration_type}/{key_name}
-pub fn get_integration(
-  req: Request,
-  integration_type: String,
-  key_name: String,
-) -> Response {
+/// READ - GET /api/v1/key/{key_type}/{key_name}
+pub fn get_key(req: Request, key_type: String, key_name: String) -> Response {
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
 
-  // TODO: Implement get specific integration
+  // TODO: Implement get specific key
   let success_json =
     json.object([
-      #("integration_type", json.string(integration_type)),
+      #("key_type", json.string(key_type)),
       #("key_name", json.string(key_name)),
       #("business_id", json.string(business_id)),
-      #("message", json.string("Get specific integration - TODO")),
+      #("message", json.string("Get specific key - TODO")),
     ])
   wisp.json_response(json.to_string_tree(success_json), 200)
 }
 
-/// UPDATE - PUT /api/v1/integrations/{integration_type}/{key_name}
-pub fn update_integration(
-  req: Request,
-  integration_type: String,
-  key_name: String,
-) -> Response {
+/// UPDATE - PUT /api/v1/key/{key_type}/{key_name}
+pub fn update_key(req: Request, key_type: String, key_name: String) -> Response {
   use <- wisp.require_method(req, http.Put)
   use business_id <- with_auth(req)
 
-  // TODO: Implement update integration
+  // TODO: Implement update key
   let success_json =
     json.object([
-      #("message", json.string("Update integration - TODO")),
-      #("integration_type", json.string(integration_type)),
+      #("message", json.string("Update key - TODO")),
+      #("key_type", json.string(key_type)),
       #("key_name", json.string(key_name)),
       #("business_id", json.string(business_id)),
     ])
   wisp.json_response(json.to_string_tree(success_json), 200)
 }
 
-/// DELETE - DELETE /api/v1/integrations/{integration_type}/{key_name}
-pub fn delete_integration(
-  req: Request,
-  integration_type: String,
-  key_name: String,
-) -> Response {
+/// DELETE - DELETE /api/v1/key/{key_type}/{key_name}
+pub fn delete_key(req: Request, key_type: String, key_name: String) -> Response {
   use <- wisp.require_method(req, http.Delete)
   use business_id <- with_auth(req)
 
-  // TODO: Implement delete integration
+  // TODO: Implement delete key
   let success_json =
     json.object([
-      #("message", json.string("Delete integration - TODO")),
-      #("integration_type", json.string(integration_type)),
+      #("message", json.string("Delete key - TODO")),
+      #("key_type", json.string(key_type)),
       #("key_name", json.string(key_name)),
       #("business_id", json.string(business_id)),
     ])
@@ -461,17 +433,16 @@ pub fn delete_integration(
 // PROCESSING FUNCTIONS
 // ============================================================================
 
-fn validate_integration_request(
-  req: IntegrationRequest,
-) -> Result(IntegrationRequest, List(decode.DecodeError)) {
-  // Validate integration type
-  case list.contains(valid_integration_types, req.integration_type) {
+fn validate_key_request(
+  req: KeyRequest,
+) -> Result(KeyRequest, List(decode.DecodeError)) {
+  // Validate key type
+  case list.contains(valid_key_types, req.key_type) {
     False ->
       Error([
         decode.DecodeError(
           "Invalid",
-          "integration_type must be one of: "
-            <> string.join(valid_integration_types, ", "),
+          "key_type must be one of: " <> string.join(valid_key_types, ", "),
           [],
         ),
       ])
@@ -491,23 +462,20 @@ fn validate_integration_request(
   })
   |> result.try(fn(_) {
     // Validate credentials
-    case validate_credentials(req.integration_type, req.credentials) {
+    case validate_credentials(req.key_type, req.credentials) {
       Ok(_) -> Ok(req)
       Error(msg) -> Error([decode.DecodeError("Invalid", msg, [])])
     }
   })
 }
 
-fn process_create_integration(
-  business_id: String,
-  req: IntegrationRequest,
-) -> Response {
+fn process_create_key(business_id: String, req: KeyRequest) -> Response {
   logging.log(
     logging.Info,
-    "[IntegrationHandler] Processing CREATE integration: "
+    "[KeyHandler] Processing CREATE key: "
       <> business_id
       <> "/"
-      <> req.integration_type
+      <> req.key_type
       <> "/"
       <> req.key_name,
   )
@@ -517,7 +485,7 @@ fn process_create_integration(
     Error(encryption_error) -> {
       logging.log(
         logging.Error,
-        "[IntegrationHandler] ❌ Encryption failed: " <> encryption_error,
+        "[KeyHandler] ❌ Encryption failed: " <> encryption_error,
       )
       let error_json =
         json.object([
@@ -530,41 +498,37 @@ fn process_create_integration(
       case
         supabase_client.store_integration_key(
           business_id,
-          req.integration_type,
+          req.key_type,
           req.key_name,
           encrypted_credentials,
           None,
         )
       {
-        Ok(integration_key) -> {
+        Ok(key_key) -> {
           let success_json =
             json.object([
               #("status", json.string("created")),
-              #("integration_id", json.string(integration_key.id)),
+              #("key_id", json.string(key_key.id)),
               #("business_id", json.string(business_id)),
-              #("integration_type", json.string(req.integration_type)),
+              #("key_type", json.string(req.key_type)),
               #("key_name", json.string(req.key_name)),
-              #("is_active", json.bool(integration_key.is_active)),
+              #("is_active", json.bool(key_key.is_active)),
               #("encrypted", json.bool(True)),
               // NEW: Indicate encryption is used
             ])
 
           logging.log(
             logging.Info,
-            "[IntegrationHandler] ✅ Integration created with encryption: "
-              <> integration_key.id,
+            "[KeyHandler] ✅ Key created with encryption: " <> key_key.id,
           )
           wisp.json_response(json.to_string_tree(success_json), 201)
         }
         Error(supabase_client.DatabaseError(msg)) -> {
-          logging.log(
-            logging.Error,
-            "[IntegrationHandler] ❌ Database error: " <> msg,
-          )
+          logging.log(logging.Error, "[KeyHandler] ❌ Database error: " <> msg)
           let error_json =
             json.object([
               #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to store integration")),
+              #("message", json.string("Failed to store key")),
             ])
           wisp.json_response(json.to_string_tree(error_json), 500)
         }
@@ -572,7 +536,7 @@ fn process_create_integration(
           let error_json =
             json.object([
               #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to create integration")),
+              #("message", json.string("Failed to create key")),
             ])
           wisp.json_response(json.to_string_tree(error_json), 500)
         }

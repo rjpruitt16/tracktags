@@ -1,6 +1,7 @@
 // src/web/router.gleam
 import gleam/http.{Delete, Get, Post, Put}
-import web/handler/integration_handler
+import web/handler/client_handler
+import web/handler/key_handler
 import web/handler/metric_handler
 import wisp.{type Request, type Response}
 
@@ -8,7 +9,6 @@ pub fn handle_request(req: Request) -> Response {
   use <- wisp.log_request(req)
   use <- wisp.rescue_crashes
   use req <- wisp.handle_head(req)
-
   case wisp.path_segments(req) {
     // Health check
     ["health"] ->
@@ -17,12 +17,42 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
+    // Client CRUD API
+    ["api", "v1", "clients"] ->
+      case req.method {
+        Post -> client_handler.create_client(req)
+        Get -> client_handler.list_clients(req)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    // Individual client operations
+    ["api", "v1", "clients", client_id] ->
+      case req.method {
+        Get -> client_handler.get_client(req, client_id)
+        Delete -> client_handler.delete_client(req, client_id)
+        _ -> wisp.method_not_allowed([Get, Delete])
+      }
+
+    // Client key management
+    ["api", "v1", "clients", client_id, "keys"] ->
+      case req.method {
+        Post -> client_handler.create_client_key(req, client_id)
+        Get -> client_handler.list_client_keys(req, client_id)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    // Individual client key operations
+    ["api", "v1", "clients", client_id, "keys", key_id] ->
+      case req.method {
+        Delete -> client_handler.delete_client_key(req, client_id, key_id)
+        _ -> wisp.method_not_allowed([Delete])
+      }
+
     // Metrics CRUD API
     ["api", "v1", "metrics"] ->
       case req.method {
         Post -> metric_handler.create_metric(req)
         Get -> metric_handler.list_metrics(req)
-        // TODO: Implement
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
@@ -35,39 +65,27 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 
-    // Integration management - unified API
-    ["api", "v1", "integrations"] ->
+    // key management - unified API
+    ["api", "v1", "keys"] ->
       case req.method {
-        Post -> integration_handler.create_integration(req)
-        Get -> integration_handler.list_integrations(req)
+        Post -> key_handler.create_key(req)
+        Get -> key_handler.list_key(req)
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
-    // Individual integration operations
-    ["api", "v1", "integrations", integration_type] ->
+    // Individual key operations
+    ["api", "v1", "keys", key_type] ->
       case req.method {
-        Get ->
-          integration_handler.get_integrations_by_type(req, integration_type)
+        Get -> key_handler.get_key_by_type(req, key_type)
         _ -> wisp.method_not_allowed([Get])
       }
 
-    // Specific integration by type and name
-    ["api", "v1", "integrations", integration_type, key_name] ->
+    // Specific key by type and name
+    ["api", "v1", "keys", key_type, key_name] ->
       case req.method {
-        Get ->
-          integration_handler.get_integration(req, integration_type, key_name)
-        Put ->
-          integration_handler.update_integration(
-            req,
-            integration_type,
-            key_name,
-          )
-        Delete ->
-          integration_handler.delete_integration(
-            req,
-            integration_type,
-            key_name,
-          )
+        Get -> key_handler.get_key(req, key_type, key_name)
+        Put -> key_handler.update_key(req, key_type, key_name)
+        Delete -> key_handler.delete_key(req, key_type, key_name)
         _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 

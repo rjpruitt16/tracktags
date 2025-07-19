@@ -11,7 +11,7 @@ import gleam/http
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import glixir
@@ -30,7 +30,6 @@ pub type MetricRequest {
     metric_name: String,
     operation: String,
     flush_interval: String,
-    supabase_interval: String,
     cleanup_after: String,
     metric_type: String,
     initial_value: Float,
@@ -224,11 +223,6 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     None,
     decode.optional(metric_types.metadata_decoder()),
   )
-  use supabase_interval <- decode.optional_field(
-    "supabase_interval",
-    "15s",
-    decode.string,
-  )
 
   decode.success(MetricRequest(
     metric_name: metric_name,
@@ -239,7 +233,6 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     initial_value: initial_value,
     tags: tags,
     metadata: metadata,
-    supabase_interval: supabase_interval,
   ))
 }
 
@@ -366,12 +359,41 @@ pub fn create_metric(req: Request) -> Response {
   use business_id <- with_auth(req)
   use json_data <- wisp.require_json(req)
 
+  // ✅ Parse query parameters
+  let scope = case wisp.get_query(req) |> list.key_find("scope") {
+    Ok(s) -> s
+    Error(_) -> "business"
+    // default
+  }
+
+  let client_id = case wisp.get_query(req) |> list.key_find("client_id") {
+    Ok(cid) -> Some(cid)
+    Error(_) -> None
+  }
+
   let result = {
     use metric_req <- result.try(decode.run(json_data, metric_request_decoder()))
     use validated_req <- result.try(validate_metric_request(metric_req))
-    Ok(process_create_metric(business_id, validated_req))
-  }
 
+    // ✅ Route based on scope
+    case scope {
+      "client" -> {
+        case client_id {
+          Some(cid) ->
+            Ok(process_create_client_metric(business_id, cid, validated_req))
+          None ->
+            Error([
+              decode.DecodeError(
+                "Missing",
+                "client_id required for client scope",
+                [],
+              ),
+            ])
+        }
+      }
+      "business" | _ -> Ok(process_create_metric(business_id, validated_req))
+    }
+  }
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 CREATE REQUEST END - ID: " <> request_id,
@@ -406,8 +428,23 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
 
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
+  // Parse query parameters  
+  let scope = case wisp.get_query(req) |> list.key_find("scope") {
+    Ok(s) -> s
+    Error(_) -> "business"
+  }
 
-  case metric_store.get_value(business_id, metric_name) {
+  let lookup_key = case scope {
+    "client" -> {
+      case wisp.get_query(req) |> list.key_find("client_id") {
+        Ok(cid) -> business_id <> ":" <> cid
+        Error(_) -> business_id
+      }
+    }
+    _ -> business_id
+  }
+
+  case metric_store.get_value(lookup_key, metric_name) {
     Ok(value) -> {
       let success_json =
         json.object([
@@ -464,6 +501,26 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
 
   use <- wisp.require_method(req, http.Put)
   use business_id <- with_auth(req)
+
+  // Parse query parameters  
+  let scope = case wisp.get_query(req) |> list.key_find("scope") {
+    Ok(s) -> s
+    Error(_) -> "business"
+  }
+
+  let lookup_key = case scope {
+    "client" -> {
+      case wisp.get_query(req) |> list.key_find("client_id") {
+        Ok(cid) -> business_id <> ":" <> cid
+        // "biz_001:mobile_app"
+        Error(_) -> business_id
+        // fallback to business
+      }
+    }
+    _ -> business_id
+    // business scope
+  }
+
   use json_data <- wisp.require_json(req)
 
   let result = {
@@ -471,7 +528,13 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
       json_data,
       update_metric_request_decoder(),
     ))
-    Ok(process_update_metric(business_id, metric_name, update_req.value))
+    // ✅ FIXED: Pass lookup_key to process_update_metric
+    Ok(process_update_metric(
+      lookup_key,
+      business_id,
+      metric_name,
+      update_req.value,
+    ))
   }
 
   logging.log(
@@ -588,7 +651,6 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
   let metric_type = metric_types.string_to_metric_type(req.metric_type)
   let initial_value = req.initial_value
   let tick_type = interval_to_tick_type(interval)
-  let supabase_tick_type = interval_to_tick_type(req.supabase_interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
 
   logging.log(
@@ -614,11 +676,10 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
 
       process.send(
         app_actor,
-        application.SendMetricToUser(
-          account_id: business_id,
+        application.SendMetricToBusiness(
+          business_id: business_id,
           metric_name: req.metric_name,
           tick_type: tick_type,
-          supabase_tick_type: supabase_tick_type,
           operation: req.operation,
           cleanup_after_seconds: cleanup_seconds,
           metric_type: metric_type,
@@ -667,25 +728,31 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
 }
 
 fn process_update_metric(
+  lookup_key: String,
+  // ✅ NEW: Accept lookup_key parameter
   business_id: String,
+  // Keep for response JSON
   metric_name: String,
   new_value: Float,
 ) -> Response {
   logging.log(
     logging.Info,
     "[MetricHandler] Processing UPDATE metric: "
-      <> business_id
+      <> lookup_key
+      // ✅ FIXED: Log the actual lookup key
       <> "/"
       <> metric_name
       <> " to "
       <> float.to_string(new_value),
   )
 
-  case metric_actor.lookup_metric_subject(business_id, metric_name) {
+  // ✅ FIXED: Use lookup_key instead of business_id
+  case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
     Ok(metric_subject) -> {
       let metric =
         metric_actor.Metric(
-          account_id: business_id,
+          account_id: lookup_key,
+          // ✅ FIXED: Use lookup_key for account_id
           metric_name: metric_name,
           value: new_value,
           tags: dict.new(),
@@ -724,6 +791,94 @@ fn process_update_metric(
         "[MetricHandler] Update failed - metric not found: " <> metric_name,
       )
       wisp.json_response(json.to_string_tree(error_json), 404)
+    }
+  }
+}
+
+fn process_create_client_metric(
+  business_id: String,
+  client_id: String,
+  req: MetricRequest,
+) -> Response {
+  let operation = req.operation
+  let interval = req.flush_interval
+  let cleanup_after = req.cleanup_after
+  let metric_type = metric_types.string_to_metric_type(req.metric_type)
+  let initial_value = req.initial_value
+  let tick_type = interval_to_tick_type(interval)
+  let cleanup_seconds = cleanup_to_seconds(cleanup_after)
+
+  logging.log(
+    logging.Info,
+    "[MetricHandler] Processing CREATE metric: "
+      <> business_id
+      <> "/"
+      <> req.metric_name
+      <> " (cleanup_after: "
+      <> cleanup_after
+      <> " = "
+      <> int.to_string(cleanup_seconds)
+      <> "s)",
+  )
+
+  case get_application_actor() {
+    Ok(app_actor) -> {
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🚀 Sending CREATE to application actor: "
+          <> req.metric_name,
+      )
+
+      process.send(
+        app_actor,
+        application.SendMetricToClient(
+          business_id: business_id,
+          client_id: client_id,
+          metric_name: req.metric_name,
+          tick_type: tick_type,
+          operation: req.operation,
+          cleanup_after_seconds: cleanup_seconds,
+          metric_type: metric_type,
+          initial_value: initial_value,
+          tags: req.tags,
+          metadata: req.metadata,
+        ),
+      )
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ CREATE metric sent to application: "
+          <> req.metric_name
+          <> " = "
+          <> float.to_string(req.initial_value),
+      )
+
+      let success_json =
+        json.object([
+          #("status", json.string("created")),
+          #("business_id", json.string(business_id)),
+          #("metric_name", json.string(req.metric_name)),
+          #("operation", json.string(operation)),
+          #("flush_interval", json.string(interval)),
+          #("cleanup_after", json.string(cleanup_after)),
+          #("tick_type", json.string(tick_type)),
+          #("metric_type", json.string(req.metric_type)),
+          #("initial_value", json.float(initial_value)),
+        ])
+
+      wisp.json_response(json.to_string_tree(success_json), 201)
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[MetricHandler] ❌ Failed to get application actor: " <> error,
+      )
+      let error_json =
+        json.object([
+          #("error", json.string("Internal Server Error")),
+          #("message", json.string("Failed to process metric")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 500)
     }
   }
 }

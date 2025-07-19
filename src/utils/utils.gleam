@@ -28,6 +28,10 @@ pub fn clock_actor_key() -> atom.Atom {
   atom.create("clock_actor")
 }
 
+pub fn application_actor_key() -> atom.Atom {
+  atom.create("application_actor")
+}
+
 // ============================================================================
 // ENVIRONMENT HELPERS
 // ============================================================================

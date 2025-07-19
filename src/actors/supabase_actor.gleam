@@ -8,6 +8,7 @@ import gleam/float
 import gleam/int
 import gleam/json
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
@@ -265,14 +266,69 @@ fn handle_message(
 
 /// Convert MetricBatch to MetricRecord for Supabase (FIXED FIELD MAPPING)
 fn batch_to_metric_record(batch: MetricBatch) -> supabase_client.MetricRecord {
+  logging.log(
+    logging.Info,
+    "[SupabaseActor] 🔍 INCOMING BATCH: business_id='"
+      <> batch.business_id
+      <> "', client_id='"
+      <> string.inspect(batch.client_id)
+      <> "', scope='"
+      <> batch.scope
+      <> "'",
+  )
+
+  // Extract business_id and client_id from the account_id
+  let #(actual_business_id, actual_client_id, actual_scope) = case
+    string.contains(batch.business_id, ":")
+  {
+    True -> {
+      // Client metric: "mobile_app:biz_001" -> business="biz_001", client="mobile_app"
+      case string.split_once(batch.business_id, ":") {
+        Ok(#(client_part, business_part)) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseActor] 🔍 PARSED CLIENT METRIC: client='"
+              <> client_part
+              <> "', business='"
+              <> business_part
+              <> "'",
+          )
+          #(business_part, Some(client_part), "client")
+        }
+        Error(_) -> #(batch.business_id, None, "business")
+      }
+    }
+    False -> {
+      // Business metric: just business_id
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] 🔍 BUSINESS METRIC: business='"
+          <> batch.business_id
+          <> "'",
+      )
+      #(batch.business_id, None, "business")
+    }
+  }
+
+  logging.log(
+    logging.Info,
+    "[SupabaseActor] 🔍 FINAL VALUES: business_id='"
+      <> actual_business_id
+      <> "', client_id='"
+      <> string.inspect(actual_client_id)
+      <> "', scope='"
+      <> actual_scope
+      <> "'",
+  )
+
   supabase_client.MetricRecord(
     id: "will_be_generated",
-    business_id: batch.business_id,
-    client_id: batch.client_id,
+    business_id: actual_business_id,
+    client_id: actual_client_id,
     metric_name: batch.metric_name,
     value: float.to_string(batch.aggregated_value),
     metric_type: batch.metric_type,
-    scope: batch.scope,
+    scope: actual_scope,
     adapters: batch.adapters,
     flushed_at: timestamp_to_iso(batch.window_end),
   )

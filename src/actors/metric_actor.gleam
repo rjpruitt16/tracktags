@@ -7,7 +7,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
@@ -41,7 +41,6 @@ pub type State {
     default_metric: Metric,
     current_metric: Metric,
     tick_type: String,
-    supabase_tick_type: String,
     last_accessed: Int,
     cleanup_after_seconds: Int,
     metric_type: MetricType,
@@ -156,7 +155,6 @@ pub fn start_link(
   account_id: String,
   metric_name: String,
   tick_type: String,
-  supabase_tick_type: String,
   initial_value: Float,
   tags_string: String,
   operation: String,
@@ -172,8 +170,6 @@ pub fn start_link(
       <> metric_name
       <> " (flush: "
       <> tick_type
-      <> ", supabase_tick_type: "
-      <> supabase_tick_type
       <> ", initial value: "
       <> float.to_string(initial_value)
       <> ", tags value: "
@@ -215,7 +211,6 @@ pub fn start_link(
       default_metric: default_metric,
       current_metric: default_metric,
       tick_type: tick_type,
-      supabase_tick_type: supabase_tick_type,
       last_accessed: timestamp,
       cleanup_after_seconds: cleanup_after_seconds,
       metric_type: metric_types.string_to_metric_type(metric_type),
@@ -599,7 +594,6 @@ pub fn start(
   account_id account_id: String,
   metric_name metric_name: String,
   tick_type tick_type: String,
-  supabase_tick_type supabase_tick_type: String,
   initial_value initial_value: Float,
   tags tags: String,
   operation operation: String,
@@ -607,7 +601,7 @@ pub fn start(
   metric_type metric_type: String,
   metadata metadata: String,
 ) -> supervisor.ChildSpec(
-  #(String, String, String, String, Float, String, String, Int, String, String),
+  #(String, String, String, Float, String, String, Int, String, String),
   process.Subject(Message),
 ) {
   supervisor.ChildSpec(
@@ -618,7 +612,6 @@ pub fn start(
       account_id,
       metric_name,
       tick_type,
-      supabase_tick_type,
       initial_value,
       tags,
       operation,
@@ -678,21 +671,23 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
           // No change
         }
         _ -> {
-          // Send the diff
+          let #(business_id, client_id, scope) =
+            metric_types.parse_account_id(state.default_metric.account_id)
           let batch =
             metric_types.MetricBatch(
-              business_id: state.default_metric.account_id,
-              client_id: None,
+              business_id: business_id,
+              client_id: client_id,
               metric_name: state.default_metric.metric_name,
               aggregated_value: diff,
-              // ✅ Send only the diff
               operation_count: 1,
               metric_type: metric_types.metric_type_to_string(state.metric_type),
               window_start: utils.current_timestamp(),
               window_end: utils.current_timestamp(),
-              flush_interval: state.supabase_tick_type,
-              scope: "business",
-              adapters: None,
+              flush_interval: metric_types.get_supabase_batch_interval(
+                state.metadata,
+              ),
+              scope: scope,
+              adapters: metric_types.metadata_to_adapters(state.metadata),
               metric_mode: metric_types.Simple(
                 convert_metric_store_operation_to_simple(state.metric_operation),
               ),
@@ -824,37 +819,101 @@ fn flush_metrics_and_get_state(state: State) -> State {
           state.last_flushed_value
         }
         _ -> {
-          // Send the diff
-          let batch =
-            metric_types.MetricBatch(
-              business_id: state.default_metric.account_id,
-              client_id: None,
-              metric_name: state.default_metric.metric_name,
-              aggregated_value: diff,
-              operation_count: 1,
-              metric_type: metric_types.metric_type_to_string(state.metric_type),
-              window_start: utils.current_timestamp(),
-              window_end: utils.current_timestamp(),
-              flush_interval: state.supabase_tick_type,
-              scope: "business",
-              adapters: None,
-              metric_mode: metric_types.Simple(
-                convert_metric_store_operation_to_simple(state.metric_operation),
-              ),
-            )
+          // Parse the account_id to determine business_id, client_id, and scope
+          let #(business_id, client_id, scope) =
+            metric_types.parse_account_id(state.default_metric.account_id)
 
-          case supabase_actor.send_metric_batch(batch) {
-            Ok(_) -> {
+          // Check if we should flush immediately (same interval) or batch for later
+          let supabase_batch_interval =
+            metric_types.get_supabase_batch_interval(state.metadata)
+          let current_tick_interval = "tick_" <> state.tick_type
+
+          logging.log(
+            logging.Info,
+            "[MetricActor] 🔍 Comparing intervals: supabase="
+              <> supabase_batch_interval
+              <> ", current="
+              <> current_tick_interval,
+          )
+
+          case supabase_batch_interval == current_tick_interval {
+            True -> {
+              // Same interval - flush immediately to avoid race condition
               logging.log(
                 logging.Info,
-                "[MetricActor] ✅ Sent diff to SupabaseActor: "
-                  <> float.to_string(diff),
+                "[MetricActor] 🚀 Same interval flush (immediate): "
+                  <> supabase_batch_interval,
               )
-              current_value
+              case
+                supabase_client.store_metric(
+                  business_id,
+                  client_id,
+                  state.default_metric.metric_name,
+                  float.to_string(diff),
+                  metric_types.metric_type_to_string(state.metric_type),
+                  scope,
+                  None,
+                )
+              {
+                Ok(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] ✅ Direct flush to Supabase: "
+                      <> float.to_string(diff),
+                  )
+                  current_value
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Warning,
+                    "[MetricActor] ⚠️ Direct flush failed: " <> string.inspect(e),
+                  )
+                  state.last_flushed_value
+                }
+              }
             }
-            Error(e) -> {
-              logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
-              state.last_flushed_value
+            False -> {
+              // Different interval - use batch system
+              logging.log(
+                logging.Info,
+                "[MetricActor] 📦 Batching for later flush: "
+                  <> supabase_batch_interval,
+              )
+              let batch =
+                metric_types.MetricBatch(
+                  business_id: business_id,
+                  client_id: client_id,
+                  metric_name: state.default_metric.metric_name,
+                  aggregated_value: diff,
+                  operation_count: 1,
+                  metric_type: metric_types.metric_type_to_string(
+                    state.metric_type,
+                  ),
+                  window_start: utils.current_timestamp(),
+                  window_end: utils.current_timestamp(),
+                  flush_interval: supabase_batch_interval,
+                  scope: scope,
+                  adapters: None,
+                  metric_mode: metric_types.Simple(
+                    convert_metric_store_operation_to_simple(
+                      state.metric_operation,
+                    ),
+                  ),
+                )
+              case supabase_actor.send_metric_batch(batch) {
+                Ok(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] ✅ Sent diff to SupabaseActor: "
+                      <> float.to_string(diff),
+                  )
+                  current_value
+                }
+                Error(e) -> {
+                  logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
+                  state.last_flushed_value
+                }
+              }
             }
           }
         }

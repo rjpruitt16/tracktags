@@ -1,7 +1,7 @@
 // src/actors/application.gleam
+import actors/business_actor
 import actors/clock_actor
 import actors/supabase_actor
-import actors/user_actor
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/erlang/atom
@@ -17,11 +17,22 @@ import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
 pub type ApplicationMessage {
-  SendMetricToUser(
-    account_id: String,
+  SendMetricToBusiness(
+    business_id: String,
     metric_name: String,
     tick_type: String,
-    supabase_tick_type: String,
+    operation: String,
+    cleanup_after_seconds: Int,
+    metric_type: MetricType,
+    initial_value: Float,
+    tags: Dict(String, String),
+    metadata: Option(MetricMetadata),
+  )
+  SendMetricToClient(
+    business_id: String,
+    client_id: String,
+    metric_name: String,
+    tick_type: String,
     operation: String,
     cleanup_after_seconds: Int,
     metric_type: MetricType,
@@ -37,35 +48,30 @@ pub type ApplicationState {
   ApplicationState(
     supervisor: glixir.DynamicSupervisor(
       String,
-      process.Subject(user_actor.Message),
+      process.Subject(business_actor.Message),
     ),
     clock_actor: process.Subject(clock_actor.Message),
     supabase_actor: process.Subject(supabase_actor.Message),
   )
 }
 
-// Encoder function for user actor arguments
-fn encode_user_args(account_id: String) -> List(dynamic.Dynamic) {
-  [dynamic.string(account_id)]
-}
-
 // Decoder function for user actor replies
 fn decode_user_reply(
   _reply: dynamic.Dynamic,
-) -> Result(process.Subject(user_actor.Message), String) {
+) -> Result(process.Subject(business_actor.Message), String) {
   Ok(process.new_subject())
 }
 
 // Simple helper to get or spawn a user - NO BLOCKING!
-fn get_or_spawn_user_simple(
+fn get_or_spawn_business_simple(
   supervisor: glixir.DynamicSupervisor(
     String,
-    process.Subject(user_actor.Message),
+    process.Subject(business_actor.Message),
   ),
   account_id: String,
-) -> Result(process.Subject(user_actor.Message), String) {
+) -> Result(process.Subject(business_actor.Message), String) {
   // First try to find existing user
-  case user_actor.lookup_user_subject(account_id) {
+  case business_actor.lookup_business_subject(account_id) {
     Ok(user_subject) -> {
       logging.log(
         logging.Debug,
@@ -80,12 +86,12 @@ fn get_or_spawn_user_simple(
         "[Application] Spawning new user: " <> account_id,
       )
 
-      let user_spec = user_actor.start(account_id)
+      let user_spec = business_actor.start(account_id)
       case
         glixir.start_dynamic_child(
           supervisor,
           user_spec,
-          encode_user_args,
+          business_actor.encode_business_args,
           decode_user_reply,
         )
       {
@@ -100,7 +106,7 @@ fn get_or_spawn_user_simple(
 
           // Instead of blocking, just try lookup immediately
           // The UserActor will handle the "first metric send" internally
-          case user_actor.lookup_user_subject(account_id) {
+          case business_actor.lookup_business_subject(account_id) {
             Ok(user_subject) -> {
               logging.log(
                 logging.Info,
@@ -142,11 +148,73 @@ fn handle_application_message(
   )
 
   case message {
-    SendMetricToUser(
-      account_id,
+    SendMetricToClient(
+      client_id,
+      business_id,
       metric_name,
       tick_type,
-      supabase_tick_type,
+      operation,
+      cleanup_after_seconds,
+      metric_type,
+      initial_value,
+      tags,
+      metadata,
+    ) -> {
+      case business_actor.lookup_business_subject(business_id) {
+        Ok(business_subject) ->
+          // Send client metric to existing BusinessActor
+          process.send(
+            business_subject,
+            business_actor.RecordClientMetric(
+              client_id,
+              metric_name,
+              initial_value,
+              tick_type,
+              operation,
+              cleanup_after_seconds,
+              metric_type,
+              tags,
+              metadata,
+            ),
+          )
+        Error(_) ->
+          // Spawn BusinessActor, then send client metric
+          case get_or_spawn_business_simple(state.supervisor, business_id) {
+            Ok(business_subject) -> {
+              logging.log(
+                logging.Info,
+                "[ApplicationActor] ✅ Business spawned, sending metric to mailbox: "
+                  <> business_id,
+              )
+              process.send(
+                business_subject,
+                business_actor.RecordClientMetric(
+                  client_id,
+                  metric_name,
+                  initial_value,
+                  tick_type,
+                  operation,
+                  cleanup_after_seconds,
+                  metric_type,
+                  tags,
+                  metadata,
+                ),
+              )
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Error,
+                "[ApplicationActor] ❌ Failed to spawn business: " <> error,
+              )
+            }
+          }
+      }
+      actor.continue(state)
+    }
+    SendMetricToBusiness(
+      business_id,
+      metric_name,
+      tick_type,
       operation,
       cleanup_after_seconds,
       metric_type,
@@ -161,21 +229,20 @@ fn handle_application_message(
       )
 
       // Try to get existing user first
-      case user_actor.lookup_user_subject(account_id) {
-        Ok(user_subject) -> {
+      case business_actor.lookup_business_subject(business_id) {
+        Ok(business_subject) -> {
           logging.log(
             logging.Info,
-            "[ApplicationActor] ✅ Found existing user, sending metric: "
-              <> account_id,
+            "[ApplicationActor] ✅ Found existing business_id, sending metric: "
+              <> business_id,
           )
 
           process.send(
-            user_subject,
-            user_actor.RecordMetric(
+            business_subject,
+            business_actor.RecordMetric(
               metric_name,
               initial_value,
               tick_type,
-              supabase_tick_type,
               operation,
               cleanup_after_seconds,
               metric_type,
@@ -185,31 +252,30 @@ fn handle_application_message(
           )
           logging.log(
             logging.Info,
-            "[ApplicationActor] ✅ Metric sent to existing user: " <> account_id,
+            "[ApplicationActor] ✅ Metric sent to existing user: " <> business_id,
           )
         }
         Error(_) -> {
           // User doesn't exist - spawn it AND send metric to its mailbox
           logging.log(
             logging.Info,
-            "[ApplicationActor] User not found, spawning: " <> account_id,
+            "[ApplicationActor] Business not found, spawning: " <> business_id,
           )
 
-          case get_or_spawn_user_simple(state.supervisor, account_id) {
-            Ok(user_subject) -> {
+          case get_or_spawn_business_simple(state.supervisor, business_id) {
+            Ok(business_subject) -> {
               logging.log(
                 logging.Info,
-                "[ApplicationActor] ✅ User spawned, sending metric to mailbox: "
-                  <> account_id,
+                "[ApplicationActor] ✅ Business spawned, sending metric to mailbox: "
+                  <> business_id,
               )
 
               process.send(
-                user_subject,
-                user_actor.RecordMetric(
+                business_subject,
+                business_actor.RecordMetric(
                   metric_name,
                   initial_value,
                   tick_type,
-                  supabase_tick_type,
                   operation,
                   cleanup_after_seconds,
                   metric_type,
@@ -219,14 +285,14 @@ fn handle_application_message(
               )
               logging.log(
                 logging.Info,
-                "[ApplicationActor] ✅ Metric queued in new user's mailbox: "
-                  <> account_id,
+                "[ApplicationActor] ✅ Metric queued in new business's mailbox: "
+                  <> business_id,
               )
             }
             Error(error) -> {
               logging.log(
                 logging.Error,
-                "[ApplicationActor] ❌ Failed to spawn user: " <> error,
+                "[ApplicationActor] ❌ Failed to spawn business: " <> error,
               )
             }
           }
@@ -253,7 +319,7 @@ fn handle_application_message(
 pub fn start_application_actor(
   supervisor: glixir.DynamicSupervisor(
     String,
-    process.Subject(user_actor.Message),
+    process.Subject(business_actor.Message),
   ),
   clock_actor_subject: process.Subject(clock_actor.Message),
   supabase_actor_subject: process.Subject(supabase_actor.Message),
@@ -281,7 +347,7 @@ pub fn start_application_actor(
       case
         glixir.register_subject(
           utils.tracktags_registry(),
-          atom.create("application_actor"),
+          utils.application_actor_key(),
           subject,
           glixir.atom_key_encoder,
         )
