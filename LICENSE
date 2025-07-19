@@ -1,0 +1,73 @@
+TrackTags Business Source License
+
+Copyright © 2025, Rahmi Pruitt
+
+This license ("License") grants rights in specified software code (the "Code") 
+under a business-source-style license that applies one set of terms and 
+conditions (the "Pre-Change Terms") to the Code and all modified Code before a 
+specified date (the "Change Date"), and another set of terms and conditions 
+(the "Post-Change Terms") on and after the Change Date. The Change Date for 
+this license is July 19, 2029.
+
+More about this License can be found at https://github.com/rjpruitt16/tracktags
+
+A. Pre-Change Terms: License, before July 19, 2029:
+
+Prior to the Change Date, you have the non-exclusive, worldwide rights under 
+this License to copy, modify, display, use, and redistribute the Code solely 
+under the following conditions:
+
+You may use the Code for any purpose EXCEPT offering TrackTags as a hosted 
+service to third parties. Specifically, you may NOT:
+- Provide TrackTags-as-a-Service to external customers
+- Compete with the official TrackTags commercial hosting platform
+- Sell access to TrackTags functionality to third parties
+
+You MAY:
+- Use TrackTags for your own business or personal projects
+- Self-host TrackTags for internal use within your organization
+- Modify and create derivative works of the Code
+- Distribute the Code and modifications under this same License
+
+All copies and uses of original and modified Code are also subject to this 
+License. When copying or distributing original or modified Code, you must 
+conspicuously and appropriately publish on each copy an appropriate copyright 
+notice; keep intact all notices stating that this License applies to the 
+original or modified Code; keep intact all notices of the absence of any 
+warranty; and give all recipients a copy of this License along with the Code.
+
+If your desired use of the Code or modified Code does not meet all of the 
+above requirements, you MUST purchase a separate, commercial license for the 
+Code prior to all conflicting installations or other uses of the Code. You can 
+contact the licensor at: [rahmipruitt@dreamsfrommemphistechnologygroup.com]
+
+Any attempt to use the Code outside the permitted scope of the Pre-Change 
+Terms will automatically terminate your rights under this License to this and 
+all future versions of the Code.
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE CODE OR ANY SERVICES OR WORK 
+PRODUCT PROVIDED UNDER OR IN CONNECTION WITH THIS LICENSE ARE PROVIDED ON 
+AN "AS IS" BASIS. YOU EXPRESSLY WAIVE ALL WARRANTIES, WHETHER EXPRESS OR 
+IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF MERCHANTABILITY, FITNESS 
+FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, SYSTEM INTEGRATION, AND ACCURACY OF 
+INFORMATIONAL CONTENT.
+
+On the Change Date, the Pre-Change Terms shall automatically terminate and 
+shall be replaced with the Post-Change Terms described in Section B, below.
+
+B. Post-Change Terms: License after, and including, July 19, 2029:
+
+On and after the Change Date, the software code is licensed to you pursuant to 
+the Apache License, Version 2.0, as follows:
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
