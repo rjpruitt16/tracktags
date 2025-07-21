@@ -853,6 +853,10 @@ fn flush_metrics_and_get_state(state: State) -> State {
                   metric_types.metric_type_to_string(state.metric_type),
                   scope,
                   None,
+                  None,
+                  None,
+                  None,
+                  None,
                 )
               {
                 Ok(_) -> {

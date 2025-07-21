@@ -115,13 +115,18 @@ fn make_request(
       |> request.set_header("Prefer", "return=representation")
       |> request.set_body(json_body)
     }
+    http.Patch, Some(json_body) -> {
+      req_with_headers
+      |> request.set_method(http.Patch)
+      |> request.set_header("Prefer", "return=representation")
+      |> request.set_body(json_body)
+    }
     http.Get, None -> {
       req_with_headers
       |> request.set_method(http.Get)
     }
     _, _ -> req_with_headers |> request.set_method(method)
   }
-
   case httpc.send(final_req) {
     Ok(response) -> Ok(response)
     Error(http_error) -> {
@@ -249,6 +254,131 @@ pub fn validate_api_key(api_key: String) -> Result(String, SupabaseError) {
 // BUSINESS MANAGEMENT
 // ============================================================================
 
+/// Create business for new Stripe customer (webhook auto-creation)
+pub fn create_business_for_stripe_customer(
+  stripe_customer_id: String,
+  business_name: String,
+  email: String,
+  plan_type: String,
+  // ✅ Now configurable
+) -> Result(Business, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating business for Stripe customer: "
+      <> stripe_customer_id,
+  )
+
+  let business_id = "biz_" <> string.slice(stripe_customer_id, 4, 8)
+  // Extract part of customer ID
+
+  let business_data =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("business_name", json.string(business_name)),
+      #("email", json.string(email)),
+      #("plan_type", json.string("pro")),
+      #("stripe_customer_id", json.string(stripe_customer_id)),
+      #("subscription_status", json.string("active")),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/businesses",
+    Some(json.to_string(business_data)),
+  ))
+
+  case response.status {
+    201 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Created business: " <> business_id,
+      )
+      Ok(Business(
+        business_id: business_id,
+        stripe_customer_id: Some(stripe_customer_id),
+        business_name: business_name,
+        email: email,
+        plan_type: "pro",
+      ))
+    }
+    _ -> Error(DatabaseError("Failed to create business"))
+  }
+}
+
+pub fn update_business_subscription(
+  business_id: String,
+  subscription_id: Option(String),
+  status: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating subscription for business: " <> business_id,
+  )
+
+  let base_fields = [#("subscription_status", json.string(status))]
+
+  let all_fields = case subscription_id {
+    Some(sub_id) -> [
+      #("stripe_subscription_id", json.string(sub_id)),
+      ..base_fields
+    ]
+    None -> base_fields
+  }
+
+  let update_data = json.object(all_fields)
+
+  let path = "/businesses?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Updated subscription status to: " <> status,
+      )
+      Ok(Nil)
+    }
+    _ -> Error(DatabaseError("Failed to update business subscription"))
+  }
+}
+
+/// Get business by Stripe customer ID (for webhook processing)
+pub fn get_business_by_stripe_customer(
+  stripe_customer_id: String,
+) -> Result(Business, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting business by Stripe customer: "
+      <> stripe_customer_id,
+  )
+
+  let path = "/businesses?stripe_customer_id=eq." <> stripe_customer_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(business_decoder())) {
+        Ok([]) -> Error(NotFound("Business not found for Stripe customer"))
+        Ok([business, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Found business: " <> business.business_id,
+          )
+          Ok(business)
+        }
+        Error(_) -> Error(ParseError("Invalid business format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch business by Stripe customer"))
+  }
+}
+
 /// Get business details by business_id
 pub fn get_business(business_id: String) -> Result(Business, SupabaseError) {
   logging.log(
@@ -269,6 +399,59 @@ pub fn get_business(business_id: String) -> Result(Business, SupabaseError) {
       }
     }
     _ -> Error(DatabaseError("Failed to fetch business"))
+  }
+}
+
+/// Create plan limit for subscription provisioning
+pub fn create_plan_limit(
+  business_id: String,
+  metric_name: String,
+  limit_value: Float,
+  period: String,
+  operator: String,
+  action: String,
+  webhook_url: Option(String),
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating plan limit: "
+      <> metric_name
+      <> " = "
+      <> float.to_string(limit_value),
+  )
+
+  let base_fields = [
+    #("business_id", json.string(business_id)),
+    #("plan_id", json.null()),
+    #("client_id", json.null()),
+    #("metric_name", json.string(metric_name)),
+    #("limit_value", json.float(limit_value)),
+    #("limit_period", json.string(period)),
+    #("breach_operator", json.string(operator)),
+    #("breach_action", json.string(action)),
+  ]
+  let all_fields = case webhook_url {
+    Some(url) -> [#("webhook_url", json.string(url)), ..base_fields]
+    None -> base_fields
+  }
+
+  let limit_data = json.object(all_fields)
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/plan_limits",
+    Some(json.to_string(limit_data)),
+  ))
+
+  case response.status {
+    201 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Created plan limit: " <> metric_name,
+      )
+      Ok(Nil)
+    }
+    _ -> Error(DatabaseError("Failed to create plan limit"))
   }
 }
 
@@ -369,6 +552,10 @@ pub fn store_metric(
   metric_type: String,
   scope: String,
   adapters: Option(Dict(String, json.Json)),
+  threshold_value: Option(Float),
+  threshold_operator: Option(String),
+  threshold_action: Option(String),
+  webhook_urls: Option(String),
 ) -> Result(MetricRecord, SupabaseError) {
   logging.log(
     logging.Info,
@@ -383,9 +570,30 @@ pub fn store_metric(
     #("scope", json.string(scope)),
   ]
 
-  let with_client = case client_id {
-    Some(cid) -> [#("client_id", json.string(cid)), ..base_fields]
+  // Add threshold fields if provided
+  let with_threshold = case threshold_value {
+    Some(val) -> [
+      #("threshold_value", json.float(val)),
+      #(
+        "threshold_operator",
+        json.string(threshold_operator |> option.unwrap("gte")),
+      ),
+      #(
+        "threshold_action",
+        json.string(threshold_action |> option.unwrap("deny")),
+      ),
+      ..base_fields
+    ]
     None -> base_fields
+  }
+
+  let with_webhook = case webhook_urls {
+    Some(url) -> [#("webhook_urls", json.string(url)), ..with_threshold]
+    None -> with_threshold
+  }
+  let with_client = case client_id {
+    Some(cid) -> [#("client_id", json.string(cid)), ..with_webhook]
+    None -> with_webhook
   }
 
   let all_fields = case adapters {

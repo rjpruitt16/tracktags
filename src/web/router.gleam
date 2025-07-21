@@ -3,6 +3,7 @@ import gleam/http.{Delete, Get, Post, Put}
 import web/handler/client_handler
 import web/handler/key_handler
 import web/handler/metric_handler
+import web/handler/stripe_handler
 import wisp.{type Request, type Response}
 
 pub fn handle_request(req: Request) -> Response {
@@ -17,6 +18,13 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
+    // Stripe webhooks
+    // In your router.gleam, add:
+    ["api", "v1", "webhooks", "stripe"] ->
+      case req.method {
+        Post -> stripe_handler.handle_stripe_webhook(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
     // Client CRUD API
     ["api", "v1", "clients"] ->
       case req.method {

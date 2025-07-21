@@ -1,7 +1,6 @@
 // src/utils/crypto.gleam
 import gleam/bit_array
 import gleam/crypto
-import gleam/int
 import gleam/result
 import gleam/string
 import logging
