@@ -16,10 +16,10 @@ CREATE TABLE businesses (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 2. Clients table (under businesses) - UNCHANGED
 CREATE TABLE clients (
   client_id TEXT PRIMARY KEY,
   business_id TEXT REFERENCES businesses(business_id) ON DELETE CASCADE,
+  plan_id UUID REFERENCES plans(id) ON DELETE SET NULL,
   client_name TEXT NOT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -116,7 +116,9 @@ CREATE INDEX idx_businesses_email ON businesses(email);
 CREATE INDEX idx_businesses_status ON businesses(subscription_status);
 CREATE INDEX idx_businesses_plan ON businesses(current_plan_id);
 
+-- Add index for performance  
 CREATE INDEX idx_clients_business ON clients(business_id);
+CREATE INDEX idx_clients_plan ON clients(plan_id);
 
 CREATE INDEX idx_integration_keys_business ON integration_keys(business_id);
 CREATE INDEX idx_integration_keys_type ON integration_keys(key_type);

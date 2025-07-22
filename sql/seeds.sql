@@ -32,15 +32,14 @@ UPDATE businesses SET current_plan_id = (
   SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'
 ) WHERE business_id = 'biz_003';
 
--- Insert test clients (customers of the businesses above)
-INSERT INTO clients (client_id, business_id, client_name) VALUES
-  ('mobile_app', 'biz_001', 'Mobile Application'),
-  ('web_portal', 'biz_001', 'Web Portal'),
-  ('api_service', 'biz_001', 'API Service'),
-  ('customer_app', 'biz_002', 'Main Customer App'),
-  ('enterprise_client', 'biz_003', 'Enterprise Integration');
+-- Insert test clients with plan references
+INSERT INTO clients (client_id, business_id, plan_id, client_name) VALUES
+  ('mobile_app', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Mobile Application'),
+  ('web_portal', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Web Portal'),
+  ('api_service', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'enterprise'), 'API Service'),
+  ('customer_app', 'biz_002', (SELECT id FROM plans WHERE business_id = 'biz_002' AND plan_name = 'free'), 'Main Customer App'),
+  ('enterprise_client', 'biz_003', (SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'Enterprise Integration');-- Insert test API keys (business API keys + customer API keys)
 
--- Insert test API keys (business API keys + customer API keys)
 INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key) VALUES
   -- Business API keys (for TrackTags platform)
   ('biz_001', 'api', 'production', 'tk_live_test123'),

@@ -80,6 +80,16 @@ pub type PlanLimit {
   )
 }
 
+pub type Client {
+  Client(
+    client_id: String,
+    business_id: String,
+    plan_id: Option(String),
+    client_name: String,
+    created_at: String,
+  )
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -177,6 +187,22 @@ fn make_request_with_params(
 // ============================================================================
 // JSON DECODERS
 // ============================================================================
+
+fn client_decoder() -> decode.Decoder(Client) {
+  use client_id <- decode.field("client_id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use plan_id <- decode.field("plan_id", decode.optional(decode.string))
+  use client_name <- decode.field("client_name", decode.string)
+  use created_at <- decode.field("created_at", decode.string)
+
+  decode.success(Client(
+    client_id: client_id,
+    business_id: business_id,
+    plan_id: plan_id,
+    client_name: client_name,
+    created_at: created_at,
+  ))
+}
 
 fn business_decoder() -> decode.Decoder(Business) {
   use business_id <- decode.field("business_id", decode.string)
@@ -1372,21 +1398,173 @@ pub fn get_latest_metric_value(
   }
 }
 
+// ============================================================================
+// CLIENT MANAGEMENT CRUD
+// ============================================================================
+
+/// Get all clients for a business
+pub fn get_business_clients(
+  business_id: String,
+) -> Result(List(Client), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting clients for business: " <> business_id,
+  )
+
+  let path = "/clients?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(client_decoder())) {
+        Ok(clients) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved "
+              <> string.inspect(list.length(clients))
+              <> " clients",
+          )
+          Ok(clients)
+        }
+        Error(_) -> Error(ParseError("Invalid clients format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch clients"))
+  }
+}
+
+/// Get a specific client by ID (with business ownership check)
+pub fn get_client_by_id(
+  business_id: String,
+  client_id: String,
+) -> Result(Client, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting client: "
+      <> client_id
+      <> " for business: "
+      <> business_id,
+  )
+
+  let path =
+    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(client_decoder())) {
+        Ok([]) -> Error(NotFound("Client not found"))
+        Ok([client, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved client: " <> client.client_id,
+          )
+          Ok(client)
+        }
+        Error(_) -> Error(ParseError("Invalid client format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch client"))
+  }
+}
+
+/// Update a client
+pub fn update_client(
+  business_id: String,
+  client_id: String,
+  client_name: String,
+  plan_id: String,
+) -> Result(Client, SupabaseError) {
+  logging.log(logging.Info, "[SupabaseClient] Updating client: " <> client_id)
+
+  let update_data =
+    json.object([
+      #("client_name", json.string(client_name)),
+      #("plan_id", json.string(plan_id)),
+    ])
+
+  let path =
+    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(client_decoder())) {
+        Ok([]) -> Error(NotFound("Client not found or not owned by business"))
+        Ok([updated_client, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Updated client: " <> updated_client.client_id,
+          )
+          Ok(updated_client)
+        }
+        Error(_) -> Error(ParseError("Invalid client response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to update client"))
+  }
+}
+
+/// Delete a client
+pub fn delete_client(
+  business_id: String,
+  client_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Deleting client: "
+      <> client_id
+      <> " for business: "
+      <> business_id,
+  )
+
+  let path =
+    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Delete, path, None))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Deleted client: " <> client_id,
+      )
+      Ok(Nil)
+    }
+    404 -> Error(NotFound("Client not found or not owned by business"))
+    _ -> Error(DatabaseError("Failed to delete client"))
+  }
+}
+
 /// Create a new client for a business
 pub fn create_client(
   business_id: String,
   client_id: String,
   client_name: String,
-) -> Result(Nil, SupabaseError) {
+  plan_id: String,
+) -> Result(Client, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Creating client: " <> business_id <> "/" <> client_id,
+    "[SupabaseClient] Creating client: "
+      <> business_id
+      <> "/"
+      <> client_id
+      <> " on plan: "
+      <> plan_id,
   )
 
   let client_data =
     json.object([
       #("client_id", json.string(client_id)),
       #("business_id", json.string(business_id)),
+      #("plan_id", json.string(plan_id)),
       #("client_name", json.string(client_name)),
     ])
 
@@ -1398,11 +1576,18 @@ pub fn create_client(
 
   case response.status {
     201 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] ✅ Client created successfully",
-      )
-      Ok(Nil)
+      case json.parse(response.body, decode.list(client_decoder())) {
+        Ok([new_client, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Client created successfully: "
+              <> new_client.client_id,
+          )
+          Ok(new_client)
+        }
+        Ok([]) -> Error(ParseError("No client returned from server"))
+        Error(_) -> Error(ParseError("Invalid client response format"))
+      }
     }
     409 -> Error(DatabaseError("Client already exists"))
     _ -> Error(DatabaseError("Failed to create client"))

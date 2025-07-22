@@ -4,6 +4,7 @@ import gleam/dynamic/decode
 import gleam/http
 import gleam/json
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
@@ -15,7 +16,12 @@ import wisp.{type Request, type Response}
 // ============================================================================
 
 pub type ClientRequest {
-  ClientRequest(client_id: String, name: String, description: String)
+  ClientRequest(
+    client_id: String,
+    name: String,
+    description: String,
+    plan_id: String,
+  )
 }
 
 pub type ClientKeyRequest {
@@ -90,6 +96,7 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
 
 fn client_request_decoder() -> decode.Decoder(ClientRequest) {
   use client_id <- decode.field("client_id", decode.string)
+  use plan_id <- decode.field("plan_id", decode.string)
   use name <- decode.optional_field("name", "", decode.string)
   use description <- decode.optional_field("description", "", decode.string)
 
@@ -97,6 +104,7 @@ fn client_request_decoder() -> decode.Decoder(ClientRequest) {
     client_id: client_id,
     name: name,
     description: description,
+    plan_id: plan_id,
   ))
 }
 
@@ -204,19 +212,50 @@ pub fn list_clients(req: Request) -> Response {
     "[ClientHandler] 📋 Listing clients for business: " <> business_id,
   )
 
-  let success_json =
-    json.object([
-      #("message", json.string("List clients - LOGGED")),
-      #("business_id", json.string(business_id)),
-      #("clients", json.array([], json.string)),
-    ])
+  case supabase_client.get_business_clients(business_id) {
+    Ok(clients) -> {
+      let response_data =
+        clients
+        |> list.map(fn(client) {
+          json.object([
+            #("client_id", json.string(client.client_id)),
+            #("client_name", json.string(client.client_name)),
+            #("plan_id", case client.plan_id {
+              Some(pid) -> json.string(pid)
+              None -> json.null()
+            }),
+          ])
+        })
+        |> json.array(from: _, of: fn(item) { item })
 
-  logging.log(
-    logging.Info,
-    "[ClientHandler] 🔍 LIST CLIENTS REQUEST END - ID: " <> request_id,
-  )
+      let success_json =
+        json.object([
+          #("clients", response_data),
+          #("count", json.int(list.length(clients))),
+          #("business_id", json.string(business_id)),
+        ])
 
-  wisp.json_response(json.to_string_tree(success_json), 200)
+      logging.log(
+        logging.Info,
+        "[ClientHandler] 🔍 LIST CLIENTS REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(success_json), 200)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Internal Server Error")),
+          #("message", json.string("Failed to fetch clients")),
+        ])
+      logging.log(
+        logging.Info,
+        "[ClientHandler] 🔍 LIST CLIENTS REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
 }
 
 pub fn get_client(req: Request, client_id: String) -> Response {
@@ -237,19 +276,54 @@ pub fn get_client(req: Request, client_id: String) -> Response {
     "[ClientHandler] 🔍 Getting client: " <> business_id <> "/" <> client_id,
   )
 
-  let success_json =
-    json.object([
-      #("message", json.string("Get client - LOGGED")),
-      #("business_id", json.string(business_id)),
-      #("client_id", json.string(client_id)),
-    ])
+  case supabase_client.get_client_by_id(business_id, client_id) {
+    Ok(client) -> {
+      logging.log(
+        logging.Info,
+        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+      )
 
-  logging.log(
-    logging.Info,
-    "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
-  )
+      let success_json =
+        json.object([
+          #("client_id", json.string(client.client_id)),
+          #("client_name", json.string(client.client_name)),
+          #("plan_id", case client.plan_id {
+            Some(pid) -> json.string(pid)
+            None -> json.null()
+          }),
+        ])
+      wisp.json_response(json.to_string_tree(success_json), 200)
+    }
+    Error(supabase_client.NotFound(_)) -> {
+      logging.log(
+        logging.Info,
+        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+      )
 
-  wisp.json_response(json.to_string_tree(success_json), 200)
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Not Found")),
+            #("message", json.string("Client not found")),
+          ]),
+        ),
+        404,
+      )
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Info,
+        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+      )
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Internal Server Error"))]),
+        ),
+        500,
+      )
+    }
+  }
 }
 
 pub fn delete_client(req: Request, client_id: String) -> Response {
@@ -302,7 +376,14 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
   )
 
   // Actually create the client in the database
-  case supabase_client.create_client(business_id, req.client_id, req.name) {
+  case
+    supabase_client.create_client(
+      business_id,
+      req.client_id,
+      req.name,
+      req.plan_id,
+    )
+  {
     Ok(_) -> {
       logging.log(
         logging.Info,
