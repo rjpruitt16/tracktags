@@ -64,6 +64,22 @@ pub type MetricRecord {
   )
 }
 
+pub type PlanLimit {
+  PlanLimit(
+    id: String,
+    business_id: Option(String),
+    client_id: Option(String),
+    plan_id: Option(String),
+    metric_name: String,
+    limit_value: Float,
+    limit_period: String,
+    breach_operator: String,
+    breach_action: String,
+    webhook_urls: Option(String),
+    created_at: String,
+  )
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -614,6 +630,434 @@ pub fn create_plan_limit(
     }
     _ -> Error(DatabaseError("Failed to create plan limit"))
   }
+}
+
+// ============================================================================
+// PLAN LIMITS JSON DECODERS (Add to decoders section)
+// ============================================================================
+
+fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
+  use id <- decode.field("id", decode.string)
+  use business_id <- decode.field("business_id", decode.optional(decode.string))
+  use client_id <- decode.field("client_id", decode.optional(decode.string))
+  use plan_id <- decode.field("plan_id", decode.optional(decode.string))
+  use metric_name <- decode.field("metric_name", decode.string)
+  use limit_value <- decode.field(
+    "limit_value",
+    decode.one_of(decode.float, or: [decode.int |> decode.map(int.to_float)]),
+  )
+  use limit_period <- decode.field("limit_period", decode.string)
+  use breach_operator <- decode.field("breach_operator", decode.string)
+  use breach_action <- decode.field("breach_action", decode.string)
+  use webhook_urls <- decode.field(
+    "webhook_urls",
+    decode.optional(decode.string),
+  )
+  use created_at <- decode.field("created_at", decode.string)
+
+  decode.success(PlanLimit(
+    id: id,
+    business_id: business_id,
+    client_id: client_id,
+    plan_id: plan_id,
+    metric_name: metric_name,
+    limit_value: limit_value,
+    limit_period: limit_period,
+    breach_operator: breach_operator,
+    breach_action: breach_action,
+    webhook_urls: webhook_urls,
+    created_at: created_at,
+  ))
+}
+
+// ============================================================================
+// BUSINESS PLAN LIMITS MANAGEMENT
+// ============================================================================
+
+/// Create a business-level plan limit
+pub fn create_business_plan_limit(
+  business_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_period: String,
+  breach_operator: String,
+  breach_action: String,
+  webhook_urls: Option(String),
+) -> Result(PlanLimit, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating business plan limit: "
+      <> business_id
+      <> "/"
+      <> metric_name
+      <> " = "
+      <> float.to_string(limit_value),
+  )
+
+  let base_fields = [
+    #("business_id", json.string(business_id)),
+    #("plan_id", json.null()),
+    #("client_id", json.null()),
+    #("metric_name", json.string(metric_name)),
+    #("limit_value", json.float(limit_value)),
+    #("limit_period", json.string(limit_period)),
+    #("breach_operator", json.string(breach_operator)),
+    #("breach_action", json.string(breach_action)),
+  ]
+
+  let all_fields = case webhook_urls {
+    Some(urls) -> [#("webhook_urls", json.string(urls)), ..base_fields]
+    None -> base_fields
+  }
+
+  let limit_data = json.object(all_fields)
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/plan_limits",
+    Some(json.to_string(limit_data)),
+  ))
+
+  case response.status {
+    201 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([new_limit, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Created business plan limit: " <> new_limit.id,
+          )
+          Ok(new_limit)
+        }
+        Ok([]) -> Error(ParseError("No plan limit returned from server"))
+        Error(_) -> Error(ParseError("Invalid plan limit response format"))
+      }
+    }
+    409 -> Error(DatabaseError("Plan limit already exists for this metric"))
+    _ -> Error(DatabaseError("Failed to create business plan limit"))
+  }
+}
+
+/// Get all business-level plan limits
+pub fn get_business_plan_limits(
+  business_id: String,
+) -> Result(List(PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting business plan limits for: " <> business_id,
+  )
+
+  let path = "/plan_limits?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok(limits) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved "
+              <> string.inspect(list.length(limits))
+              <> " business plan limits",
+          )
+          Ok(limits)
+        }
+        Error(_) -> Error(ParseError("Invalid plan limits format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch business plan limits"))
+  }
+}
+
+/// Get a specific plan limit by ID (with business ownership check)
+pub fn get_plan_limit_by_id(
+  business_id: String,
+  limit_id: String,
+) -> Result(PlanLimit, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting plan limit: "
+      <> limit_id
+      <> " for business: "
+      <> business_id,
+  )
+
+  let path =
+    "/plan_limits?id=eq." <> limit_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([]) -> Error(NotFound("Plan limit not found"))
+        Ok([limit, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved plan limit: " <> limit.id,
+          )
+          Ok(limit)
+        }
+        Error(_) -> Error(ParseError("Invalid plan limit format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch plan limit"))
+  }
+}
+
+/// Update a business plan limit
+pub fn update_business_plan_limit(
+  business_id: String,
+  limit_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_period: String,
+  breach_operator: String,
+  breach_action: String,
+  webhook_urls: Option(String),
+) -> Result(PlanLimit, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating plan limit: " <> limit_id,
+  )
+
+  let base_fields = [
+    #("metric_name", json.string(metric_name)),
+    #("limit_value", json.float(limit_value)),
+    #("limit_period", json.string(limit_period)),
+    #("breach_operator", json.string(breach_operator)),
+    #("breach_action", json.string(breach_action)),
+  ]
+
+  let all_fields = case webhook_urls {
+    Some(urls) -> [#("webhook_urls", json.string(urls)), ..base_fields]
+    None -> [#("webhook_urls", json.null()), ..base_fields]
+  }
+
+  let update_data = json.object(all_fields)
+
+  let path =
+    "/plan_limits?id=eq." <> limit_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([]) ->
+          Error(NotFound("Plan limit not found or not owned by business"))
+        Ok([updated_limit, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Updated plan limit: " <> updated_limit.id,
+          )
+          Ok(updated_limit)
+        }
+        Error(_) -> Error(ParseError("Invalid plan limit response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to update plan limit"))
+  }
+}
+
+/// Delete a business plan limit
+pub fn delete_plan_limit(
+  business_id: String,
+  limit_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Deleting plan limit: "
+      <> limit_id
+      <> " for business: "
+      <> business_id,
+  )
+
+  let path =
+    "/plan_limits?id=eq." <> limit_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Delete, path, None))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Deleted plan limit: " <> limit_id,
+      )
+      Ok(Nil)
+    }
+    404 -> Error(NotFound("Plan limit not found or not owned by business"))
+    _ -> Error(DatabaseError("Failed to delete plan limit"))
+  }
+}
+
+// ============================================================================
+// CLIENT PLAN LIMITS MANAGEMENT  
+// ============================================================================
+
+/// Create a client-specific plan limit (override business limit)
+pub fn create_client_plan_limit(
+  business_id: String,
+  client_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_period: String,
+  breach_operator: String,
+  breach_action: String,
+  webhook_urls: Option(String),
+) -> Result(PlanLimit, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating client plan limit: "
+      <> business_id
+      <> "/"
+      <> client_id
+      <> "/"
+      <> metric_name
+      <> " = "
+      <> float.to_string(limit_value),
+  )
+
+  let base_fields = [
+    #("business_id", json.null()),
+    // Client limits don't have business_id
+    #("plan_id", json.null()),
+    #("client_id", json.string(client_id)),
+    #("metric_name", json.string(metric_name)),
+    #("limit_value", json.float(limit_value)),
+    #("limit_period", json.string(limit_period)),
+    #("breach_operator", json.string(breach_operator)),
+    #("breach_action", json.string(breach_action)),
+  ]
+
+  let all_fields = case webhook_urls {
+    Some(urls) -> [#("webhook_urls", json.string(urls)), ..base_fields]
+    None -> base_fields
+  }
+
+  let limit_data = json.object(all_fields)
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/plan_limits",
+    Some(json.to_string(limit_data)),
+  ))
+
+  case response.status {
+    201 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([new_limit, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Created client plan limit: " <> new_limit.id,
+          )
+          Ok(new_limit)
+        }
+        Ok([]) -> Error(ParseError("No plan limit returned from server"))
+        Error(_) -> Error(ParseError("Invalid plan limit response format"))
+      }
+    }
+    409 ->
+      Error(DatabaseError("Plan limit already exists for this client metric"))
+    _ -> Error(DatabaseError("Failed to create client plan limit"))
+  }
+}
+
+/// Get all plan limits for a specific client
+pub fn get_client_plan_limits(
+  business_id: String,
+  client_id: String,
+) -> Result(List(PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting client plan limits for: "
+      <> business_id
+      <> "/"
+      <> client_id,
+  )
+
+  let path = "/plan_limits?client_id=eq." <> client_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok(limits) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved "
+              <> string.inspect(list.length(limits))
+              <> " client plan limits",
+          )
+          Ok(limits)
+        }
+        Error(_) -> Error(ParseError("Invalid plan limits format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch client plan limits"))
+  }
+}
+
+/// Get effective plan limits for a client (client-specific + business fallbacks)
+pub fn get_effective_client_limits(
+  business_id: String,
+  client_id: String,
+) -> Result(List(PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting effective limits for client: "
+      <> business_id
+      <> "/"
+      <> client_id,
+  )
+
+  // Get both business and client limits
+  use business_limits <- result.try(get_business_plan_limits(business_id))
+  use client_limits <- result.try(get_client_plan_limits(business_id, client_id))
+
+  // Create a map of client limits by metric_name for fast lookup
+  let client_limits_map =
+    client_limits
+    |> list.fold(dict.new(), fn(acc, limit) {
+      dict.insert(acc, limit.metric_name, limit)
+    })
+
+  // For each business limit, use client override if it exists
+  let effective_limits =
+    business_limits
+    |> list.map(fn(business_limit) {
+      case dict.get(client_limits_map, business_limit.metric_name) {
+        Ok(client_limit) -> client_limit
+        // Use client override
+        Error(_) -> business_limit
+        // Use business default
+      }
+    })
+
+  // Add any client-only limits that don't have business counterparts
+  let client_only_limits =
+    client_limits
+    |> list.filter(fn(client_limit) {
+      !list.any(business_limits, fn(business_limit) {
+        business_limit.metric_name == client_limit.metric_name
+      })
+    })
+
+  let all_effective_limits = list.append(effective_limits, client_only_limits)
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] ✅ Computed "
+      <> string.inspect(list.length(all_effective_limits))
+      <> " effective limits for client",
+  )
+
+  Ok(all_effective_limits)
 }
 
 // ============================================================================

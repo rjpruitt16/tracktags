@@ -3,6 +3,7 @@ import gleam/http.{Delete, Get, Post, Put}
 import web/handler/client_handler
 import web/handler/key_handler
 import web/handler/metric_handler
+import web/handler/plan_limit_handler
 import web/handler/stripe_handler
 import wisp.{type Request, type Response}
 
@@ -103,7 +104,19 @@ pub fn handle_request(req: Request) -> Response {
         Get -> metric_handler.get_metric_history(req, metric_name)
         _ -> wisp.method_not_allowed([Get])
       }
-
+    ["api", "v1", "plan_limits"] ->
+      case req.method {
+        http.Get -> plan_limit_handler.list_plan_limits(req)
+        http.Post -> plan_limit_handler.create_plan_limit(req)
+        _ -> wisp.method_not_allowed([http.Get, http.Post])
+      }
+    ["api", "v1", "plan_limits", limit_id] ->
+      case req.method {
+        http.Get -> plan_limit_handler.get_plan_limit(req, limit_id)
+        http.Put -> plan_limit_handler.update_plan_limit(req, limit_id)
+        http.Delete -> plan_limit_handler.delete_plan_limit(req, limit_id)
+        _ -> wisp.method_not_allowed([http.Get, http.Put, http.Delete])
+      }
     // 404 for everything else
     _ -> wisp.not_found()
   }
