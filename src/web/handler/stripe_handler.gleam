@@ -5,12 +5,12 @@ import gleam/crypto
 import gleam/dynamic/decode
 import gleam/float
 import gleam/http
-import gleam/io
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import logging
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -19,6 +19,7 @@ pub type StripeEventType {
   InvoicePaymentSucceeded
   CustomerSubscriptionCreated
   CustomerSubscriptionUpdated
+  CustomerSubscriptionDeleted
   InvoicePaymentFailed
   UnknownEvent(String)
 }
@@ -57,7 +58,10 @@ fn process_webhook(req: Request) -> Response {
   // Get Stripe signature from headers
   case get_stripe_signature(req) {
     Error(_) -> {
-      io.println("Missing Stripe signature header")
+      logging.log(
+        logging.Error,
+        "[StripeHandler] Missing Stripe signature header",
+      )
       wisp.bad_request()
       |> wisp.string_body("Missing Stripe-Signature header")
     }
@@ -65,7 +69,10 @@ fn process_webhook(req: Request) -> Response {
       // Read request body
       case wisp.read_body_to_bitstring(req) {
         Error(_) -> {
-          io.println("Failed to read webhook body")
+          logging.log(
+            logging.Error,
+            "[StripeHandler] Failed to read webhook body",
+          )
           wisp.bad_request()
           |> wisp.string_body("Invalid request body")
         }
@@ -73,7 +80,10 @@ fn process_webhook(req: Request) -> Response {
           // Convert to string for processing
           case bit_array.to_string(body_bits) {
             Error(_) -> {
-              io.println("Invalid UTF-8 in webhook body")
+              logging.log(
+                logging.Error,
+                "[StripeHandler] Invalid UTF-8 in webhook body",
+              )
               wisp.bad_request()
               |> wisp.string_body("Invalid body encoding")
             }
@@ -81,22 +91,35 @@ fn process_webhook(req: Request) -> Response {
               // Verify signature and process
               case verify_and_process(body, signature) {
                 Success(message) -> {
-                  io.println("Webhook processed successfully: " <> message)
+                  logging.log(
+                    logging.Info,
+                    "[StripeHandler] Webhook processed successfully: "
+                      <> message,
+                  )
                   wisp.ok()
                   |> wisp.string_body("{\"received\": true}")
                 }
                 InvalidSignature -> {
-                  io.println("Invalid Stripe signature")
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Invalid Stripe signature",
+                  )
                   wisp.bad_request()
                   |> wisp.string_body("Invalid signature")
                 }
                 InvalidPayload(error) -> {
-                  io.println("Invalid webhook payload: " <> error)
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Invalid webhook payload: " <> error,
+                  )
                   wisp.bad_request()
                   |> wisp.string_body("Invalid payload: " <> error)
                 }
                 ProcessingError(error) -> {
-                  io.println("Webhook processing error: " <> error)
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Webhook processing error: " <> error,
+                  )
                   wisp.internal_server_error()
                   |> wisp.string_body("Processing error")
                 }
@@ -234,24 +257,32 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
     "invoice.payment_succeeded" -> InvoicePaymentSucceeded
     "customer.subscription.created" -> CustomerSubscriptionCreated
     "customer.subscription.updated" -> CustomerSubscriptionUpdated
+    "customer.subscription.deleted" -> CustomerSubscriptionDeleted
     "invoice.payment_failed" -> InvoicePaymentFailed
     unknown -> UnknownEvent(unknown)
   }
-
   decode.success(StripeEvent(id, event_type, data, created))
 }
 
 /// Process parsed Stripe event based on type
 fn process_stripe_event(event: StripeEvent) -> WebhookResult {
-  io.println("Processing Stripe event: " <> event.id)
+  logging.log(
+    logging.Info,
+    "[StripeHandler] Processing Stripe event: " <> event.id,
+  )
 
   case event.event_type {
     InvoicePaymentSucceeded -> handle_payment_succeeded(event)
     CustomerSubscriptionCreated -> handle_subscription_created(event)
     CustomerSubscriptionUpdated -> handle_subscription_updated(event)
+
+    CustomerSubscriptionDeleted -> handle_subscription_deleted(event)
     InvoicePaymentFailed -> handle_payment_failed(event)
     UnknownEvent(type_name) -> {
-      io.println("Ignoring unknown event type: " <> type_name)
+      logging.log(
+        logging.Info,
+        "[StripeHandler] Ignoring unknown event type: " <> type_name,
+      )
       Success("Ignored unknown event: " <> type_name)
     }
   }
@@ -262,7 +293,10 @@ fn handle_payment_succeeded(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
     Ok(customer_id) -> {
-      io.println("Payment succeeded for customer: " <> customer_id)
+      logging.log(
+        logging.Info,
+        "[StripeHandler] Payment succeeded for customer: " <> customer_id,
+      )
 
       // Update business plan and limits
       case update_business_plan_after_payment(customer_id, event.data) {
@@ -285,7 +319,10 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
     Ok(customer_id) -> {
-      io.println("New subscription created for customer: " <> customer_id)
+      logging.log(
+        logging.Info,
+        "[StripeHandler] New subscription created for customer: " <> customer_id,
+      )
 
       // Provision initial resources and set up plan limits
       case provision_subscription_resources(customer_id, event.data) {
@@ -303,9 +340,12 @@ fn handle_subscription_updated(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
     Ok(customer_id) -> {
-      io.println("Subscription updated for customer: " <> customer_id)
+      logging.log(
+        logging.Info,
+        "[StripeHandler] 🔄 Subscription updated for customer: " <> customer_id,
+      )
 
-      // Update plan limits and features
+      // Update subscription status and plan
       case update_subscription_limits(customer_id, event.data) {
         Error(error) -> ProcessingError("Failed to update limits: " <> error)
         Ok(_) -> Success("Subscription updated for customer: " <> customer_id)
@@ -319,15 +359,198 @@ fn handle_payment_failed(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
     Ok(customer_id) -> {
-      io.println("Payment failed for customer: " <> customer_id)
+      logging.log(
+        logging.Warning,
+        "[StripeHandler] ⚠️ Payment failed for customer: " <> customer_id,
+      )
 
-      // Implement graceful degradation (reduce limits, send notifications)
       case handle_payment_failure_gracefully(customer_id, event.data) {
         Error(error) ->
           ProcessingError("Failed to handle payment failure: " <> error)
         Ok(_) ->
           Success("Payment failure handled for customer: " <> customer_id)
       }
+    }
+  }
+}
+
+/// Add new handler for subscription deletion
+fn handle_subscription_deleted(event: StripeEvent) -> WebhookResult {
+  case extract_customer_id(event.data) {
+    Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
+    Ok(customer_id) -> {
+      logging.log(
+        logging.Info,
+        "[StripeHandler] 🗑️ Subscription canceled for customer: " <> customer_id,
+      )
+
+      case handle_subscription_cancellation(customer_id, event.data) {
+        Error(error) ->
+          ProcessingError("Failed to handle cancellation: " <> error)
+        Ok(_) -> Success("Subscription canceled for customer: " <> customer_id)
+      }
+    }
+  }
+}
+
+/// Update subscription limits after plan change
+fn update_subscription_limits(
+  customer_id: String,
+  data: StripeData,
+) -> Result(Nil, String) {
+  logging.log(
+    logging.Info,
+    "[StripeHandler] 🔄 Processing subscription update for: " <> customer_id,
+  )
+
+  case supabase_client.get_business_by_stripe_customer(customer_id) {
+    Ok(business) -> {
+      // Update subscription status (might be changing from past_due to active)
+      case
+        supabase_client.update_business_subscription(
+          business.business_id,
+          data.subscription_id,
+          "active",
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Updated subscription status to active",
+          )
+          // TODO: In future, detect plan changes and update limits accordingly
+          // For now, just ensure status is current
+          Ok(Nil)
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to update subscription: "
+              <> string.inspect(error),
+          )
+          Error("Failed to update subscription")
+        }
+      }
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
+      )
+      Error("Business lookup failed")
+    }
+  }
+}
+
+/// Handle payment failure with graceful degradation
+fn handle_payment_failure_gracefully(
+  customer_id: String,
+  data: StripeData,
+) -> Result(Nil, String) {
+  logging.log(
+    logging.Warning,
+    "[StripeHandler] ⚠️ Processing payment failure for: " <> customer_id,
+  )
+
+  case supabase_client.get_business_by_stripe_customer(customer_id) {
+    Ok(business) -> {
+      // Mark subscription as past_due (don't immediately cancel)
+      case
+        supabase_client.update_business_subscription(
+          business.business_id,
+          data.subscription_id,
+          "past_due",
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Marked subscription as past_due",
+          )
+          // TODO: Send notification email to customer
+          // TODO: Reduce to free tier limits temporarily
+          Ok(Nil)
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to update subscription: "
+              <> string.inspect(error),
+          )
+          Error("Failed to update subscription")
+        }
+      }
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
+      )
+      Error("Business lookup failed")
+    }
+  }
+}
+
+/// Handle subscription cancellation 
+fn handle_subscription_cancellation(
+  customer_id: String,
+  data: StripeData,
+) -> Result(Nil, String) {
+  logging.log(
+    logging.Info,
+    "[StripeHandler] 🗑️ Processing cancellation for: " <> customer_id,
+  )
+
+  case supabase_client.get_business_by_stripe_customer(customer_id) {
+    Ok(business) -> {
+      // Mark subscription as canceled
+      case
+        supabase_client.update_business_subscription(
+          business.business_id,
+          data.subscription_id,
+          "canceled",
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Marked subscription as canceled",
+          )
+          // Downgrade to free tier limits
+          case supabase_client.downgrade_to_free_limits(business.business_id) {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] ✅ Downgraded to free tier limits",
+              )
+              Ok(Nil)
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Error,
+                "[StripeHandler] ❌ Failed to downgrade limits: "
+                  <> string.inspect(error),
+              )
+              Error("Failed to downgrade limits")
+            }
+          }
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to update subscription: "
+              <> string.inspect(error),
+          )
+          Error("Failed to update subscription")
+        }
+      }
+    }
+    Error(error) -> {
+      logging.log(
+        logging.Error,
+        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
+      )
+      Error("Business lookup failed")
     }
   }
 }
@@ -339,16 +562,15 @@ fn extract_customer_id(data: StripeData) -> Result(String, String) {
 
 // Helper functions to extract from Stripe data
 fn extract_customer_name(data: StripeData) -> String {
-  // In real Stripe webhooks, you'd extract from data.customer object
-  // For now, generate a reasonable default
-  "Customer " <> string.slice(data.customer, 4, 8)
-  // "Customer ABC123"
+  // TODO: Extract actual customer name from Stripe webhook data
+  // For now, use customer ID as name - customer can rename in dashboard
+  data.customer
 }
 
 fn extract_customer_email(data: StripeData) -> String {
-  // Stripe sometimes has email, sometimes doesn't
-  // Generate a reasonable default
-  string.lowercase(data.customer) <> "@stripe-customer.com"
+  // TODO: Extract actual email from Stripe webhook data
+  // For now, generate placeholder - customer must update in dashboard
+  string.lowercase(data.customer) <> "@placeholder.com"
 }
 
 fn extract_plan_name_from_stripe(data: StripeData) -> String {
@@ -366,12 +588,18 @@ fn provision_subscription_resources(
   customer_id: String,
   data: StripeData,
 ) -> Result(Nil, String) {
-  io.println("🚀 Provisioning subscription for customer: " <> customer_id)
+  logging.log(
+    logging.Info,
+    "[StripeHandler] 🚀 Provisioning subscription for customer: " <> customer_id,
+  )
 
   // 1. Find business by stripe_customer_id
   case supabase_client.get_business_by_stripe_customer(customer_id) {
     Ok(business) -> {
-      io.println("✅ Found business: " <> business.business_id)
+      logging.log(
+        logging.Info,
+        "[StripeHandler] ✅ Found business: " <> business.business_id,
+      )
 
       // 2. Update subscription status
       case
@@ -382,32 +610,44 @@ fn provision_subscription_resources(
         )
       {
         Ok(_) -> {
-          io.println("✅ Updated business subscription status")
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Updated business subscription status",
+          )
 
           // 3. Create default plan limits (you can customize this)
           case create_default_plan_limits(business.business_id) {
             Ok(_) -> {
-              io.println("✅ Created default plan limits")
+              logging.log(
+                logging.Info,
+                "[StripeHandler] ✅ Created default plan limits",
+              )
               Ok(Nil)
             }
             Error(error) -> {
-              io.println("❌ Failed to create plan limits: " <> error)
+              logging.log(
+                logging.Error,
+                "[StripeHandler] ❌ Failed to create plan limits: " <> error,
+              )
               Error("Failed to create plan limits")
             }
           }
         }
         Error(error) -> {
-          io.println(
-            "❌ Failed to update subscription: " <> string.inspect(error),
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to update subscription: "
+              <> string.inspect(error),
           )
           Error("Failed to update subscription")
         }
       }
     }
     Error(supabase_client.NotFound(_)) -> {
-      io.println(
-        "⚠️ Business not found, creating new business for customer: "
-        <> customer_id,
+      logging.log(
+        logging.Info,
+        "[StripeHandler] ⚠️ Business not found, creating new business for customer: "
+          <> customer_id,
       )
       // Updated function call
       let business_name = extract_customer_name(data)
@@ -424,24 +664,37 @@ fn provision_subscription_resources(
         )
       {
         Ok(business) -> {
-          io.println("✅ Created new business: " <> business.business_id)
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Created new business: " <> business.business_id,
+          )
           // Now create plan limits for the new business
           case create_default_plan_limits(business.business_id) {
             Ok(_) -> {
-              io.println("✅ Created default plan limits for new business")
+              logging.log(
+                logging.Info,
+                "[StripeHandler] ✅ Created default plan limits for new business",
+              )
               Ok(Nil)
             }
             Error(error) -> Error("Failed to create plan limits: " <> error)
           }
         }
         Error(error) -> {
-          io.println("❌ Failed to create business: " <> string.inspect(error))
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to create business: "
+              <> string.inspect(error),
+          )
           Error("Failed to create business")
         }
       }
     }
     Error(error) -> {
-      io.println("❌ Database error: " <> string.inspect(error))
+      logging.log(
+        logging.Error,
+        "[StripeHandler] ❌ Database error: " <> string.inspect(error),
+      )
       Error("Database error")
     }
   }
@@ -452,7 +705,10 @@ fn update_business_plan_after_payment(
   customer_id: String,
   data: StripeData,
 ) -> Result(Nil, String) {
-  io.println("💰 Processing payment for customer: " <> customer_id)
+  logging.log(
+    logging.Info,
+    "[StripeHandler] 💰 Processing payment for customer: " <> customer_id,
+  )
 
   // 1. Find business by stripe_customer_id
   case supabase_client.get_business_by_stripe_customer(customer_id) {
@@ -466,58 +722,27 @@ fn update_business_plan_after_payment(
         )
       {
         Ok(_) -> {
-          io.println("✅ Reactivated subscription after payment")
+          logging.log(
+            logging.Info,
+            "[StripeHandler] ✅ Reactivated subscription after payment",
+          )
           Ok(Nil)
         }
         Error(error) -> {
-          io.println(
-            "❌ Failed to update subscription: " <> string.inspect(error),
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Failed to update subscription: "
+              <> string.inspect(error),
           )
           Error("Failed to update subscription")
         }
       }
     }
     Error(error) -> {
-      io.println("❌ Business lookup failed: " <> string.inspect(error))
-      Error("Business lookup failed")
-    }
-  }
-}
-
-/// Handle payment failure with graceful degradation
-fn handle_payment_failure_gracefully(
-  customer_id: String,
-  data: StripeData,
-) -> Result(Nil, String) {
-  io.println("⚠️ Payment failed for customer: " <> customer_id)
-
-  // 1. Find business by stripe_customer_id
-  case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
-      // 2. Update subscription status to past_due
-      case
-        supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
-          "past_due",
-        )
-      {
-        Ok(_) -> {
-          io.println("✅ Marked subscription as past_due")
-          // TODO: Reduce to free tier limits
-          // TODO: Send notification email
-          Ok(Nil)
-        }
-        Error(error) -> {
-          io.println(
-            "❌ Failed to update subscription: " <> string.inspect(error),
-          )
-          Error("Failed to update subscription")
-        }
-      }
-    }
-    Error(error) -> {
-      io.println("❌ Business lookup failed: " <> string.inspect(error))
+      logging.log(
+        logging.Error,
+        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
+      )
       Error("Business lookup failed")
     }
   }
@@ -549,39 +774,27 @@ fn create_default_plan_limits(business_id: String) -> Result(Nil, String) {
       )
     {
       Ok(_) -> {
-        io.println(
-          "✅ Created limit: "
-          <> metric_name
-          <> " = "
-          <> float.to_string(limit_value),
+        logging.log(
+          logging.Info,
+          "[StripeHandler] ✅ Created limit: "
+            <> metric_name
+            <> " = "
+            <> float.to_string(limit_value),
         )
         Ok(Nil)
       }
       Error(error) -> {
-        io.println(
-          "❌ Failed to create limit "
-          <> metric_name
-          <> ": "
-          <> string.inspect(error),
+        logging.log(
+          logging.Error,
+          "[StripeHandler] ❌ Failed to create limit "
+            <> metric_name
+            <> ": "
+            <> string.inspect(error),
         )
         Error("Failed to create limit: " <> metric_name)
       }
     }
   })
-}
-
-/// Update subscription limits after plan change
-fn update_subscription_limits(
-  customer_id: String,
-  _data: StripeData,
-) -> Result(Nil, String) {
-  // TODO: Compare old vs new subscription
-  // TODO: Update plan_limits table
-  // TODO: Notify business actor of new limits
-  // TODO: Handle upgrade/downgrade logic
-
-  io.println("TODO: Update subscription limits for customer: " <> customer_id)
-  Ok(Nil)
 }
 
 /// Handle payment failure with graceful degradation
@@ -590,7 +803,11 @@ fn send_payment_success_metric(customer_id: String) -> Result(Nil, String) {
   // TODO: Send metric via business actor
   // This will trigger any automated responses
 
-  io.println("TODO: Send payment success metric for customer: " <> customer_id)
+  logging.log(
+    logging.Info,
+    "[StripeHandler] TODO: Send payment success metric for customer: "
+      <> customer_id,
+  )
   Ok(Nil)
 }
 

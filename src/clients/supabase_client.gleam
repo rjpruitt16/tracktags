@@ -125,6 +125,10 @@ fn make_request(
       req_with_headers
       |> request.set_method(http.Get)
     }
+    http.Delete, None -> {
+      req_with_headers
+      |> request.set_method(http.Delete)
+    }
     _, _ -> req_with_headers |> request.set_method(method)
   }
   case httpc.send(final_req) {
@@ -251,6 +255,163 @@ pub fn validate_api_key(api_key: String) -> Result(String, SupabaseError) {
 }
 
 // ============================================================================
+// SUBSCRIPTION CANCELLATION - Customer Controlled
+// ============================================================================
+
+/// Get customer's configured free plan limits
+pub fn get_customer_free_limits(
+  business_id: String,
+) -> Result(List(#(String, Float, String)), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting customer free plan for: " <> business_id,
+  )
+
+  // Find their free plan
+  let query_params = [
+    #("business_id", "eq." <> business_id),
+    #("plan_name", "eq.free"),
+  ]
+
+  use response <- result.try(make_request_with_params(
+    http.Get,
+    "/plans",
+    None,
+    query_params,
+  ))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(decode.field("id", decode.string, decode.success)),
+        )
+      {
+        Ok([plan_id]) -> get_plan_limits(plan_id)
+        Ok([]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] No free plan found, using defaults",
+          )
+          // Return reasonable defaults if no free plan configured
+          Ok([
+            #("api_calls", 1000.0, "monthly"),
+            #("storage_mb", 100.0, "monthly"),
+          ])
+        }
+        Ok([_, _, ..]) -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] Multiple free plans found, using first one",
+          )
+          // If somehow multiple free plans exist, just use the first
+          case
+            json.parse(
+              response.body,
+              decode.list(decode.field("id", decode.string, decode.success)),
+            )
+          {
+            Ok([first_plan, ..]) -> get_plan_limits(first_plan)
+            _ -> Error(ParseError("Failed to extract first plan"))
+          }
+        }
+        Error(_) -> Error(ParseError("Invalid plan response"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch customer plans"))
+  }
+}
+
+/// Get limits for a specific plan
+fn get_plan_limits(
+  plan_id: String,
+) -> Result(List(#(String, Float, String)), SupabaseError) {
+  let query_params = [#("plan_id", "eq." <> plan_id)]
+
+  use response <- result.try(make_request_with_params(
+    http.Get,
+    "/plan_limits",
+    None,
+    query_params,
+  ))
+
+  case response.status {
+    200 -> {
+      let limit_decoder =
+        decode.field("metric_name", decode.string, fn(metric_name) {
+          decode.field("limit_value", decode.float, fn(limit_value) {
+            decode.field("limit_period", decode.string, fn(limit_period) {
+              decode.success(#(metric_name, limit_value, limit_period))
+            })
+          })
+        })
+
+      case json.parse(response.body, decode.list(limit_decoder)) {
+        Ok(limits) -> Ok(limits)
+        Error(_) -> Error(ParseError("Invalid limits format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch plan limits"))
+  }
+}
+
+/// Downgrade business to their configured free tier limits
+pub fn downgrade_to_free_limits(
+  business_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Downgrading to customer's free limits: " <> business_id,
+  )
+
+  // Get customer's free tier configuration
+  use free_limits <- result.try(get_customer_free_limits(business_id))
+
+  // Deactivate existing business-level limits (soft delete)
+  let deactivate_data = json.object([#("is_active", json.bool(False))])
+  let update_path = "/plan_limits?business_id=eq." <> business_id
+  use _response <- result.try(make_request(
+    http.Patch,
+    update_path,
+    Some(json.to_string(deactivate_data)),
+  ))
+
+  // Create new business-level limits based on their free plan (avoiding duplicates)
+  use _ <- result.try(
+    list.try_each(free_limits, fn(limit) {
+      let #(metric_name, limit_value, period) = limit
+
+      // Delete any existing limit for this metric first
+      let delete_path =
+        "/plan_limits?business_id=eq."
+        <> business_id
+        <> "&metric_name=eq."
+        <> metric_name
+      let _ = make_request(http.Delete, delete_path, None)
+
+      create_plan_limit(
+        business_id,
+        metric_name,
+        limit_value,
+        period,
+        "gte",
+        "deny",
+        None,
+      )
+    })
+    |> result.map_error(fn(_) { DatabaseError("Failed to create free limits") }),
+  )
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] ✅ Successfully downgraded to customer's free limits: "
+      <> business_id,
+  )
+
+  Ok(Nil)
+}
+
+// ============================================================================
 // BUSINESS MANAGEMENT
 // ============================================================================
 
@@ -276,7 +437,7 @@ pub fn create_business_for_stripe_customer(
       #("business_id", json.string(business_id)),
       #("business_name", json.string(business_name)),
       #("email", json.string(email)),
-      #("plan_type", json.string("pro")),
+      #("plan_type", json.string(plan_type)),
       #("stripe_customer_id", json.string(stripe_customer_id)),
       #("subscription_status", json.string("active")),
     ])
