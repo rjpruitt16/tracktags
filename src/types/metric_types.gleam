@@ -20,6 +20,9 @@ pub type Message {
   GetStatus(reply_with: process.Subject(Metric))
   Shutdown
   UpdatePlanLimit(Float, String, String)
+
+  GetLimitStatus(reply_with: process.Subject(LimitStatus))
+  // NEW
 }
 
 // ============================================================================
@@ -75,6 +78,16 @@ pub type MetricBatch {
     flush_interval: String,
     scope: String,
     adapters: Option(Dict(String, json.Json)),
+  )
+}
+
+pub type LimitStatus {
+  LimitStatus(
+    current_value: Float,
+    limit_value: Float,
+    limit_operator: String,
+    breach_action: String,
+    is_breached: Bool,
   )
 }
 

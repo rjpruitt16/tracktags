@@ -828,91 +828,91 @@ fn process_create_client_metric(
   client_id: String,
   req: MetricRequest,
 ) -> Response {
-  let operation = req.operation
-  let interval = req.flush_interval
-  let cleanup_after = req.cleanup_after
-  let metric_type = metric_types.string_to_metric_type(req.metric_type)
-  let initial_value = req.initial_value
-  let tick_type = interval_to_tick_type(interval)
-  let cleanup_seconds = cleanup_to_seconds(cleanup_after)
-  let plan_limit_value = req.plan_limit_value
-  let plan_limit_operator = req.plan_limit_operator
-  let plan_breach_action = req.plan_breach_action
+  case
+    create_client_metric_internal(
+      business_id,
+      client_id,
+      req.metric_name,
+      req.operation,
+      req.flush_interval,
+      req.cleanup_after,
+      req.metric_type,
+      req.initial_value,
+      req.tags,
+      req.metadata,
+      req.plan_limit_value,
+      req.plan_limit_operator,
+      req.plan_breach_action,
+    )
+  {
+    Ok(_) -> {
+      let success_json =
+        json.object([
+          #("status", json.string("created")),
+          #("business_id", json.string(business_id)),
+          #("client_id", json.string(client_id)),
+          #("metric_name", json.string(req.metric_name)),
+          #("operation", json.string(req.operation)),
+          #("flush_interval", json.string(req.flush_interval)),
+          #("cleanup_after", json.string(req.cleanup_after)),
+          #("metric_type", json.string(req.metric_type)),
+          #("initial_value", json.float(req.initial_value)),
+        ])
+      wisp.json_response(json.to_string_tree(success_json), 201)
+    }
+    Error(error) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Internal Server Error")),
+          #("message", json.string(error)),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
+}
 
-  logging.log(
-    logging.Info,
-    "[MetricHandler] Processing CREATE metric: "
-      <> business_id
-      <> "/"
-      <> req.metric_name
-      <> " (cleanup_after: "
-      <> cleanup_after
-      <> " = "
-      <> int.to_string(cleanup_seconds)
-      <> "s)",
-  )
+// NEW: Internal function for proxy_handler to use
+pub fn create_client_metric_internal(
+  business_id: String,
+  client_id: String,
+  metric_name: String,
+  operation: String,
+  flush_interval: String,
+  cleanup_after: String,
+  metric_type: String,
+  initial_value: Float,
+  tags: Dict(String, String),
+  metadata: Option(MetricMetadata),
+  plan_limit_value: Float,
+  plan_limit_operator: String,
+  plan_breach_action: String,
+) -> Result(Nil, String) {
+  let metric_type_parsed = metric_types.string_to_metric_type(metric_type)
+  let tick_type = interval_to_tick_type(flush_interval)
+  let cleanup_seconds = cleanup_to_seconds(cleanup_after)
 
   case get_application_actor() {
     Ok(app_actor) -> {
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🚀 Sending CREATE to application actor: "
-          <> req.metric_name,
-      )
-
       process.send(
         app_actor,
         application.SendMetricToClient(
           business_id: business_id,
           client_id: client_id,
-          metric_name: req.metric_name,
+          metric_name: metric_name,
           tick_type: tick_type,
-          operation: req.operation,
+          operation: operation,
           cleanup_after_seconds: cleanup_seconds,
-          metric_type: metric_type,
+          metric_type: metric_type_parsed,
           initial_value: initial_value,
-          tags: req.tags,
-          metadata: req.metadata,
+          tags: tags,
+          metadata: metadata,
           plan_limit_value: plan_limit_value,
           plan_limit_operator: plan_limit_operator,
           plan_breach_action: plan_breach_action,
         ),
       )
-
-      logging.log(
-        logging.Info,
-        "[MetricHandler] ✅ CREATE metric sent to application: "
-          <> req.metric_name
-          <> " = "
-          <> float.to_string(req.initial_value),
-      )
-
-      let success_json =
-        json.object([
-          #("status", json.string("created")),
-          #("business_id", json.string(business_id)),
-          #("metric_name", json.string(req.metric_name)),
-          #("operation", json.string(operation)),
-          #("flush_interval", json.string(interval)),
-          #("cleanup_after", json.string(cleanup_after)),
-          #("tick_type", json.string(tick_type)),
-          #("metric_type", json.string(req.metric_type)),
-          #("initial_value", json.float(initial_value)),
-        ])
-
-      wisp.json_response(json.to_string_tree(success_json), 201)
+      Ok(Nil)
     }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[MetricHandler] ❌ Failed to get application actor: " <> error,
-      )
-      let error_json =
-        json.object([
-          #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to process metric")),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 500)
-    }
+    Error(error) -> Error("Failed to get application actor: " <> error)
   }
 }

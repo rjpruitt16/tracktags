@@ -464,10 +464,23 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
             "[MetricActor] Value updated: " <> float.to_string(new_value),
           )
 
+          // ✅ NEW: Update current_metric state to match store
+          let updated_current_metric =
+            metric_types.Metric(
+              ..updated_state.current_metric,
+              value: new_value,
+              timestamp: utils.current_timestamp(),
+            )
+
           // Check for plan limit breach
           let new_breach_state = check_plan_breach(new_value, updated_state)
           let state_with_breach =
-            State(..updated_state, is_breached: new_breach_state)
+            State(
+              ..updated_state,
+              is_breached: new_breach_state,
+              current_metric: updated_current_metric,
+              // ✅ NEW: Update state
+            )
 
           case new_breach_state != updated_state.is_breached {
             True -> {
@@ -572,6 +585,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         }
       }
     }
+
     // Dedicated cleanup logic - check if we should self-destruct
     metric_types.ForceFlush -> flush_metrics(updated_state)
 
@@ -614,6 +628,22 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           plan_breach_action: action,
         )
       logging.log(logging.Info, "[MetricActor] ✅ Plan limit updated in-memory")
+      actor.continue(updated_state)
+    }
+    metric_types.GetLimitStatus(reply_with) -> {
+      // NEW
+      let limit_status =
+        metric_types.LimitStatus(
+          current_value: updated_state.current_metric.value,
+          limit_value: updated_state.plan_limit_value,
+          // TODO: Rename to limit_value
+          limit_operator: updated_state.plan_limit_operator,
+          // TODO: Rename to limit_operator  
+          breach_action: updated_state.plan_breach_action,
+          // TODO: Rename to breach_action
+          is_breached: updated_state.is_breached,
+        )
+      process.send(reply_with, limit_status)
       actor.continue(updated_state)
     }
   }

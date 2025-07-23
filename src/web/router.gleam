@@ -4,6 +4,7 @@ import web/handler/client_handler
 import web/handler/key_handler
 import web/handler/metric_handler
 import web/handler/plan_limit_handler
+import web/handler/proxy_handler
 import web/handler/stripe_handler
 import wisp.{type Request, type Response}
 
@@ -117,7 +118,15 @@ pub fn handle_request(req: Request) -> Response {
         http.Delete -> plan_limit_handler.delete_plan_limit(req, limit_id)
         _ -> wisp.method_not_allowed([http.Get, http.Put, http.Delete])
       }
+
     // 404 for everything else
+    // Add this route in your router
+    ["api", "v1", "proxy"] ->
+      case req.method {
+        Post -> proxy_handler.check_and_forward(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
     _ -> wisp.not_found()
   }
 }
