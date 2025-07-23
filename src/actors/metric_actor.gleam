@@ -14,32 +14,14 @@ import glixir
 import glixir/supervisor
 import logging
 import storage/metric_store
-import types/metric_types.{type MetricMetadata, type MetricType}
+import types/metric_types.{type Message, type MetricMetadata, type MetricType}
 import utils/utils
-
-pub type Message {
-  RecordMetric(metric: Metric)
-  FlushTick(timestamp: String, tick_type: String)
-  ForceFlush
-  GetStatus(reply_with: process.Subject(Metric))
-  Shutdown
-}
-
-pub type Metric {
-  Metric(
-    account_id: String,
-    metric_name: String,
-    value: Float,
-    tags: Dict(String, String),
-    timestamp: Int,
-  )
-}
 
 // Updated state with cleanup tracking
 pub type State {
   State(
-    default_metric: Metric,
-    current_metric: Metric,
+    default_metric: metric_types.Metric,
+    current_metric: metric_types.Metric,
     tick_type: String,
     last_accessed: Int,
     cleanup_after_seconds: Int,
@@ -107,7 +89,7 @@ pub fn handle_tick_direct(registry_key: String, json_message: String) -> Nil {
               // All other ticks are flush ticks (if they match the metric's flush interval)
               process.send(
                 subject,
-                FlushTick(tick_data.timestamp, tick_data.tick_name),
+                metric_types.FlushTick(tick_data.timestamp, tick_data.tick_name),
               )
               logging.log(
                 logging.Debug,
@@ -202,7 +184,7 @@ pub fn start_link(
   let timestamp = utils.current_timestamp()
 
   let default_metric =
-    Metric(
+    metric_types.Metric(
       account_id: account_id,
       metric_name: metric_name,
       value: initial_value,
@@ -453,7 +435,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
   // Update last_accessed timestamp for relevant operations
   let updated_state = case message {
-    RecordMetric(_) | GetStatus(_) ->
+    metric_types.RecordMetric(_) | metric_types.GetStatus(_) ->
       State(..state, last_accessed: current_time)
     _ -> state
   }
@@ -467,7 +449,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   )
 
   case message {
-    RecordMetric(metric) -> {
+    metric_types.RecordMetric(metric) -> {
       // Store in ETS instead of just state
       case
         metric_store.add_value(
@@ -511,7 +493,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         }
       }
     }
-    FlushTick(timestamp, tick_type) -> {
+    metric_types.FlushTick(timestamp, tick_type) -> {
       logging.log(
         logging.Info,
         "[MetricActor] 📊 Flushing "
@@ -591,14 +573,14 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       }
     }
     // Dedicated cleanup logic - check if we should self-destruct
-    ForceFlush -> flush_metrics(updated_state)
+    metric_types.ForceFlush -> flush_metrics(updated_state)
 
-    GetStatus(reply_with) -> {
+    metric_types.GetStatus(reply_with) -> {
       process.send(reply_with, updated_state.current_metric)
       actor.continue(updated_state)
     }
 
-    Shutdown -> {
+    metric_types.Shutdown -> {
       logging.log(
         logging.Info,
         "[MetricActor] Shutting down: "
@@ -621,6 +603,18 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       }
 
       actor.stop()
+    }
+    // In metric_actor.gleam handle_message:
+    metric_types.UpdatePlanLimit(new_limit, operator, action) -> {
+      let updated_state =
+        State(
+          ..state,
+          plan_limit_value: new_limit,
+          plan_limit_operator: operator,
+          plan_breach_action: action,
+        )
+      logging.log(logging.Info, "[MetricActor] ✅ Plan limit updated in-memory")
+      actor.continue(updated_state)
     }
   }
 }

@@ -13,6 +13,7 @@ import gleam/string
 import glixir
 import glixir/supervisor
 import logging
+import types/business_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
@@ -54,7 +55,7 @@ pub type ApplicationState {
   ApplicationState(
     supervisor: glixir.DynamicSupervisor(
       String,
-      process.Subject(business_actor.Message),
+      process.Subject(business_types.Message),
     ),
     clock_actor: process.Subject(clock_actor.Message),
     supabase_actor: process.Subject(supabase_actor.Message),
@@ -64,7 +65,7 @@ pub type ApplicationState {
 // Decoder function for user actor replies
 fn decode_user_reply(
   _reply: dynamic.Dynamic,
-) -> Result(process.Subject(business_actor.Message), String) {
+) -> Result(process.Subject(business_types.Message), String) {
   Ok(process.new_subject())
 }
 
@@ -72,10 +73,10 @@ fn decode_user_reply(
 fn get_or_spawn_business_simple(
   supervisor: glixir.DynamicSupervisor(
     String,
-    process.Subject(business_actor.Message),
+    process.Subject(business_types.Message),
   ),
   account_id: String,
-) -> Result(process.Subject(business_actor.Message), String) {
+) -> Result(process.Subject(business_types.Message), String) {
   // First try to find existing user
   case business_actor.lookup_business_subject(account_id) {
     Ok(user_subject) -> {
@@ -174,7 +175,7 @@ fn handle_application_message(
           // Send client metric to existing BusinessActor
           process.send(
             business_subject,
-            business_actor.RecordClientMetric(
+            business_types.RecordClientMetric(
               client_id,
               metric_name,
               initial_value,
@@ -200,7 +201,7 @@ fn handle_application_message(
               )
               process.send(
                 business_subject,
-                business_actor.RecordClientMetric(
+                business_types.RecordClientMetric(
                   client_id,
                   metric_name,
                   initial_value,
@@ -257,7 +258,7 @@ fn handle_application_message(
 
           process.send(
             business_subject,
-            business_actor.RecordMetric(
+            business_types.RecordMetric(
               metric_name,
               initial_value,
               tick_type,
@@ -293,7 +294,7 @@ fn handle_application_message(
 
               process.send(
                 business_subject,
-                business_actor.RecordMetric(
+                business_types.RecordMetric(
                   metric_name,
                   initial_value,
                   tick_type,
@@ -343,7 +344,7 @@ fn handle_application_message(
 pub fn start_application_actor(
   supervisor: glixir.DynamicSupervisor(
     String,
-    process.Subject(business_actor.Message),
+    process.Subject(business_types.Message),
   ),
   clock_actor_subject: process.Subject(clock_actor.Message),
   supabase_actor_subject: process.Subject(supabase_actor.Message),

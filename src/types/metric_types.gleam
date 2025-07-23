@@ -4,6 +4,7 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/float
 import gleam/json
 import gleam/list
@@ -11,6 +12,15 @@ import gleam/option.{type Option, None, Some}
 import gleam/string
 import logging
 import storage/metric_store
+
+pub type Message {
+  RecordMetric(metric: Metric)
+  FlushTick(timestamp: String, tick_type: String)
+  ForceFlush
+  GetStatus(reply_with: process.Subject(Metric))
+  Shutdown
+  UpdatePlanLimit(Float, String, String)
+}
 
 // ============================================================================
 // CORE METRIC TYPES

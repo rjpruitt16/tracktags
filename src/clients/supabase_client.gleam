@@ -886,6 +886,7 @@ pub fn update_business_plan_limit(
   breach_operator: String,
   breach_action: String,
   webhook_urls: Option(String),
+  client_id: Option(String),
 ) -> Result(PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
@@ -898,6 +899,10 @@ pub fn update_business_plan_limit(
     #("limit_period", json.string(limit_period)),
     #("breach_operator", json.string(breach_operator)),
     #("breach_action", json.string(breach_action)),
+    #("client_id", case client_id {
+      Some(id) -> json.string(id)
+      None -> json.null()
+    }),
   ]
 
   let all_fields = case webhook_urls {

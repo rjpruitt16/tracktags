@@ -596,7 +596,7 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
 
   case metric_actor.lookup_metric_subject(business_id, metric_name) {
     Ok(metric_subject) -> {
-      process.send(metric_subject, metric_actor.Shutdown)
+      process.send(metric_subject, metric_types.Shutdown)
 
       let success_json =
         json.object([
@@ -778,7 +778,7 @@ fn process_update_metric(
   case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
     Ok(metric_subject) -> {
       let metric =
-        metric_actor.Metric(
+        metric_types.Metric(
           account_id: lookup_key,
           // ✅ FIXED: Use lookup_key for account_id
           metric_name: metric_name,
@@ -787,7 +787,7 @@ fn process_update_metric(
           timestamp: utils.current_timestamp(),
         )
 
-      process.send(metric_subject, metric_actor.RecordMetric(metric))
+      process.send(metric_subject, metric_types.RecordMetric(metric))
 
       let success_json =
         json.object([

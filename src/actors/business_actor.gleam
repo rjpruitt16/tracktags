@@ -5,9 +5,10 @@ import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option.{type Option}
+import gleam/option
 import gleam/otp/actor
 import gleam/result
 import gleam/string
@@ -15,44 +16,10 @@ import glixir
 import glixir/supervisor
 import logging
 import storage/metric_store
-import types/metric_types.{type MetricMetadata, type MetricType}
+import types/business_types
+import types/client_types
+import types/metric_types
 import utils/utils
-
-pub type Message {
-  RecordMetric(
-    metric_name: String,
-    initial_value: Float,
-    tick_type: String,
-    operation: String,
-    cleanup_after_seconds: Int,
-    metric_type: MetricType,
-    tags: Dict(String, String),
-    metadata: Option(MetricMetadata),
-    plan_limit_value: Float,
-    plan_limit_operator: String,
-    plan_breach_action: String,
-  )
-  RecordClientMetric(
-    client_id: String,
-    metric_name: String,
-    initial_value: Float,
-    tick_type: String,
-    operation: String,
-    cleanup_after_seconds: Int,
-    metric_type: MetricType,
-    tags: Dict(String, String),
-    metadata: Option(MetricMetadata),
-    plan_limit_value: Float,
-    plan_limit_operator: String,
-    plan_breach_action: String,
-  )
-  CleanupTick(timestamp: String, tick_type: String)
-  GetMetricActor(
-    metric_name: String,
-    reply_with: process.Subject(Option(process.Subject(metric_actor.Message))),
-  )
-  Shutdown
-}
 
 pub type State {
   State(
@@ -72,11 +39,11 @@ pub type State {
         String,
         String,
       ),
-      process.Subject(metric_actor.Message),
+      process.Subject(metric_types.Message),
     ),
     clients_supervisor: glixir.DynamicSupervisor(
       #(String, String),
-      process.Subject(client_actor.Message),
+      process.Subject(client_types.Message),
     ),
     last_accessed: Int,
     user_cleanup_threshold: Int,
@@ -90,7 +57,7 @@ pub fn business_subject_name(account_id: String) -> String {
 
 pub fn lookup_business_subject(
   account_id: String,
-) -> Result(process.Subject(Message), String) {
+) -> Result(process.Subject(business_types.Message), String) {
   case glixir.lookup_subject_string(utils.tracktags_registry(), account_id) {
     Ok(subject) -> Ok(subject)
     Error(_) -> Error("User actor not found: " <> account_id)
@@ -150,12 +117,15 @@ fn encode_metric_args(
   ]
 }
 
-fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
+fn handle_message(
+  state: State,
+  message: business_types.Message,
+) -> actor.Next(State, business_types.Message) {
   let current_time = utils.current_timestamp()
 
   // Update last_accessed for user activity
   let updated_state = case message {
-    RecordMetric(_, _, _, _, _, _, _, _, _, _, _) ->
+    business_types.RecordMetric(_, _, _, _, _, _, _, _, _, _, _) ->
       State(..state, last_accessed: current_time)
     _ -> state
   }
@@ -166,7 +136,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   )
 
   case message {
-    RecordClientMetric(
+    business_types.RecordClientMetric(
       client_id,
       metric_name,
       initial_value,
@@ -191,7 +161,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       )
 
       case
-        client_actor.lookup_client_subject(updated_state.account_id, client_id)
+        client_types.lookup_client_subject(updated_state.account_id, client_id)
       {
         Ok(client_subject) -> {
           logging.log(
@@ -202,7 +172,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
           process.send(
             client_subject,
-            client_actor.RecordMetric(
+            client_types.RecordMetric(
               metric_name: metric_name,
               initial_value: initial_value,
               tick_type: tick_type,
@@ -240,7 +210,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
               process.send(
                 client_subject,
-                client_actor.RecordMetric(
+                client_types.RecordMetric(
                   metric_name: metric_name,
                   initial_value: initial_value,
                   tick_type: tick_type,
@@ -267,7 +237,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         }
       }
     }
-    CleanupTick(_timestamp, _tick_type) -> {
+    business_types.CleanupTick(_timestamp, _tick_type) -> {
       // Check if user should be cleaned up due to inactivity
       let inactive_duration = current_time - updated_state.last_accessed
 
@@ -337,7 +307,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       }
     }
 
-    RecordMetric(
+    business_types.RecordMetric(
       metric_name,
       initial_value,
       tick_type,
@@ -371,7 +341,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
         Ok(metric_subject) -> {
           // Found existing actor - create a simple Metric and send it
           let metric =
-            metric_actor.Metric(
+            metric_types.Metric(
               account_id: updated_state.account_id,
               metric_name: metric_name,
               value: initial_value,
@@ -383,7 +353,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
             logging.Info,
             "[BusinessActor] ✅ Found existing MetricActor, sending metric",
           )
-          process.send(metric_subject, metric_actor.RecordMetric(metric))
+          process.send(metric_subject, metric_types.RecordMetric(metric))
           actor.continue(updated_state)
         }
         Error(_) -> {
@@ -439,7 +409,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               {
                 Ok(metric_subject) -> {
                   let metric =
-                    metric_actor.Metric(
+                    metric_types.Metric(
                       account_id: updated_state.account_id,
                       metric_name: metric_name,
                       value: initial_value,
@@ -449,7 +419,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
                   process.send(
                     metric_subject,
-                    metric_actor.RecordMetric(metric),
+                    metric_types.RecordMetric(metric),
                   )
                   logging.log(
                     logging.Info,
@@ -478,7 +448,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       }
     }
 
-    GetMetricActor(metric_name, reply_with) -> {
+    business_types.GetMetricActor(metric_name, reply_with) -> {
       let result = case
         metric_actor.lookup_metric_subject(
           updated_state.account_id,
@@ -491,8 +461,23 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       process.send(reply_with, result)
       actor.continue(updated_state)
     }
-
-    Shutdown -> {
+    business_types.RefreshPlanLimit(
+      metric_name,
+      limit_value,
+      _operator,
+      _action,
+    ) -> {
+      logging.log(
+        logging.Info,
+        "[BusinessActor] Plan limit refresh: "
+          <> metric_name
+          <> " = "
+          <> float.to_string(limit_value),
+      )
+      // TODO: update business metrics plans
+      actor.continue(updated_state)
+    }
+    business_types.Shutdown -> {
       logging.log(
         logging.Info,
         "[BusinessActor] Shutting down: " <> updated_state.account_id,
@@ -527,7 +512,7 @@ pub fn encode_business_args(account_id: String) -> List(dynamic.Dynamic) {
 // start_link function for bridge to call
 pub fn start_link(
   account_id: String,
-) -> Result(process.Subject(Message), actor.StartError) {
+) -> Result(process.Subject(business_types.Message), actor.StartError) {
   logging.log(
     logging.Info,
     "[BusinessActor] Starting for account: " <> account_id,
@@ -639,7 +624,10 @@ pub fn handle_business_cleanup_tick(
 
       case json.parse(json_message, tick_decoder) {
         Ok(#(tick_name, timestamp)) -> {
-          process.send(user_subject, CleanupTick(timestamp, tick_name))
+          process.send(
+            user_subject,
+            business_types.CleanupTick(timestamp, tick_name),
+          )
         }
         Error(_) -> {
           logging.log(
@@ -661,12 +649,12 @@ pub fn handle_business_cleanup_tick(
 fn get_or_spawn_client_simple(
   supervisor supervisor: glixir.DynamicSupervisor(
     #(String, String),
-    process.Subject(client_actor.Message),
+    process.Subject(client_types.Message),
   ),
   business_id business_id: String,
   client_id client_id: String,
-) -> Result(process.Subject(client_actor.Message), String) {
-  case client_actor.lookup_client_subject(business_id, client_id) {
+) -> Result(process.Subject(client_types.Message), String) {
+  case client_types.lookup_client_subject(business_id, client_id) {
     Ok(client_subject) -> {
       logging.log(
         logging.Debug,
@@ -706,7 +694,7 @@ fn get_or_spawn_client_simple(
               <> string.inspect(child_pid),
           )
 
-          case client_actor.lookup_client_subject(business_id, client_id) {
+          case client_types.lookup_client_subject(business_id, client_id) {
             Ok(client_subject) -> {
               logging.log(
                 logging.Info,
@@ -748,7 +736,7 @@ fn get_or_spawn_client_simple(
 // Returns glixir.ChildSpec for dynamic spawning
 pub fn start(
   account_id: String,
-) -> glixir.ChildSpec(String, process.Subject(Message)) {
+) -> glixir.ChildSpec(String, process.Subject(business_types.Message)) {
   glixir.child_spec(
     id: "business_" <> account_id,
     module: "Elixir.BusinessActorBridge",

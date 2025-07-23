@@ -9,14 +9,15 @@ import gleam/float
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
 import logging
 import storage/metric_batch_store
+import types/business_types
+import types/client_types
 import types/metric_types.{type MetricBatch}
-import types/supabase_types
 import utils/utils
 
 // ============================================================================
@@ -28,7 +29,6 @@ pub type Message {
   FlushInterval(tick_type: String)
   StartRealtimeConnection
   RealtimeReconnect(retry_count: Int)
-  ProcessPlanLimitUpdate(business_id: Option(String), client_id: Option(String))
   Shutdown
   ForceFlush
 }
@@ -125,6 +125,11 @@ pub fn start() -> Result(process.Subject(Message), actor.StartError) {
       }
 
       logging.log(logging.Info, "[SupabaseActor] ✅ SupabaseActor started")
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] 🚀 Sending StartRealtimeConnection message",
+      )
+      process.send(subject, StartRealtimeConnection)
       Ok(subject)
     }
     Error(error) -> {
@@ -263,11 +268,14 @@ fn handle_message(
       actor.continue(state)
     }
     StartRealtimeConnection -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] 📨 Received StartRealtimeConnection message",
+      )
       logging.log(logging.Info, "[SupabaseActor] Starting Realtime connection")
       start_realtime_connection(0)
       actor.continue(state)
     }
-
     RealtimeReconnect(retry_count) -> {
       let backoff_ms = case retry_count {
         0 -> 1000
@@ -289,33 +297,6 @@ fn handle_message(
       actor.continue(BatchingState(..state, realtime_retry_count: retry_count))
     }
 
-    ProcessPlanLimitUpdate(business_id, client_id) -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] 🎯 Plan limit update: business="
-          <> string.inspect(business_id)
-          <> " client="
-          <> string.inspect(client_id),
-      )
-
-      // Route to specific ClientActor
-      case business_id, client_id {
-        Some(biz_id), Some(cli_id) -> {
-          notify_client_actor(biz_id, cli_id)
-        }
-        Some(biz_id), None -> {
-          // Business-level limit changed - notify all clients for this business
-          notify_business_clients(biz_id)
-        }
-        _, _ -> {
-          logging.log(
-            logging.Warning,
-            "[SupabaseActor] Invalid plan limit update",
-          )
-        }
-      }
-      actor.continue(state)
-    }
     Shutdown -> {
       logging.log(logging.Info, "[SupabaseActor] 🛑 Shutdown requested")
       // Flush any pending metrics before shutdown
@@ -502,31 +483,33 @@ pub fn realtime_reconnect(retry_count: Int) {
   }
 }
 
-pub fn process_plan_limit_update(business_id: String, client_id: String) {
-  case
-    glixir.lookup_subject(
-      utils.tracktags_registry(),
-      utils.supabase_actor_key(),
-      glixir.atom_key_encoder,
-    )
-  {
-    Ok(subj) -> {
-      let business_opt = case business_id {
-        "" -> None
-        id -> Some(id)
-      }
-      let client_opt = case client_id {
-        "" -> None
-        id -> Some(id)
-      }
-      process.send(subj, ProcessPlanLimitUpdate(business_opt, client_opt))
-    }
-    Error(err) -> {
-      logging.log(
-        logging.Error,
-        "[SupabaseActor] ❌ Registry lookup failed: " <> string.inspect(err),
+// Update the function signature:
+pub fn process_plan_limit_update(
+  business_id: String,
+  client_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_operator: String,
+  breach_action: String,
+) -> Nil {
+  case client_id {
+    "" ->
+      notify_business_clients(
+        business_id,
+        metric_name,
+        limit_value,
+        limit_operator,
+        breach_action,
       )
-    }
+    _ ->
+      notify_client_actor(
+        business_id,
+        client_id,
+        metric_name,
+        limit_value,
+        limit_operator,
+        breach_action,
+      )
   }
 }
 
@@ -549,14 +532,29 @@ fn start_realtime_connection(retry_count: Int) -> Nil {
   }
 }
 
-fn notify_client_actor(business_id: String, client_id: String) -> Nil {
+fn notify_client_actor(
+  business_id: String,
+  client_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_operator: String,
+  breach_action: String,
+) -> Nil {
   let registry_key = "client:" <> business_id <> ":" <> client_id
   case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
     Ok(client_subject) -> {
-      // Send a generic message that any actor can handle
-      let change_event =
-        supabase_types.PlanLimitChangeEvent(business_id, client_id)
-      process.send(client_subject, change_event)
+      // Send the new message type with actual data
+      process.send(
+        client_subject,
+        client_types.PlanLimitChanged(
+          business_id: business_id,
+          client_id: client_id,
+          metric_name: metric_name,
+          new_limit_value: limit_value,
+          limit_operator: limit_operator,
+          breach_action: breach_action,
+        ),
+      )
       logging.log(
         logging.Info,
         "[SupabaseActor] ✅ Notified ClientActor: "
@@ -577,10 +575,34 @@ fn notify_client_actor(business_id: String, client_id: String) -> Nil {
   }
 }
 
-fn notify_business_clients(business_id: String) -> Nil {
-  // TODO: Get all clients for business and notify them
-  logging.log(
-    logging.Info,
-    "[SupabaseActor] TODO: Notify all clients for business: " <> business_id,
-  )
+fn notify_business_clients(
+  business_id: String,
+  metric_name: String,
+  limit_value: Float,
+  limit_operator: String,
+  breach_action: String,
+) -> Nil {
+  case business_types.lookup_business_subject(business_id) {
+    Ok(business_subject) -> {
+      process.send(
+        business_subject,
+        business_types.RefreshPlanLimit(
+          metric_name: metric_name,
+          new_limit_value: limit_value,
+          limit_operator: limit_operator,
+          breach_action: breach_action,
+        ),
+      )
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] ✅ Sent plan refresh to BusinessActor: " <> business_id,
+      )
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Debug,
+        "[SupabaseActor] BusinessActor not found: " <> business_id,
+      )
+    }
+  }
 }
