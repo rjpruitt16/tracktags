@@ -101,6 +101,14 @@ fn get_supabase_config() -> Result(#(String, String), SupabaseError) {
   Ok(#(url, key))
 }
 
+pub fn get_supabase_realtime_url() -> String {
+  utils.require_env("SUPABASE_REALTIME_URL")
+}
+
+pub fn get_supabase_anon_key() -> String {
+  utils.require_env("SUPABASE_ANON_KEY")
+}
+
 // ============================================================================
 // HTTP HELPERS
 // ============================================================================
@@ -655,6 +663,43 @@ pub fn create_plan_limit(
       Ok(Nil)
     }
     _ -> Error(DatabaseError("Failed to create plan limit"))
+  }
+}
+
+// ============================================================================
+// PLAN INHERITANCE FOR CLIENT ACTORS
+// ============================================================================
+
+/// Get plan limits for a specific plan_id (used by client_actor)
+pub fn get_plan_limits_by_plan_id(
+  plan_id: String,
+) -> Result(List(PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting plan limits for plan: " <> plan_id,
+  )
+
+  let path = "/plan_limits?plan_id=eq." <> plan_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok(limits) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved "
+              <> string.inspect(list.length(limits))
+              <> " plan limits for plan: "
+              <> plan_id,
+          )
+          Ok(limits)
+        }
+        Error(_) -> Error(ParseError("Invalid plan limits format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch plan limits"))
   }
 }
 

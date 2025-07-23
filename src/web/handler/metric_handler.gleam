@@ -35,6 +35,9 @@ pub type MetricRequest {
     initial_value: Float,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
 }
 
@@ -224,6 +227,22 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     decode.optional(metric_types.metadata_decoder()),
   )
 
+  use plan_limit_value <- decode.optional_field(
+    "plan_limit_value",
+    0.0,
+    decode.float,
+  )
+  use plan_limit_operator <- decode.optional_field(
+    "plan_limit_operator",
+    "gte",
+    decode.string,
+  )
+  use plan_breach_action <- decode.optional_field(
+    "plan_breach_action",
+    "disabled",
+    decode.string,
+  )
+
   decode.success(MetricRequest(
     metric_name: metric_name,
     operation: operation,
@@ -233,6 +252,9 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     initial_value: initial_value,
     tags: tags,
     metadata: metadata,
+    plan_limit_value: plan_limit_value,
+    plan_limit_operator: plan_limit_operator,
+    plan_breach_action: plan_breach_action,
   ))
 }
 
@@ -652,6 +674,9 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
   let initial_value = req.initial_value
   let tick_type = interval_to_tick_type(interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
+  let plan_limit_value = req.plan_limit_value
+  let plan_limit_operator = req.plan_limit_operator
+  let plan_breach_action = req.plan_breach_action
 
   logging.log(
     logging.Info,
@@ -686,6 +711,9 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
           initial_value: initial_value,
           tags: req.tags,
           metadata: req.metadata,
+          plan_limit_value: plan_limit_value,
+          plan_limit_operator: plan_limit_operator,
+          plan_breach_action: plan_breach_action,
         ),
       )
 
@@ -807,6 +835,9 @@ fn process_create_client_metric(
   let initial_value = req.initial_value
   let tick_type = interval_to_tick_type(interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
+  let plan_limit_value = req.plan_limit_value
+  let plan_limit_operator = req.plan_limit_operator
+  let plan_breach_action = req.plan_breach_action
 
   logging.log(
     logging.Info,
@@ -842,6 +873,9 @@ fn process_create_client_metric(
           initial_value: initial_value,
           tags: req.tags,
           metadata: req.metadata,
+          plan_limit_value: plan_limit_value,
+          plan_limit_operator: plan_limit_operator,
+          plan_breach_action: plan_breach_action,
         ),
       )
 

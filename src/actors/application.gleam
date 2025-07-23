@@ -27,6 +27,9 @@ pub type ApplicationMessage {
     initial_value: Float,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
   SendMetricToClient(
     business_id: String,
@@ -39,6 +42,9 @@ pub type ApplicationMessage {
     initial_value: Float,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
   Shutdown
 }
@@ -149,8 +155,8 @@ fn handle_application_message(
 
   case message {
     SendMetricToClient(
-      client_id,
       business_id,
+      client_id,
       metric_name,
       tick_type,
       operation,
@@ -159,6 +165,9 @@ fn handle_application_message(
       initial_value,
       tags,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ) -> {
       case business_actor.lookup_business_subject(business_id) {
         Ok(business_subject) ->
@@ -175,6 +184,9 @@ fn handle_application_message(
               metric_type,
               tags,
               metadata,
+              plan_limit_value,
+              plan_limit_operator,
+              plan_breach_action,
             ),
           )
         Error(_) ->
@@ -198,6 +210,9 @@ fn handle_application_message(
                   metric_type,
                   tags,
                   metadata,
+                  plan_limit_value,
+                  plan_limit_operator,
+                  plan_breach_action,
                 ),
               )
             }
@@ -221,6 +236,9 @@ fn handle_application_message(
       initial_value,
       tags,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ) -> {
       let message_id = string.inspect(utils.system_time())
       logging.log(
@@ -248,6 +266,9 @@ fn handle_application_message(
               metric_type,
               tags,
               metadata,
+              plan_limit_value,
+              plan_limit_operator,
+              plan_breach_action,
             ),
           )
           logging.log(
@@ -281,6 +302,9 @@ fn handle_application_message(
                   metric_type,
                   tags,
                   metadata,
+                  plan_limit_value,
+                  plan_limit_operator,
+                  plan_breach_action,
                 ),
               )
               logging.log(
@@ -423,6 +447,8 @@ pub fn start_app(
       "ApplicationActor start failed: " <> string.inspect(e)
     }),
   )
+
+  process.send(supabase_subject, supabase_actor.StartRealtimeConnection)
 
   logging.log(
     logging.Info,

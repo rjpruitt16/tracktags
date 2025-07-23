@@ -28,6 +28,9 @@ pub type Message {
     metric_type: MetricType,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
   RecordClientMetric(
     client_id: String,
@@ -39,6 +42,9 @@ pub type Message {
     metric_type: MetricType,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
   CleanupTick(timestamp: String, tick_type: String)
   GetMetricActor(
@@ -52,7 +58,20 @@ pub type State {
   State(
     account_id: String,
     metrics_supervisor: glixir.DynamicSupervisor(
-      #(String, String, String, Float, String, String, Int, String, String),
+      #(
+        String,
+        String,
+        String,
+        Float,
+        String,
+        String,
+        Int,
+        String,
+        String,
+        Float,
+        String,
+        String,
+      ),
       process.Subject(metric_actor.Message),
     ),
     clients_supervisor: glixir.DynamicSupervisor(
@@ -86,7 +105,20 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
 
 // FIXED: Updated encoder function to match bridge signature (10 args)
 fn encode_metric_args(
-  args: #(String, String, String, Float, String, String, Int, String, String),
+  args: #(
+    String,
+    String,
+    String,
+    Float,
+    String,
+    String,
+    Int,
+    String,
+    String,
+    Float,
+    String,
+    String,
+  ),
 ) -> List(dynamic.Dynamic) {
   let #(
     account_id,
@@ -98,6 +130,9 @@ fn encode_metric_args(
     cleanup_after_seconds,
     metric_type,
     metadata,
+    plan_limit_value,
+    plan_limit_operator,
+    plan_breach_action,
   ) = args
   [
     dynamic.string(account_id),
@@ -109,6 +144,9 @@ fn encode_metric_args(
     dynamic.int(cleanup_after_seconds),
     dynamic.string(metric_type),
     dynamic.string(metadata),
+    dynamic.float(plan_limit_value),
+    dynamic.string(plan_limit_operator),
+    dynamic.string(plan_breach_action),
   ]
 }
 
@@ -117,7 +155,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
   // Update last_accessed for user activity
   let updated_state = case message {
-    RecordMetric(_, _, _, _, _, _, _, _) ->
+    RecordMetric(_, _, _, _, _, _, _, _, _, _, _) ->
       State(..state, last_accessed: current_time)
     _ -> state
   }
@@ -138,6 +176,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       metric_type,
       tags,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -162,14 +203,17 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           process.send(
             client_subject,
             client_actor.RecordMetric(
-              metric_name,
-              initial_value,
-              tick_type,
-              operation,
-              cleanup_after_seconds,
-              metric_type,
-              tags,
-              metadata,
+              metric_name: metric_name,
+              initial_value: initial_value,
+              tick_type: tick_type,
+              operation: operation,
+              cleanup_after_seconds: cleanup_after_seconds,
+              metric_type: metric_type,
+              tags: tags,
+              metadata: metadata,
+              plan_limit_value: plan_limit_value,
+              plan_limit_operator: plan_limit_operator,
+              plan_breach_action: plan_breach_action,
             ),
           )
           actor.continue(updated_state)
@@ -197,14 +241,17 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               process.send(
                 client_subject,
                 client_actor.RecordMetric(
-                  metric_name,
-                  initial_value,
-                  tick_type,
-                  operation,
-                  cleanup_after_seconds,
-                  metric_type,
-                  tags,
-                  metadata,
+                  metric_name: metric_name,
+                  initial_value: initial_value,
+                  tick_type: tick_type,
+                  operation: operation,
+                  cleanup_after_seconds: cleanup_after_seconds,
+                  metric_type: metric_type,
+                  tags: tags,
+                  metadata: metadata,
+                  plan_limit_value: plan_limit_value,
+                  plan_limit_operator: plan_limit_operator,
+                  plan_breach_action: plan_breach_action,
                 ),
               )
               actor.continue(updated_state)
@@ -299,6 +346,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       metric_type,
       tags,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -358,6 +408,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               cleanup_after_seconds,
               metric_type_string,
               metric_types.encode_metadata_to_string(metadata),
+              plan_limit_value,
+              plan_limit_operator,
+              plan_breach_action,
             )
 
           case

@@ -1,20 +1,25 @@
 // src/actors/client_actor.gleam
 import actors/metric_actor
+import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option.{type Option}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import gleam/result
 import gleam/string
 import glixir
 import glixir/supervisor
 import logging
 import storage/metric_store
 import types/metric_types.{type MetricMetadata, type MetricType}
+import types/supabase_types
 import utils/utils
 
 pub type Message {
@@ -27,6 +32,9 @@ pub type Message {
     metric_type: MetricType,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
   )
   CleanupTick(timestamp: String, tick_type: String)
   GetMetricActor(
@@ -34,6 +42,7 @@ pub type Message {
     reply_with: process.Subject(Option(process.Subject(metric_actor.Message))),
   )
   Shutdown
+  PlanLimitChanged(supabase_types.PlanLimitChangeEvent)
 }
 
 pub type State {
@@ -41,7 +50,20 @@ pub type State {
     business_id: String,
     client_id: String,
     metrics_supervisor: glixir.DynamicSupervisor(
-      #(String, String, String, Float, String, String, Int, String, String),
+      #(
+        String,
+        String,
+        String,
+        Float,
+        String,
+        String,
+        Int,
+        String,
+        String,
+        Float,
+        String,
+        String,
+      ),
       process.Subject(metric_actor.Message),
     ),
     last_accessed: Int,
@@ -67,7 +89,20 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
 }
 
 fn encode_metric_args(
-  args: #(String, String, String, Float, String, String, Int, String, String),
+  args: #(
+    String,
+    String,
+    String,
+    Float,
+    String,
+    String,
+    Int,
+    String,
+    String,
+    Float,
+    String,
+    String,
+  ),
 ) -> List(dynamic.Dynamic) {
   let #(
     account_id,
@@ -79,6 +114,9 @@ fn encode_metric_args(
     cleanup_after_seconds,
     metric_type,
     metadata,
+    plan_limit_value,
+    plan_limit_operator,
+    plan_breach_action,
   ) = args
   [
     dynamic.string(account_id),
@@ -90,14 +128,234 @@ fn encode_metric_args(
     dynamic.int(cleanup_after_seconds),
     dynamic.string(metric_type),
     dynamic.string(metadata),
+    dynamic.float(plan_limit_value),
+    dynamic.string(plan_limit_operator),
+    dynamic.string(plan_breach_action),
   ]
+}
+
+// ============================================================================
+// CLIENT ACTOR PLAN INHERITANCE (Add to client_actor.gleam)
+// ============================================================================
+
+/// Load plan limits for a client and create limit-checking metrics
+fn load_client_plan_limits(
+  business_id: String,
+  client_id: String,
+  metrics_supervisor: glixir.DynamicSupervisor(
+    #(
+      String,
+      String,
+      String,
+      Float,
+      String,
+      String,
+      Int,
+      String,
+      String,
+      Float,
+      String,
+      String,
+    ),
+    process.Subject(metric_actor.Message),
+    // ← Missing second type parameter
+  ),
+) -> Result(Nil, String) {
+  logging.log(
+    logging.Info,
+    "[ClientActor] Loading plan limits for: " <> business_id <> "/" <> client_id,
+  )
+
+  // Get the client record to find its plan_id
+  case supabase_client.get_client_by_id(business_id, client_id) {
+    Ok(client) -> {
+      case client.plan_id {
+        Some(plan_id) -> {
+          logging.log(
+            logging.Info,
+            "[ClientActor] Client has plan: " <> plan_id,
+          )
+
+          // Get plan limits for this plan
+          case supabase_client.get_plan_limits_by_plan_id(plan_id) {
+            Ok(plan_limits) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] Found "
+                  <> string.inspect(list.length(plan_limits))
+                  <> " plan limits",
+              )
+
+              // Create limit-checking metrics for each plan limit
+              list.try_each(plan_limits, fn(limit) {
+                create_limit_checking_metric(
+                  business_id,
+                  client_id,
+                  limit,
+                  metrics_supervisor,
+                )
+              })
+              |> result.map_error(fn(_) { "Failed to create limit metrics" })
+              |> result.map(fn(_) { Nil })
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[ClientActor] Failed to get plan limits: " <> string.inspect(e),
+              )
+              Error("Failed to get plan limits")
+            }
+          }
+        }
+        None -> {
+          logging.log(
+            logging.Info,
+            "[ClientActor] Client has no plan assigned - skipping limit creation",
+          )
+          Ok(Nil)
+        }
+      }
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[ClientActor] Failed to get client record: " <> string.inspect(e),
+      )
+      Error("Failed to get client record")
+    }
+  }
+}
+
+/// Create a limit-checking metric for a plan limit
+fn create_limit_checking_metric(
+  business_id: String,
+  client_id: String,
+  limit: supabase_client.PlanLimit,
+  metrics_supervisor: glixir.DynamicSupervisor(
+    #(
+      String,
+      String,
+      String,
+      Float,
+      String,
+      String,
+      Int,
+      String,
+      String,
+      Float,
+      String,
+      String,
+    ),
+    process.Subject(metric_actor.Message),
+    // ← Missing second type parameter
+  ),
+) -> Result(Nil, String) {
+  let client_key = business_id <> ":" <> client_id
+
+  logging.log(
+    logging.Info,
+    "[ClientActor] Creating plan-aware MetricActor for: " <> limit.metric_name,
+  )
+
+  // Create MetricActor with plan limits built-in
+  let metric_spec =
+    metric_actor.start(
+      client_key,
+      limit.metric_name,
+      "tick_1h",
+      // Default flush
+      0.0,
+      // Start at zero usage
+      "",
+      // No tags
+      "SUM",
+      // Accumulate usage
+      -1,
+      // No cleanup
+      "checkpoint",
+      // Persistent
+      "",
+      // No metadata
+      limit.limit_value,
+      // Plan limit
+      limit.breach_operator,
+      // Plan operator
+      limit.breach_action,
+      // Plan action
+    )
+
+  case
+    glixir.start_dynamic_child(
+      metrics_supervisor,
+      metric_spec,
+      encode_metric_args,
+      fn(_) { Ok(process.new_subject()) },
+    )
+  {
+    supervisor.ChildStarted(_child_pid, _reply) -> {
+      logging.log(
+        logging.Info,
+        "[ClientActor] ✅ Plan-aware metric spawned: " <> limit.metric_name,
+      )
+      Ok(Nil)
+    }
+    supervisor.StartChildError(error) -> {
+      Error("Failed to spawn plan-aware metric: " <> error)
+    }
+  }
+}
+
+/// Check if a metric is over its plan limit
+pub fn is_metric_over_limit(
+  business_id: String,
+  client_id: String,
+  metric_name: String,
+) -> Result(Bool, String) {
+  let client_key = business_id <> ":" <> client_id
+  let limit_metric_name = "_limit_" <> metric_name
+
+  // Get current metric value
+  let current_value = case metric_store.get_value(client_key, metric_name) {
+    Ok(value) -> value
+    Error(_) -> 0.0
+    // No metric = no usage
+  }
+
+  // Get limit value
+  case metric_store.get_value(client_key, limit_metric_name) {
+    Ok(limit_value) -> {
+      let is_over = current_value >=. limit_value
+
+      logging.log(
+        logging.Debug,
+        "[ClientActor] Limit check: "
+          <> metric_name
+          <> " current="
+          <> float.to_string(current_value)
+          <> " limit="
+          <> float.to_string(limit_value)
+          <> " over="
+          <> string.inspect(is_over),
+      )
+
+      Ok(is_over)
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Debug,
+        "[ClientActor] No limit found for metric: " <> metric_name,
+      )
+      Ok(False)
+      // No limit = no breach
+    }
+  }
 }
 
 fn handle_message(state: State, message: Message) -> actor.Next(State, Message) {
   let current_time = utils.current_timestamp()
 
   let updated_state = case message {
-    RecordMetric(_, _, _, _, _, _, _, _) ->
+    RecordMetric(_, _, _, _, _, _, _, _, _, _, _) ->
       State(..state, last_accessed: current_time)
     _ -> state
   }
@@ -190,6 +448,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       metric_type,
       tags,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -241,6 +502,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
               cleanup_after_seconds,
               metric_type_string,
               metric_types.encode_metadata_to_string(metadata),
+              plan_limit_value,
+              plan_limit_operator,
+              plan_breach_action,
             )
 
           case
@@ -320,6 +584,35 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       actor.continue(updated_state)
     }
 
+    PlanLimitChanged(change_event) -> {
+      logging.log(
+        logging.Info,
+        "[ClientActor] 🔄 Plan limits changed, refreshing: "
+          <> change_event.business_id
+          <> "/"
+          <> change_event.client_id,
+      )
+
+      // Just reload plan limits directly - we already have the supervisor
+      case
+        load_client_plan_limits(
+          updated_state.business_id,
+          updated_state.client_id,
+          updated_state.metrics_supervisor,
+        )
+      {
+        Ok(_) -> {
+          logging.log(logging.Info, "[ClientActor] ✅ Plan limits refreshed")
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Warning,
+            "[ClientActor] ⚠️ Failed to refresh limits: " <> e,
+          )
+        }
+      }
+      actor.continue(updated_state)
+    }
     Shutdown -> {
       logging.log(
         logging.Info,
@@ -356,8 +649,8 @@ pub fn encode_client_args(args: #(String, String)) -> List(dynamic.Dynamic) {
 }
 
 pub fn start_link(
-  business_id: String,
-  client_id: String,
+  business_id business_id: String,
+  client_id client_id: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -432,6 +725,24 @@ pub fn start_link(
                 logging.Error,
                 "[ClientActor] ❌ Failed client cleanup subscription: "
                   <> string.inspect(e),
+              )
+            }
+          }
+
+          // Load plan limits and create limit-checking metrics
+          case
+            load_client_plan_limits(business_id, client_id, metrics_supervisor)
+          {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] ✅ Plan limits loaded and metrics created",
+              )
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[ClientActor] ⚠️ Failed to load plan limits: " <> e,
               )
             }
           }

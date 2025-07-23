@@ -7,7 +7,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option.{type Option, None, Some}
+import gleam/option.{type Option, None}
 import gleam/otp/actor
 import gleam/string
 import glixir
@@ -48,6 +48,10 @@ pub type State {
     metadata: Option(MetricMetadata),
     metric_operation: metric_store.Operation,
     last_flushed_value: Float,
+    plan_limit_value: Float,
+    plan_limit_operator: String,
+    plan_breach_action: String,
+    is_breached: Bool,
   )
 }
 
@@ -161,6 +165,9 @@ pub fn start_link(
   cleanup_after_seconds: Int,
   metric_type: String,
   metadata_json: String,
+  plan_limit_value: Float,
+  plan_limit_operator: String,
+  plan_breach_action: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -180,6 +187,12 @@ pub fn start_link(
       <> metric_type
       <> ", cleanup_after: "
       <> int.to_string(cleanup_after_seconds)
+      <> ", plan_limit_value: "
+      <> float.to_string(plan_limit_value)
+      <> ", plan_limit_operator: "
+      <> plan_limit_operator
+      <> ", plan_breach_action: "
+      <> plan_breach_action
       <> ")"
       <> ", metric_json: "
       <> metadata_json,
@@ -218,8 +231,11 @@ pub fn start_link(
       metadata: metric_types.decode_metadata_from_string(metadata_json),
       metric_operation: metric_operation,
       last_flushed_value: initial_value,
+      plan_limit_value: plan_limit_value,
+      plan_limit_operator: plan_limit_operator,
+      plan_breach_action: plan_breach_action,
+      is_breached: False,
     )
-
   case metric_store.init_store(account_id) {
     Ok(_) -> {
       logging.log(
@@ -465,17 +481,36 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
             logging.Info,
             "[MetricActor] Value updated: " <> float.to_string(new_value),
           )
+
+          // Check for plan limit breach
+          let new_breach_state = check_plan_breach(new_value, updated_state)
+          let state_with_breach =
+            State(..updated_state, is_breached: new_breach_state)
+
+          case new_breach_state != updated_state.is_breached {
+            True -> {
+              logging.log(
+                logging.Warning,
+                "[MetricActor] 🚨 BREACH STATE CHANGED: "
+                  <> string.inspect(new_breach_state)
+                  <> " action="
+                  <> updated_state.plan_breach_action,
+              )
+            }
+            False -> Nil
+          }
+
+          actor.continue(state_with_breach)
         }
         Error(e) -> {
           logging.log(
             logging.Error,
             "[MetricActor] Store error: " <> string.inspect(e),
           )
+          actor.continue(updated_state)
         }
       }
-      actor.continue(updated_state)
     }
-
     FlushTick(timestamp, tick_type) -> {
       logging.log(
         logging.Info,
@@ -600,8 +635,24 @@ pub fn start(
   cleanup_after_seconds cleanup_after_seconds: Int,
   metric_type metric_type: String,
   metadata metadata: String,
+  plan_limit_value plan_limit_value: Float,
+  plan_limit_operator plan_limit_operator: String,
+  plan_breach_action plan_breach_action: String,
 ) -> supervisor.ChildSpec(
-  #(String, String, String, Float, String, String, Int, String, String),
+  #(
+    String,
+    String,
+    String,
+    Float,
+    String,
+    String,
+    Int,
+    String,
+    String,
+    Float,
+    String,
+    String,
+  ),
   process.Subject(Message),
 ) {
   supervisor.ChildSpec(
@@ -618,6 +669,9 @@ pub fn start(
       cleanup_after_seconds,
       metric_type,
       metadata,
+      plan_limit_value,
+      plan_limit_operator,
+      plan_breach_action,
     ),
     restart: supervisor.Permanent,
     shutdown_timeout: 5000,
@@ -965,4 +1019,27 @@ fn flush_metrics_and_get_state(state: State) -> State {
     current_metric: state.default_metric,
     last_flushed_value: new_last_flushed_value,
   )
+}
+
+/// Check if current metric value breaches plan limit
+fn check_plan_breach(current_value: Float, state: State) -> Bool {
+  case state.plan_limit_value {
+    0.0 -> False
+    // No limit set
+    limit -> {
+      case state.plan_limit_operator {
+        "gt" -> current_value >. limit
+        "gte" -> current_value >=. limit
+        "lt" -> current_value <. limit
+        "lte" -> current_value <=. limit
+        "eq" -> current_value == limit
+        _ -> False
+      }
+    }
+  }
+}
+
+/// Check if metric is currently disabled due to breach
+pub fn is_metric_disabled(state: State) -> Bool {
+  state.is_breached && state.plan_breach_action == "disabled"
 }

@@ -1,6 +1,7 @@
 // src/actors/supabase_actor.gleam - FIXED VERSION
 import birl
 import clients/supabase_client
+import clients/supabase_realtime_client
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -8,13 +9,14 @@ import gleam/float
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
 import logging
 import storage/metric_batch_store
 import types/metric_types.{type MetricBatch}
+import types/supabase_types
 import utils/utils
 
 // ============================================================================
@@ -24,16 +26,19 @@ import utils/utils
 pub type Message {
   BatchMetric(metric: MetricBatch)
   FlushInterval(tick_type: String)
-  ForceFlush
+  StartRealtimeConnection
+  RealtimeReconnect(retry_count: Int)
+  ProcessPlanLimitUpdate(business_id: Option(String), client_id: Option(String))
   Shutdown
+  ForceFlush
 }
 
 pub type BatchingState {
   BatchingState(
     active_tick_types: Dict(String, Bool),
-    // Track which tick types are active
     last_flush_time: Int,
     flush_counter: Int,
+    realtime_retry_count: Int,
   )
 }
 
@@ -65,6 +70,7 @@ pub fn start() -> Result(process.Subject(Message), actor.StartError) {
       active_tick_types: dict.new(),
       last_flush_time: utils.current_timestamp(),
       flush_counter: 0,
+      realtime_retry_count: 0,
     )
   case
     actor.new(initial_state)
@@ -256,6 +262,60 @@ fn handle_message(
       // TODO: Flush all active intervals or implement differently
       actor.continue(state)
     }
+    StartRealtimeConnection -> {
+      logging.log(logging.Info, "[SupabaseActor] Starting Realtime connection")
+      start_realtime_connection(0)
+      actor.continue(state)
+    }
+
+    RealtimeReconnect(retry_count) -> {
+      let backoff_ms = case retry_count {
+        0 -> 1000
+        1 -> 2000
+        2 -> 4000
+        3 -> 8000
+        4 -> 16_000
+        _ -> 30_000
+      }
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] 🔄 Realtime retrying in "
+          <> int.to_string(backoff_ms)
+          <> "ms...",
+      )
+
+      process.sleep(backoff_ms)
+      start_realtime_connection(retry_count)
+      actor.continue(BatchingState(..state, realtime_retry_count: retry_count))
+    }
+
+    ProcessPlanLimitUpdate(business_id, client_id) -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] 🎯 Plan limit update: business="
+          <> string.inspect(business_id)
+          <> " client="
+          <> string.inspect(client_id),
+      )
+
+      // Route to specific ClientActor
+      case business_id, client_id {
+        Some(biz_id), Some(cli_id) -> {
+          notify_client_actor(biz_id, cli_id)
+        }
+        Some(biz_id), None -> {
+          // Business-level limit changed - notify all clients for this business
+          notify_business_clients(biz_id)
+        }
+        _, _ -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseActor] Invalid plan limit update",
+          )
+        }
+      }
+      actor.continue(state)
+    }
     Shutdown -> {
       logging.log(logging.Info, "[SupabaseActor] 🛑 Shutdown requested")
       // Flush any pending metrics before shutdown
@@ -419,4 +479,108 @@ fn flush_interval_to_supabase(
       actor.continue(state)
     }
   }
+}
+
+// Public FFI functions for Elixir callbacks
+pub fn realtime_reconnect(retry_count: Int) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.supabase_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subj) -> {
+      process.send(subj, RealtimeReconnect(retry_count))
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseActor] ❌ Registry lookup failed: " <> string.inspect(err),
+      )
+    }
+  }
+}
+
+pub fn process_plan_limit_update(business_id: String, client_id: String) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.supabase_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subj) -> {
+      let business_opt = case business_id {
+        "" -> None
+        id -> Some(id)
+      }
+      let client_opt = case client_id {
+        "" -> None
+        id -> Some(id)
+      }
+      process.send(subj, ProcessPlanLimitUpdate(business_opt, client_opt))
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseActor] ❌ Registry lookup failed: " <> string.inspect(err),
+      )
+    }
+  }
+}
+
+fn start_realtime_connection(retry_count: Int) -> Nil {
+  logging.log(logging.Info, "[SupabaseActor] 🚀 Starting Realtime connection")
+
+  case supabase_realtime_client.start_realtime_connection(retry_count) {
+    supabase_realtime_client.RealtimeStarted(_) -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] ✅ Realtime connection started successfully",
+      )
+    }
+    supabase_realtime_client.RealtimeError(r) -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseActor] ❌ Realtime start error: " <> r,
+      )
+    }
+  }
+}
+
+fn notify_client_actor(business_id: String, client_id: String) -> Nil {
+  let registry_key = "client:" <> business_id <> ":" <> client_id
+  case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
+    Ok(client_subject) -> {
+      // Send a generic message that any actor can handle
+      let change_event =
+        supabase_types.PlanLimitChangeEvent(business_id, client_id)
+      process.send(client_subject, change_event)
+      logging.log(
+        logging.Info,
+        "[SupabaseActor] ✅ Notified ClientActor: "
+          <> business_id
+          <> "/"
+          <> client_id,
+      )
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Debug,
+        "[SupabaseActor] ClientActor not found: "
+          <> business_id
+          <> "/"
+          <> client_id,
+      )
+    }
+  }
+}
+
+fn notify_business_clients(business_id: String) -> Nil {
+  // TODO: Get all clients for business and notify them
+  logging.log(
+    logging.Info,
+    "[SupabaseActor] TODO: Notify all clients for business: " <> business_id,
+  )
 }

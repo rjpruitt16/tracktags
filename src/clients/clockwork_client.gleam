@@ -2,9 +2,6 @@
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/atom
 import gleam/erlang/process
-import gleam/string
-import glixir
-import logging
 
 // Result types from our Elixir wrapper
 pub type SseStartResult {
