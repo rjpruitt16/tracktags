@@ -980,3 +980,71 @@ fn stripe_credentials_decoder() -> decode.Decoder(StripeCredentials) {
   use webhook_secret <- decode.field("webhook_secret", decode.string)
   decode.success(StripeCredentials(secret_key, webhook_secret))
 }
+
+/// Fetch event from Stripe API and process it (for admin replay)
+pub fn fetch_and_process_stripe_event(
+  business_id: String,
+  event_id: String,
+) -> Result(String, String) {
+  logging.log(
+    logging.Info,
+    "[StripeHandler] Fetching Stripe event: "
+      <> event_id
+      <> " for business: "
+      <> business_id,
+  )
+
+  // Get customer's Stripe secret key for API calls
+  case get_customer_stripe_secret(business_id) {
+    Error(error) -> Error("Failed to get Stripe credentials: " <> error)
+    Ok(secret_key) -> {
+      // Fetch event from Stripe API
+      case fetch_stripe_event_from_api(event_id, secret_key) {
+        Error(error) -> Error("Failed to fetch event from Stripe: " <> error)
+        Ok(event_json) -> {
+          // Process the event through existing customer webhook logic
+          case parse_stripe_event(event_json) {
+            Error(error) -> Error("Failed to parse Stripe event: " <> error)
+            Ok(event) -> {
+              case process_customer_stripe_event(event, business_id) {
+                Success(message) -> Ok(message)
+                InvalidSignature -> Error("Invalid signature")
+                InvalidPayload(error) -> Error("Invalid payload: " <> error)
+                ProcessingError(error) -> Error("Processing error: " <> error)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Get customer's Stripe secret key for API calls
+fn get_customer_stripe_secret(business_id: String) -> Result(String, String) {
+  case supabase_client.get_integration_keys(business_id, Some("stripe")) {
+    Ok([key, ..]) -> {
+      case crypto.decrypt_from_json(key.encrypted_key) {
+        Ok(decrypted_json) -> {
+          case json.parse(decrypted_json, stripe_credentials_decoder()) {
+            Ok(credentials) -> Ok(credentials.secret_key)
+            Error(_) -> Error("Failed to parse Stripe credentials")
+          }
+        }
+        Error(_) -> Error("Failed to decrypt Stripe credentials")
+      }
+    }
+    Ok([]) -> Error("No Stripe integration found for business")
+    Error(_) -> Error("Database error fetching integration keys")
+  }
+}
+
+/// Fetch single event from Stripe API
+fn fetch_stripe_event_from_api(
+  _event_id: String,
+  _secret_key: String,
+) -> Result(String, String) {
+  // TODO: Implement Stripe API call
+  // For now, return error - you can implement this when needed
+  Error("Stripe API fetch not yet implemented - use dashboard replay for now")
+}

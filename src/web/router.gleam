@@ -1,5 +1,6 @@
 // src/web/router.gleam
 import gleam/http.{Delete, Get, Post, Put}
+import web/handler/admin_handler
 import web/handler/client_handler
 import web/handler/key_handler
 import web/handler/metric_handler
@@ -19,9 +20,25 @@ pub fn handle_request(req: Request) -> Response {
         Get -> health_check()
         _ -> wisp.method_not_allowed([Get])
       }
+    // Admin APIs
+    ["admin", "v1", "replay", business_id, event_id] ->
+      case req.method {
+        Post -> admin_handler.replay_webhook(req, business_id, event_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
 
-    // Stripe webhooks
-    // In your router.gleam, add:
+    ["admin", "v1", "business", business_id, "override"] ->
+      case req.method {
+        Post -> admin_handler.override_subscription_status(req, business_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
+    ["admin", "v1", "business", business_id] ->
+      case req.method {
+        Get -> admin_handler.get_business_admin(req, business_id)
+        _ -> wisp.method_not_allowed([Get])
+      }
+
     ["api", "v1", "webhooks", "stripe"] ->
       case req.method {
         Post -> stripe_handler.handle_stripe_webhook(req)
