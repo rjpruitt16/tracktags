@@ -27,6 +27,13 @@ pub fn handle_request(req: Request) -> Response {
         Post -> stripe_handler.handle_stripe_webhook(req)
         _ -> wisp.method_not_allowed([Post])
       }
+
+    ["api", "v1", "webhooks", "stripe", business_id] ->
+      case req.method {
+        Post -> stripe_handler.handle_customer_webhook(req, business_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
     // Client CRUD API
     ["api", "v1", "clients"] ->
       case req.method {

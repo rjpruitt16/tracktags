@@ -54,10 +54,10 @@ fn validate_stripe_credentials(
     Error(_) -> Error("Missing secret_key for Stripe key")
   }
   |> result.try(fn(_) {
-    case dict.get(credentials, "webhook_endpoint") {
-      Ok("https://" <> _) -> Ok(Nil)
-      Ok(_) -> Error("Webhook URL must be HTTPS")
-      Error(_) -> Error("Missing webhook_endpoint for Stripe key")
+    case dict.get(credentials, "webhook_secret") {
+      Ok("whsec_" <> _) -> Ok(Nil)
+      Ok(_) -> Error("Webhook secret must start with whsec_")
+      Error(_) -> Error("Missing webhook_secret for Stripe key")
     }
   })
 }

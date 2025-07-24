@@ -1,7 +1,7 @@
 // src/web/handler/stripe_handler.gleam
 import clients/supabase_client
 import gleam/bit_array
-import gleam/crypto
+import gleam/crypto as gleam_crypto
 import gleam/dynamic/decode
 import gleam/float
 import gleam/http
@@ -11,6 +11,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import logging
+import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -43,6 +44,10 @@ pub type WebhookResult {
   InvalidSignature
   InvalidPayload(String)
   ProcessingError(String)
+}
+
+pub type StripeCredentials {
+  StripeCredentials(secret_key: String, webhook_secret: String)
 }
 
 /// Main webhook endpoint handler
@@ -180,9 +185,9 @@ fn verify_stripe_signature(
 
       // Compute HMAC-SHA256 using your crypto utils
       let computed_signature =
-        crypto.hmac(
+        gleam_crypto.hmac(
           bit_array.from_string(signed_payload),
-          crypto.Sha256,
+          gleam_crypto.Sha256,
           bit_array.from_string(secret),
         )
         |> bit_array.base16_encode
@@ -815,4 +820,163 @@ fn send_payment_success_metric(customer_id: String) -> Result(Nil, String) {
 fn get_webhook_secret() -> Result(String, String) {
   // Use require_env to crash if not set - webhook security is critical
   Ok(utils.require_env("STRIPE_WEBHOOK_SECRET"))
+}
+
+/// Handle customer webhook using their stored Stripe secret
+pub fn handle_customer_webhook(req: Request, business_id: String) -> Response {
+  case req.method {
+    http.Post -> process_customer_webhook(req, business_id)
+    _ -> wisp.method_not_allowed([http.Post])
+  }
+}
+
+/// Process customer webhook - reuses existing logic but with customer secret
+fn process_customer_webhook(req: Request, business_id: String) -> Response {
+  case get_stripe_signature(req) {
+    Error(_) -> {
+      logging.log(
+        logging.Error,
+        "[StripeHandler] Missing Stripe signature for customer: " <> business_id,
+      )
+      wisp.bad_request()
+      |> wisp.string_body("Missing Stripe-Signature header")
+    }
+    Ok(signature) -> {
+      case wisp.read_body_to_bitstring(req) {
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[StripeHandler] Failed to read customer webhook body",
+          )
+          wisp.bad_request()
+          |> wisp.string_body("Invalid request body")
+        }
+        Ok(body_bits) -> {
+          case bit_array.to_string(body_bits) {
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[StripeHandler] Invalid UTF-8 in customer webhook body",
+              )
+              wisp.bad_request()
+              |> wisp.string_body("Invalid body encoding")
+            }
+            Ok(body) -> {
+              // REUSE existing logic but with customer secret
+              case verify_and_process_customer(body, signature, business_id) {
+                Success(message) -> {
+                  logging.log(
+                    logging.Info,
+                    "[StripeHandler] Customer webhook processed: "
+                      <> business_id
+                      <> " - "
+                      <> message,
+                  )
+                  wisp.ok()
+                  |> wisp.string_body("{\"received\": true}")
+                }
+                InvalidSignature -> {
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Invalid signature for customer: "
+                      <> business_id,
+                  )
+                  wisp.bad_request()
+                  |> wisp.string_body("Invalid signature")
+                }
+                InvalidPayload(error) -> {
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Invalid customer webhook payload: "
+                      <> error,
+                  )
+                  wisp.bad_request()
+                  |> wisp.string_body("Invalid payload: " <> error)
+                }
+                ProcessingError(error) -> {
+                  logging.log(
+                    logging.Error,
+                    "[StripeHandler] Customer webhook processing error: "
+                      <> error,
+                  )
+                  wisp.internal_server_error()
+                  |> wisp.string_body("Processing error")
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Verify and process customer webhook - similar to verify_and_process but with customer secret
+fn verify_and_process_customer(
+  body: String,
+  signature: String,
+  business_id: String,
+) -> WebhookResult {
+  case get_customer_webhook_secret(business_id) {
+    Error(error) -> ProcessingError("Failed to get webhook secret: " <> error)
+    Ok(customer_secret) -> {
+      case verify_stripe_signature(body, signature, customer_secret) {
+        False -> InvalidSignature
+        True -> {
+          // REUSE existing parsing and processing
+          case parse_stripe_event(body) {
+            Error(error) -> InvalidPayload(error)
+            Ok(event) -> process_customer_stripe_event(event, business_id)
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Get customer's webhook secret from integration_keys (FIXED)
+fn get_customer_webhook_secret(business_id: String) -> Result(String, String) {
+  case supabase_client.get_integration_keys(business_id, Some("stripe")) {
+    Ok([key, ..]) -> {
+      // Decrypt the credentials (FIXED: use encrypted_key, not encrypted_data)
+      case crypto.decrypt_from_json(key.encrypted_key) {
+        Ok(decrypted_json) -> {
+          case json.parse(decrypted_json, stripe_credentials_decoder()) {
+            Ok(credentials) -> Ok(credentials.webhook_secret)
+            Error(_) -> Error("Failed to parse Stripe credentials")
+          }
+        }
+        Error(_) -> Error("Failed to decrypt Stripe credentials")
+      }
+    }
+    Ok([]) -> Error("No Stripe integration found for business")
+    Error(_) -> Error("Database error fetching integration keys")
+  }
+}
+
+/// Process customer's Stripe events - simple acknowledgment for Phase 3
+fn process_customer_stripe_event(
+  event: StripeEvent,
+  business_id: String,
+) -> WebhookResult {
+  logging.log(
+    logging.Info,
+    "[StripeHandler] Processing customer Stripe event: "
+      <> event.id
+      <> " for business: "
+      <> business_id,
+  )
+
+  // For Phase 3: Just log and acknowledge 
+  // Customer gets their webhook data validated and confirmed
+  Success(
+    "Customer event processed: " <> event.id <> " for business: " <> business_id,
+  )
+}
+
+/// Decoder for stored Stripe credentials
+fn stripe_credentials_decoder() -> decode.Decoder(StripeCredentials) {
+  use secret_key <- decode.field("secret_key", decode.string)
+  use webhook_secret <- decode.field("webhook_secret", decode.string)
+  decode.success(StripeCredentials(secret_key, webhook_secret))
 }
