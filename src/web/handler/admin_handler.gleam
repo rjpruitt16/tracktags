@@ -7,6 +7,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import logging
+import utils/utils
 import web/handler/stripe_handler
 import wisp.{type Request, type Response}
 

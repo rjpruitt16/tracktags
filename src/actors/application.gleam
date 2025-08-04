@@ -399,14 +399,7 @@ pub fn start_application_actor(
 }
 
 // Updated start_app function with proper actor startup sequence
-pub fn start_app(
-  sse_url: String,
-) -> Result(process.Subject(ApplicationMessage), String) {
-  logging.log(
-    logging.Info,
-    "[Application] Starting TrackTags application with SSE URL: " <> sse_url,
-  )
-
+pub fn start_app() -> Result(process.Subject(ApplicationMessage), String) {
   // Start the registry with phantom types
   use _registry <- result.try(
     glixir.start_registry(utils.tracktags_registry())
@@ -425,7 +418,7 @@ pub fn start_app(
 
   // Start ClockActor
   use clock_subject <- result.try(
-    clock_actor.start(sse_url)
+    clock_actor.start()
     |> result.map_error(fn(e) {
       "ClockActor start failed: " <> string.inspect(e)
     }),

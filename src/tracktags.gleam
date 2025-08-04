@@ -7,7 +7,6 @@ import gleam/option.{None, Some}
 import gleam/string
 import logging
 import mist
-import utils/utils
 import web/router
 import wisp
 import wisp/wisp_mist
@@ -16,23 +15,10 @@ pub fn main() {
   // Configure logging first
   logging.configure()
 
-  io.println("[Main] 🚀 Starting TrackTags")
-
-  // Check all required environment variables first using utils
-  let supabase_url = utils.require_env("SUPABASE_URL")
-  let supabase_key = utils.require_env("SUPABASE_KEY")
-
-  // Optional variables with defaults using utils
-  let clockwork_url =
-    utils.get_env_or("CLOCKWORK_URL", "http://localhost:4000/events")
   let port = 8080
 
-  io.println("[Main] Using Clockwork URL: " <> clockwork_url)
-  io.println("[Main] Using Supabase URL: " <> supabase_url)
-  io.println("[Main] API will be available on port: " <> int.to_string(port))
-
   // Start the TrackTags application (actors, registry, etc.)
-  case application.start_app(clockwork_url) {
+  case application.start_app() {
     Ok(_app_actor) -> {
       logging.log(
         logging.Info,
