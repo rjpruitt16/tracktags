@@ -293,6 +293,35 @@ pub fn start_link(
       )
       initial_value
     }
+    metric_types.StripeBilling -> {
+      // ✅ NEW: StripeBilling acts like Reset for now
+      logging.log(
+        logging.Info,
+        "[MetricActor] 💳 StripeBilling metric - resetting after flush",
+      )
+      case
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          state.initial_value,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] ✅ StripeBilling reset successful",
+          )
+          initial_value
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
+          )
+          initial_value
+        }
+      }
+    }
   }
 
   // Create the metric in ETS with the restored/initial value
@@ -825,6 +854,31 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
           )
       }
     }
+    metric_types.StripeBilling -> {
+      // ✅ Same as Reset behavior for now
+      logging.log(
+        logging.Info,
+        "[MetricActor] 💳 StripeBilling reset to initial value",
+      )
+      case
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          state.initial_value,
+        )
+      {
+        Ok(_) ->
+          logging.log(
+            logging.Info,
+            "[MetricActor] ✅ StripeBilling reset successful",
+          )
+        Error(e) ->
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
+          )
+      }
+    }
   }
 
   // ✅ Update state with new last_flushed_value
@@ -1032,6 +1086,31 @@ fn flush_metrics_and_get_state(state: State) -> State {
           logging.log(
             logging.Warning,
             "[MetricActor] ⚠️ Reset failed: " <> string.inspect(e),
+          )
+      }
+    }
+    metric_types.StripeBilling -> {
+      // ✅ Same as Reset behavior for now
+      logging.log(
+        logging.Info,
+        "[MetricActor] 💳 StripeBilling reset to initial value",
+      )
+      case
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          state.initial_value,
+        )
+      {
+        Ok(_) ->
+          logging.log(
+            logging.Info,
+            "[MetricActor] ✅ StripeBilling reset successful",
+          )
+        Error(e) ->
+          logging.log(
+            logging.Warning,
+            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
           )
       }
     }

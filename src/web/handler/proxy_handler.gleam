@@ -14,7 +14,6 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
-import types/metric_scope
 import types/metric_types
 import utils/utils
 import wisp.{type Request, type Response}
@@ -129,7 +128,7 @@ fn process_proxy_request(
   )
 
   // Step 1: Parse scope using our new MetricScope system
-  case metric_scope.string_to_scope(req.scope, business_id, req.client_id) {
+  case metric_types.string_to_scope(req.scope, business_id, req.client_id) {
     Error(scope_error) -> {
       let error_json =
         json.object([
@@ -140,7 +139,7 @@ fn process_proxy_request(
     }
     Ok(scope) -> {
       // Step 2: Generate lookup key and check metric status
-      let lookup_key = metric_scope.scope_to_lookup_key(scope)
+      let lookup_key = metric_types.scope_to_lookup_key(scope)
 
       logging.log(
         logging.Info,
@@ -200,7 +199,7 @@ fn process_proxy_request(
 fn check_metric_breach_status(
   lookup_key: String,
   metric_name: String,
-  scope: metric_scope.MetricScope,
+  scope: metric_types.MetricScope,
   business_id: String,
 ) -> Result(BreachStatus, String) {
   case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
@@ -261,7 +260,7 @@ fn get_metric_status(
 fn spawn_metric_for_checking(
   _lookup_key: String,
   metric_name: String,
-  scope: metric_scope.MetricScope,
+  scope: metric_types.MetricScope,
   _business_id: String,
 ) -> Result(process.Subject(metric_types.Message), String) {
   // NOTE: We tried several approaches to auto-spawn metrics:
@@ -276,7 +275,7 @@ fn spawn_metric_for_checking(
     "Metric '"
     <> metric_name
     <> "' not found. Create it first using POST /api/v1/metrics with scope="
-    <> metric_scope.scope_to_string(scope)
+    <> metric_types.scope_to_string(scope)
     <> " before using the proxy.",
   )
 }

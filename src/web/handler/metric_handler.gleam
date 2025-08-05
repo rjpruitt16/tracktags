@@ -56,7 +56,7 @@ const valid_cleanup_periods = [
   "5s", "1m", "1h", "6h", "1d", "7d", "30d", "never",
 ]
 
-const valid_metric_types = ["reset", "checkpoint"]
+const valid_metric_types = ["reset", "checkpoint", "stripe_billing"]
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -271,7 +271,7 @@ fn validate_metric_request(
   req: MetricRequest,
 ) -> Result(MetricRequest, List(decode.DecodeError)) {
   // Validate metric name
-  case string.length(req.metric_name) {
+  use _ <- result.try(case string.length(req.metric_name) {
     0 ->
       Error([decode.DecodeError("Invalid", "metric_name cannot be empty", [])])
     n if n > 100 ->
@@ -283,39 +283,38 @@ fn validate_metric_request(
         ),
       ])
     _ -> Ok(Nil)
-  }
-  |> result.try(fn(_) {
-    // Validate operation
-    case list.contains(valid_operations, req.operation) {
-      False ->
-        Error([
-          decode.DecodeError(
-            "Invalid",
-            "Invalid operation. Must be one of: "
-              <> string.join(valid_operations, ", "),
-            [],
-          ),
-        ])
-      True -> Ok(Nil)
-    }
   })
-  |> result.try(fn(_) {
-    // Validate flush_interval
-    case list.contains(valid_intervals, req.flush_interval) {
-      False ->
-        Error([
-          decode.DecodeError(
-            "Invalid",
-            "Invalid flush_interval. Must be one of: "
-              <> string.join(valid_intervals, ", "),
-            [],
-          ),
-        ])
-      True -> Ok(Nil)
-    }
+
+  // Validate operation
+  use _ <- result.try(case list.contains(valid_operations, req.operation) {
+    False ->
+      Error([
+        decode.DecodeError(
+          "Invalid",
+          "Invalid operation. Must be one of: "
+            <> string.join(valid_operations, ", "),
+          [],
+        ),
+      ])
+    True -> Ok(Nil)
   })
-  |> result.try(fn(_) {
-    // Validate cleanup_after
+
+  // Validate flush_interval
+  use _ <- result.try(case list.contains(valid_intervals, req.flush_interval) {
+    False ->
+      Error([
+        decode.DecodeError(
+          "Invalid",
+          "Invalid flush_interval. Must be one of: "
+            <> string.join(valid_intervals, ", "),
+          [],
+        ),
+      ])
+    True -> Ok(Nil)
+  })
+
+  // Validate cleanup_after
+  use _ <- result.try(
     case list.contains(valid_cleanup_periods, req.cleanup_after) {
       False ->
         Error([
@@ -327,23 +326,49 @@ fn validate_metric_request(
           ),
         ])
       True -> Ok(Nil)
-    }
+    },
+  )
+
+  // Validate metric_type
+  use _ <- result.try(case list.contains(valid_metric_types, req.metric_type) {
+    False ->
+      Error([
+        decode.DecodeError(
+          "Invalid",
+          "Invalid metric_type. Must be one of: "
+            <> string.join(valid_metric_types, ", "),
+          [],
+        ),
+      ])
+    True -> Ok(Nil)
   })
-  |> result.try(fn(_) {
-    // Validate metric_type
-    case list.contains(valid_metric_types, req.metric_type) {
-      False ->
-        Error([
-          decode.DecodeError(
-            "Invalid",
-            "Invalid metric_type. Must be one of: "
-              <> string.join(valid_metric_types, ", "),
-            [],
-          ),
-        ])
-      True -> Ok(req)
+
+  // Apply stripe billing interval validation (this modifies the request if needed)
+  validate_stripe_billing_interval(req)
+}
+
+fn validate_stripe_billing_interval(
+  req: MetricRequest,
+) -> Result(MetricRequest, List(decode.DecodeError)) {
+  case req.metric_type {
+    "stripe_billing" -> {
+      case req.flush_interval {
+        "1s" | "5s" | "30s" | "1m" | "15m" | "30m" -> {
+          logging.log(
+            logging.Info,
+            "[MetricHandler] ⚡ StripeBilling metric forced to 1h interval for performance",
+          )
+          Ok(MetricRequest(..req, flush_interval: "1h"))
+        }
+        "1h" | "6h" | "1d" -> Ok(req)
+        // Already good intervals
+        _ -> Ok(MetricRequest(..req, flush_interval: "1h"))
+        // Default to 1h
+      }
     }
-  })
+    _ -> Ok(req)
+    // Non-billing metrics can use any interval
+  }
 }
 
 // ============================================================================
@@ -370,22 +395,16 @@ fn get_application_actor() -> Result(
 // CRUD ENDPOINTS
 // ============================================================================
 
+// In metric_handler.gleam  
 pub fn create_metric(req: Request) -> Response {
-  let request_id = string.inspect(utils.system_time())
-  logging.log(
-    logging.Info,
-    "[MetricHandler] 🔍 CREATE REQUEST START - ID: " <> request_id,
-  )
-
   use <- wisp.require_method(req, http.Post)
   use business_id <- with_auth(req)
   use json_data <- wisp.require_json(req)
 
-  // ✅ Parse query parameters
-  let scope = case wisp.get_query(req) |> list.key_find("scope") {
+  // Parse scope from query parameters
+  let scope_str = case wisp.get_query(req) |> list.key_find("scope") {
     Ok(s) -> s
     Error(_) -> "business"
-    // default
   }
 
   let client_id = case wisp.get_query(req) |> list.key_find("client_id") {
@@ -397,44 +416,134 @@ pub fn create_metric(req: Request) -> Response {
     use metric_req <- result.try(decode.run(json_data, metric_request_decoder()))
     use validated_req <- result.try(validate_metric_request(metric_req))
 
-    // ✅ Route based on scope
-    case scope {
-      "client" -> {
-        case client_id {
-          Some(cid) ->
-            Ok(process_create_client_metric(business_id, cid, validated_req))
-          None ->
-            Error([
-              decode.DecodeError(
-                "Missing",
-                "client_id required for client scope",
-                [],
-              ),
-            ])
-        }
-      }
-      "business" | _ -> Ok(process_create_metric(business_id, validated_req))
+    // Route based on scope using your existing infrastructure
+    case metric_types.string_to_scope(scope_str, business_id, client_id) {
+      Ok(metric_types.Business(_)) ->
+        Ok(process_create_metric(business_id, validated_req))
+      Ok(metric_types.Client(_, cid)) ->
+        Ok(process_create_client_metric(business_id, cid, validated_req))
+      Error(error) -> Error([decode.DecodeError("Invalid", error, [])])
     }
   }
-  logging.log(
-    logging.Info,
-    "[MetricHandler] 🔍 CREATE REQUEST END - ID: " <> request_id,
-  )
-
   case result {
     Ok(response) -> response
     Error(decode_errors) -> {
       logging.log(
         logging.Warning,
-        "[MetricHandler] Bad request: " <> string.inspect(decode_errors),
+        "[MetricHandler] Validation failed: " <> string.inspect(decode_errors),
       )
+
+      // NEW: Format detailed error message
+      let #(error_message, error_details) = format_decode_errors(decode_errors)
       let error_json =
         json.object([
-          #("error", json.string("Bad Request")),
-          #("message", json.string("Invalid request data")),
+          #("error", json.string("Validation Failed")),
+          #("message", json.string(error_message)),
+          #("details", json.object(error_details)),
+          #("received_data", json.string(string.inspect(json_data))),
+          // Show what was received
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
+  }
+}
+
+// NEW: Helper function to format decode errors
+fn format_decode_errors(
+  decode_errors: List(decode.DecodeError),
+) -> #(String, List(#(String, json.Json))) {
+  case decode_errors {
+    [decode.DecodeError(expected, reason, path)] -> {
+      let field_path = case path {
+        [] -> "root"
+        path -> string.join(path, ".")
+      }
+
+      case expected, reason {
+        "String", "field not found" -> #(
+          "Missing required field: " <> field_path,
+          [
+            #("field", json.string(field_path)),
+            #("error_type", json.string("missing_field")),
+          ],
+        )
+
+        "String", reason -> #(
+          "Invalid value for field '" <> field_path <> "': " <> reason,
+          [
+            #("field", json.string(field_path)),
+            #("error_type", json.string("invalid_value")),
+            #("reason", json.string(reason)),
+          ],
+        )
+
+        expected, "variant not found" -> #(
+          "Invalid enum value for '"
+            <> field_path
+            <> "'. Expected: "
+            <> expected,
+          [
+            #("field", json.string(field_path)),
+            #("error_type", json.string("invalid_enum")),
+            #("expected_type", json.string(expected)),
+            #("valid_options", get_valid_options_for_field(field_path)),
+          ],
+        )
+
+        _, _ -> #(
+          "Validation error in field '"
+            <> field_path
+            <> "': expected "
+            <> expected
+            <> ", "
+            <> reason,
+          [
+            #("field", json.string(field_path)),
+            #("error_type", json.string("validation_error")),
+            #("expected", json.string(expected)),
+            #("reason", json.string(reason)),
+          ],
+        )
+      }
+    }
+    [] -> #("Unknown validation error", [
+      #("error_type", json.string("unknown")),
+    ])
+
+    multiple_errors -> {
+      let error_count = list.length(multiple_errors)
+      #(
+        "Multiple validation errors ("
+          <> int.to_string(error_count)
+          <> " total)",
+        [
+          #("error_count", json.int(error_count)),
+          #(
+            "errors",
+            json.array(
+              from: list.map(multiple_errors, fn(err) {
+                json.string(string.inspect(err))
+              }),
+              of: fn(x) { x },
+            ),
+          ),
+        ],
+      )
+    }
+  }
+}
+
+// NEW: Helper to provide valid options for enum fields
+fn get_valid_options_for_field(field_path: String) -> json.Json {
+  case field_path {
+    "metric_type" ->
+      json.array(
+        from: ["reset", "checkpoint", "stripe_billing"],
+        of: json.string,
+      )
+    "operation" ->
+      json.array(from: ["SUM", "COUNT", "MAX", "MIN", "AVG"], of: json.string)
+    _ -> json.null()
   }
 }
 
