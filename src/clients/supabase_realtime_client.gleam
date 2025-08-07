@@ -1,4 +1,4 @@
-// src/clients/supabase_realtime_client.gleam
+// src/customers/supabase_realtime_customer.gleam
 import gleam/dynamic.{type Dynamic}
 import gleam/string
 import utils/utils
@@ -10,7 +10,7 @@ pub type RealtimeStartResult {
 }
 
 pub type RealtimeEventResult {
-  PlanLimitUpdate(business_id: String, client_id: String)
+  PlanLimitUpdate(business_id: String, customer_id: String)
   ParseError(reason: String)
   Ignore
 }

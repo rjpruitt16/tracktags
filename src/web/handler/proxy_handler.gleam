@@ -25,8 +25,8 @@ import wisp.{type Request, type Response}
 pub type ProxyRequest {
   ProxyRequest(
     scope: String,
-    // "business" or "client"
-    client_id: option.Option(String),
+    // "business" or "customer"
+    customer_id: option.Option(String),
     // required if scope=client
     metric_name: String,
     // metric to check for breach
@@ -128,7 +128,7 @@ fn process_proxy_request(
   )
 
   // Step 1: Parse scope using our new MetricScope system
-  case metric_types.string_to_scope(req.scope, business_id, req.client_id) {
+  case metric_types.string_to_scope(req.scope, business_id, req.customer_id) {
     Error(scope_error) -> {
       let error_json =
         json.object([
@@ -466,8 +466,8 @@ fn breach_status_to_json(breach_status: BreachStatus) -> json.Json {
 
 fn proxy_request_decoder() -> decode.Decoder(ProxyRequest) {
   use scope <- decode.field("scope", decode.string)
-  use client_id <- decode.optional_field(
-    "client_id",
+  use customer_id <- decode.optional_field(
+    "customer_id",
     None,
     decode.optional(decode.string),
   )
@@ -487,7 +487,7 @@ fn proxy_request_decoder() -> decode.Decoder(ProxyRequest) {
 
   decode.success(ProxyRequest(
     scope: scope,
-    client_id: client_id,
+    customer_id: customer_id,
     metric_name: metric_name,
     target_url: target_url,
     method: method,
@@ -501,7 +501,7 @@ fn validate_proxy_request(
 ) -> Result(ProxyRequest, List(decode.DecodeError)) {
   // Validate scope
   case req.scope {
-    "business" | "client" -> Ok(Nil)
+    "business" | "customer" -> Ok(Nil)
     _ ->
       Error([
         decode.DecodeError(
@@ -512,13 +512,13 @@ fn validate_proxy_request(
       ])
   }
   |> result.try(fn(_) {
-    // Validate client_id for client scope
-    case req.scope, req.client_id {
-      "client", None ->
+    // Validate customer_id for client scope
+    case req.scope, req.customer_id {
+      "customer", None ->
         Error([
           decode.DecodeError(
             "Invalid",
-            "client_id required for client scope",
+            "customer_id required for client scope",
             [],
           ),
         ])

@@ -9,14 +9,13 @@ import gleam/float
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
 import logging
 import storage/metric_batch_store
 import types/business_types
-import types/client_types
+import types/customer_types
 import types/metric_types.{type MetricBatch}
 import utils/utils
 
@@ -309,67 +308,23 @@ fn handle_message(
 fn batch_to_metric_record(batch: MetricBatch) -> supabase_client.MetricRecord {
   logging.log(
     logging.Info,
-    "[SupabaseActor] 🔍 INCOMING BATCH: business_id='"
+    "[SupabaseActor] 🔍 INCOMING BATCH: account_id='"
       <> batch.business_id
-      <> "', client_id='"
-      <> string.inspect(batch.client_id)
-      <> "', scope='"
+      <> "', batch.customer_id='"
+      <> string.inspect(batch.customer_id)
+      <> "', batch.scope='"
       <> batch.scope
-      <> "'",
-  )
-
-  // Extract business_id and client_id from the account_id
-  let #(actual_business_id, actual_client_id, actual_scope) = case
-    string.contains(batch.business_id, ":")
-  {
-    True -> {
-      // Client metric: "mobile_app:biz_001" -> business="biz_001", client="mobile_app"
-      case string.split_once(batch.business_id, ":") {
-        Ok(#(client_part, business_part)) -> {
-          logging.log(
-            logging.Info,
-            "[SupabaseActor] 🔍 PARSED CLIENT METRIC: client='"
-              <> client_part
-              <> "', business='"
-              <> business_part
-              <> "'",
-          )
-          #(business_part, Some(client_part), "client")
-        }
-        Error(_) -> #(batch.business_id, None, "business")
-      }
-    }
-    False -> {
-      // Business metric: just business_id
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] 🔍 BUSINESS METRIC: business='"
-          <> batch.business_id
-          <> "'",
-      )
-      #(batch.business_id, None, "business")
-    }
-  }
-
-  logging.log(
-    logging.Info,
-    "[SupabaseActor] 🔍 FINAL VALUES: business_id='"
-      <> actual_business_id
-      <> "', client_id='"
-      <> string.inspect(actual_client_id)
-      <> "', scope='"
-      <> actual_scope
       <> "'",
   )
 
   supabase_client.MetricRecord(
     id: "will_be_generated",
-    business_id: actual_business_id,
-    client_id: actual_client_id,
+    business_id: batch.business_id,
+    customer_id: batch.customer_id,
     metric_name: batch.metric_name,
     value: float.to_string(batch.aggregated_value),
     metric_type: batch.metric_type,
-    scope: actual_scope,
+    scope: batch.scope,
     adapters: batch.adapters,
     flushed_at: timestamp_to_iso(batch.window_end),
   )
@@ -486,15 +441,15 @@ pub fn realtime_reconnect(retry_count: Int) {
 // Update the function signature:
 pub fn process_plan_limit_update(
   business_id: String,
-  client_id: String,
+  customer_id: String,
   metric_name: String,
   limit_value: Float,
   limit_operator: String,
   breach_action: String,
 ) -> Nil {
-  case client_id {
+  case customer_id {
     "" ->
-      notify_business_clients(
+      notify_business_customers(
         business_id,
         metric_name,
         limit_value,
@@ -502,9 +457,9 @@ pub fn process_plan_limit_update(
         breach_action,
       )
     _ ->
-      notify_client_actor(
+      notify_customer_actor(
         business_id,
-        client_id,
+        customer_id,
         metric_name,
         limit_value,
         limit_operator,
@@ -532,23 +487,23 @@ fn start_realtime_connection(retry_count: Int) -> Nil {
   }
 }
 
-fn notify_client_actor(
+fn notify_customer_actor(
   business_id: String,
-  client_id: String,
+  customer_id: String,
   metric_name: String,
   limit_value: Float,
   limit_operator: String,
   breach_action: String,
 ) -> Nil {
-  let registry_key = "client:" <> business_id <> ":" <> client_id
+  let registry_key = "client:" <> business_id <> ":" <> customer_id
   case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
-    Ok(client_subject) -> {
+    Ok(customer_subject) -> {
       // Send the new message type with actual data
       process.send(
-        client_subject,
-        client_types.PlanLimitChanged(
+        customer_subject,
+        customer_types.PlanLimitChanged(
           business_id: business_id,
-          client_id: client_id,
+          customer_id: customer_id,
           metric_name: metric_name,
           new_limit_value: limit_value,
           limit_operator: limit_operator,
@@ -560,7 +515,7 @@ fn notify_client_actor(
         "[SupabaseActor] ✅ Notified ClientActor: "
           <> business_id
           <> "/"
-          <> client_id,
+          <> customer_id,
       )
     }
     Error(_) -> {
@@ -569,13 +524,13 @@ fn notify_client_actor(
         "[SupabaseActor] ClientActor not found: "
           <> business_id
           <> "/"
-          <> client_id,
+          <> customer_id,
       )
     }
   }
 }
 
-fn notify_business_clients(
+fn notify_business_customers(
   business_id: String,
   metric_name: String,
   limit_value: Float,

@@ -1,7 +1,7 @@
 // src/web/router.gleam
 import gleam/http.{Delete, Get, Post, Put}
 import web/handler/admin_handler
-import web/handler/client_handler
+import web/handler/customer_handler
 import web/handler/key_handler
 import web/handler/metric_handler
 import web/handler/plan_limit_handler
@@ -52,33 +52,33 @@ pub fn handle_request(req: Request) -> Response {
       }
 
     // Client CRUD API
-    ["api", "v1", "clients"] ->
+    ["api", "v1", "customers"] ->
       case req.method {
-        Post -> client_handler.create_client(req)
-        Get -> client_handler.list_clients(req)
+        Post -> customer_handler.create_customer(req)
+        Get -> customer_handler.list_customers(req)
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
     // Individual client operations
-    ["api", "v1", "clients", client_id] ->
+    ["api", "v1", "customers", customer_id] ->
       case req.method {
-        Get -> client_handler.get_client(req, client_id)
-        Delete -> client_handler.delete_client(req, client_id)
+        Get -> customer_handler.get_client(req, customer_id)
+        Delete -> customer_handler.delete_customer(req, customer_id)
         _ -> wisp.method_not_allowed([Get, Delete])
       }
 
     // Client key management
-    ["api", "v1", "clients", client_id, "keys"] ->
+    ["api", "v1", "customers", customer_id, "keys"] ->
       case req.method {
-        Post -> client_handler.create_client_key(req, client_id)
-        Get -> client_handler.list_client_keys(req, client_id)
+        Post -> customer_handler.create_client_key(req, customer_id)
+        Get -> customer_handler.list_client_keys(req, customer_id)
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
     // Individual client key operations
-    ["api", "v1", "clients", client_id, "keys", key_id] ->
+    ["api", "v1", "customers", customer_id, "keys", key_id] ->
       case req.method {
-        Delete -> client_handler.delete_client_key(req, client_id, key_id)
+        Delete -> customer_handler.delete_client_key(req, customer_id, key_id)
         _ -> wisp.method_not_allowed([Delete])
       }
 

@@ -14,6 +14,7 @@ import logging
 import storage/metric_store
 
 pub type Message {
+
   RecordMetric(metric: Metric)
   FlushTick(timestamp: String, tick_type: String)
   ForceFlush
@@ -21,7 +22,8 @@ pub type Message {
   Shutdown
   UpdatePlanLimit(Float, String, String)
   GetLimitStatus(reply_with: process.Subject(LimitStatus))
-  // NEW
+  GetMetricType(reply_to: process.Subject(MetricType))
+  ResetToInitialValue
 }
 
 // ============================================================================
@@ -30,15 +32,15 @@ pub type Message {
 
 /// Defines the scope/hierarchy level where a metric exists
 pub type MetricScope {
-  /// Business-level metric (aggregated across all clients)
+  /// Business-level metric (aggregated across all customers)
   Business(business_id: String)
 
   /// Client-level metric (specific to one client within a business)
-  Client(business_id: String, client_id: String)
+  Customer(business_id: String, customer_id: String)
   // Future scope extensions:
   // Region(region_id: String, business_id: String)
-  // RegionClient(region_id: String, business_id: String, client_id: String)  
-  // RegionClientMachine(region_id: String, business_id: String, client_id: String, machine_id: String)
+  // RegionCustomer(region_id: String, business_id: String, customer_id: String)  
+  // RegionClientMachine(region_id: String, business_id: String, customer_id: String, machine_id: String)
 }
 
 pub type MetricType {
@@ -80,7 +82,7 @@ pub type PrecisionConfig {
 pub type MetricBatch {
   MetricBatch(
     business_id: String,
-    client_id: Option(String),
+    customer_id: Option(String),
     metric_name: String,
     aggregated_value: Float,
     operation_count: Int,
@@ -130,7 +132,7 @@ pub type SupabaseConfig {
     table_name: Option(String),
     retention_days: Option(Int),
     batch_interval: Option(String),
-    // NEW: "1s", "15s", "30s", "1m"
+    restore_on_startup: Option(Bool),
   )
 }
 
@@ -169,8 +171,8 @@ pub fn scope_to_lookup_key(scope: MetricScope) -> String {
     // Business metrics use just the business_id as the key
     Business(business_id) -> business_id
 
-    // Client metrics use "business_id:client_id" format
-    Client(business_id, client_id) -> business_id <> ":" <> client_id
+    // Client metrics use "business_id:customer_id" format
+    Customer(business_id, customer_id) -> business_id <> ":" <> customer_id
   }
 }
 
@@ -178,7 +180,7 @@ pub fn scope_to_lookup_key(scope: MetricScope) -> String {
 pub fn scope_to_string(scope: MetricScope) -> String {
   case scope {
     Business(_) -> "business"
-    Client(_, _) -> "client"
+    Customer(_, _) -> "customer"
   }
 }
 
@@ -187,14 +189,14 @@ pub fn scope_to_string(scope: MetricScope) -> String {
 pub fn string_to_scope(
   scope_str: String,
   business_id: String,
-  client_id: Option(String),
+  customer_id: Option(String),
 ) -> Result(MetricScope, String) {
   case scope_str {
     "business" -> Ok(Business(business_id))
-    "client" ->
-      case client_id {
-        Some(id) -> Ok(Client(business_id, id))
-        None -> Error("client scope requires client_id")
+    "customer" ->
+      case customer_id {
+        Some(id) -> Ok(Customer(business_id, id))
+        None -> Error("client scope requires customer_id")
       }
     _ -> Error("Invalid scope: " <> scope_str)
   }
@@ -205,8 +207,8 @@ pub fn scope_description(scope: MetricScope) -> String {
   case scope {
     Business(business_id) -> "Business-level metric for " <> business_id
 
-    Client(business_id, client_id) ->
-      "Client-level metric for " <> business_id <> "/" <> client_id
+    Customer(business_id, customer_id) ->
+      "Client-level metric for " <> business_id <> "/" <> customer_id
   }
 }
 
@@ -214,7 +216,7 @@ pub fn scope_description(scope: MetricScope) -> String {
 pub fn get_business_id(scope: MetricScope) -> String {
   case scope {
     Business(business_id) -> business_id
-    Client(business_id, _) -> business_id
+    Customer(business_id, _) -> business_id
   }
 }
 
@@ -222,7 +224,7 @@ pub fn get_business_id(scope: MetricScope) -> String {
 pub fn is_business_scope(scope: MetricScope) -> Bool {
   case scope {
     Business(_) -> True
-    Client(_, _) -> False
+    Customer(_, _) -> False
   }
 }
 
@@ -230,7 +232,7 @@ pub fn is_business_scope(scope: MetricScope) -> Bool {
 pub fn is_client_scope(scope: MetricScope) -> Bool {
   case scope {
     Business(_) -> False
-    Client(_, _) -> True
+    Customer(_, _) -> True
   }
 }
 
@@ -338,8 +340,7 @@ fn default_supabase_behavior(metric_type: MetricType) -> Bool {
   case metric_type {
     Checkpoint -> False
     Reset -> False
-    StripeBilling -> True
-    // ✅ NEW: StripeBilling defaults to sending to Supabase for billing tracking
+    StripeBilling -> False
   }
 }
 
@@ -475,6 +476,7 @@ fn supabase_config_to_json(config: SupabaseConfig) -> json.Json {
     #("table_name", json.nullable(config.table_name, json.string)),
     #("retention_days", json.nullable(config.retention_days, json.int)),
     #("batch_interval", json.nullable(config.batch_interval, json.string)),
+    #("restore_on_startup", json.nullable(config.restore_on_startup, json.bool)),
   ])
 }
 
@@ -565,13 +567,58 @@ fn supabase_config_decoder() -> decode.Decoder(SupabaseConfig) {
     None,
     decode.optional(decode.string),
   )
+  use restore_on_startup <- decode.optional_field(
+    "restore_on_startup",
+    None,
+    decode.optional(decode.bool),
+  )
 
   decode.success(SupabaseConfig(
     enabled: enabled,
     table_name: table_name,
     retention_days: retention_days,
     batch_interval: batch_interval,
+    restore_on_startup: restore_on_startup,
   ))
+}
+
+/// Check if metric should restore from DB on startup
+pub fn should_restore_on_startup(
+  metric_type: MetricType,
+  metadata: Option(MetricMetadata),
+) -> Bool {
+  case metric_type {
+    // Checkpoint ALWAYS restores (that's its purpose)
+    Checkpoint -> True
+
+    // Reset NEVER restores (always starts fresh)
+    Reset -> False
+
+    // StripeBilling lets user decide (default: false for safety)
+    StripeBilling -> {
+      case metadata {
+        Some(meta) -> {
+          case meta.integrations {
+            Some(integrations) -> {
+              case integrations.supabase {
+                Some(config) -> {
+                  // User explicitly controls restoration
+                  case config.restore_on_startup {
+                    Some(restore) -> restore
+                    None -> False
+                    // DEFAULT: Safe mode (no restore)
+                  }
+                }
+                None -> False
+              }
+            }
+            None -> False
+          }
+        }
+        None -> False
+      }
+    }
+  }
 }
 
 fn stripe_config_decoder() -> decode.Decoder(StripeConfig) {
@@ -641,7 +688,13 @@ pub fn metadata_decoder() -> decode.Decoder(MetricMetadata) {
 /// Parse account_id into components for MetricBatch creation
 pub fn parse_account_id(account_id: String) -> #(String, Option(String), String) {
   case string.split_once(account_id, ":") {
-    Ok(#(client_id, _business_id)) -> #(account_id, Some(client_id), "client")
+    Ok(#(business_id, customer_id)) -> #(
+      business_id,
+      // Return the actual business_id
+      Some(customer_id),
+      // Return the actual customer_id  
+      "customer",
+    )
     Error(_) -> #(account_id, None, "business")
   }
 }

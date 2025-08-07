@@ -3,7 +3,6 @@
 
 import gleam/erlang/atom
 import gleam/float
-import gleam/string
 import logging
 
 /// Supported aggregation operations

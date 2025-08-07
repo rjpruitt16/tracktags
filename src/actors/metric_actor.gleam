@@ -234,93 +234,57 @@ pub fn start_link(
   }
 
   // Create the metric in ETS
-  let restored_value = case state.metric_type {
-    metric_types.Checkpoint -> {
-      case
-        metric_types.should_send_to_supabase(state.metric_type, state.metadata)
-      {
-        True -> {
+  let restored_value = case
+    metric_types.should_restore_on_startup(state.metric_type, state.metadata)
+  {
+    True -> {
+      // User wants restoration (Checkpoint always, StripeBilling if configured)
+      logging.log(
+        logging.Info,
+        "[MetricActor] 🔍 Restoring from Supabase: "
+          <> metric_name
+          <> " (type: "
+          <> metric_types.metric_type_to_string(state.metric_type)
+          <> ")",
+      )
+      case supabase_client.get_latest_metric_value(account_id, metric_name) {
+        Ok(value) -> {
           logging.log(
             logging.Info,
-            "[MetricActor] 🔍 Attempting to restore checkpoint from Supabase: "
-              <> metric_name,
+            "[MetricActor] ✅ Restored: " <> float.to_string(value),
           )
-          case
-            supabase_client.get_latest_metric_value(account_id, metric_name)
-          {
-            Ok(restored_value) -> {
-              logging.log(
-                logging.Info,
-                "[MetricActor] ✅ Restored from Supabase: "
-                  <> float.to_string(restored_value),
-              )
-              restored_value
-            }
-            Error(supabase_client.NotFound(_)) -> {
-              logging.log(
-                logging.Info,
-                "[MetricActor] 📋 No previous value in Supabase, using initial: "
-                  <> float.to_string(initial_value),
-              )
-              initial_value
-            }
-            Error(error) -> {
-              logging.log(
-                logging.Warning,
-                "[MetricActor] ⚠️ Supabase restore failed: "
-                  <> string.inspect(error)
-                  <> ", using initial value",
-              )
-              initial_value
-            }
-          }
+          value
         }
-        False -> {
+        Error(supabase_client.NotFound(_)) -> {
           logging.log(
             logging.Info,
-            "[MetricActor] 💰 Supabase disabled for this checkpoint (saving money!), using initial: "
+            "[MetricActor] 📋 No previous value, using initial: "
               <> float.to_string(initial_value),
           )
           initial_value
         }
-      }
-    }
-    metric_types.Reset -> {
-      logging.log(
-        logging.Info,
-        "[MetricActor] 🔄 Reset metric, using initial value: "
-          <> float.to_string(initial_value),
-      )
-      initial_value
-    }
-    metric_types.StripeBilling -> {
-      // ✅ NEW: StripeBilling acts like Reset for now
-      logging.log(
-        logging.Info,
-        "[MetricActor] 💳 StripeBilling metric - resetting after flush",
-      )
-      case
-        metric_store.reset_metric(
-          state.default_metric.account_id,
-          state.default_metric.metric_name,
-          state.initial_value,
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[MetricActor] ✅ StripeBilling reset successful",
-          )
-          initial_value
-        }
-        Error(e) -> {
+        Error(error) -> {
           logging.log(
             logging.Warning,
-            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
+            "[MetricActor] ⚠️ Restore failed: "
+              <> string.inspect(error)
+              <> ", using initial value",
           )
           initial_value
         }
       }
+    }
+    False -> {
+      // No restoration (Reset always, StripeBilling by default)
+      logging.log(
+        logging.Info,
+        "[MetricActor] 🚀 Starting fresh at "
+          <> float.to_string(initial_value)
+          <> " (type: "
+          <> metric_types.metric_type_to_string(state.metric_type)
+          <> ", restore_on_startup: false)",
+      )
+      initial_value
     }
   }
 
@@ -478,6 +442,42 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   )
 
   case message {
+    // Add handler in loop function
+    metric_types.GetMetricType(reply_to) -> {
+      // Send back our metric type
+      process.send(reply_to, state.metric_type)
+      actor.continue(state)
+    }
+
+    metric_types.ResetToInitialValue -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] Resetting "
+          <> state.default_metric.metric_name
+          <> " to 0.0",
+      )
+
+      // Reset in store
+      let _ =
+        metric_store.reset_metric(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+          0.0,
+        )
+
+      // Reset state
+      let reset_state =
+        State(
+          ..state,
+          default_metric: metric_types.Metric(
+            ..state.default_metric,
+            value: 0.0,
+          ),
+          last_flushed_value: 0.0,
+        )
+
+      actor.continue(reset_state)
+    }
     metric_types.RecordMetric(metric) -> {
       // Store in ETS instead of just state
       case
@@ -778,12 +778,12 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
           // No change
         }
         _ -> {
-          let #(business_id, client_id, scope) =
+          let #(business_id, customer_id, scope) =
             metric_types.parse_account_id(state.default_metric.account_id)
           let batch =
             metric_types.MetricBatch(
               business_id: business_id,
-              client_id: client_id,
+              customer_id: customer_id,
               metric_name: state.default_metric.metric_name,
               aggregated_value: diff,
               operation_count: 1,
@@ -831,10 +831,11 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
 
   // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
-    metric_types.Checkpoint -> {
+    metric_types.Checkpoint | metric_types.StripeBilling -> {
+      // Both accumulate until explicitly reset
       logging.log(
         logging.Info,
-        "[MetricActor] ✅ Checkpoint metric (keeping current value)",
+        "[MetricActor] ✅ Accumulating metric (keeping current value)",
       )
     }
     metric_types.Reset -> {
@@ -854,33 +855,7 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
           )
       }
     }
-    metric_types.StripeBilling -> {
-      // ✅ Same as Reset behavior for now
-      logging.log(
-        logging.Info,
-        "[MetricActor] 💳 StripeBilling reset to initial value",
-      )
-      case
-        metric_store.reset_metric(
-          state.default_metric.account_id,
-          state.default_metric.metric_name,
-          state.initial_value,
-        )
-      {
-        Ok(_) ->
-          logging.log(
-            logging.Info,
-            "[MetricActor] ✅ StripeBilling reset successful",
-          )
-        Error(e) ->
-          logging.log(
-            logging.Warning,
-            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
-          )
-      }
-    }
   }
-
   // ✅ Update state with new last_flushed_value
   actor.continue(
     State(
@@ -951,9 +926,22 @@ fn flush_metrics_and_get_state(state: State) -> State {
           state.last_flushed_value
         }
         _ -> {
-          // Parse the account_id to determine business_id, client_id, and scope
-          let #(business_id, client_id, scope) =
+          // Parse the account_id to determine business_id, customer_id, and scope
+          let #(business_id, customer_id, scope) =
             metric_types.parse_account_id(state.default_metric.account_id)
+
+          logging.log(
+            logging.Info,
+            "[MetricActor] 🔍 PARSED account_id='"
+              <> state.default_metric.account_id
+              <> "' -> business='"
+              <> business_id
+              <> "', customer='"
+              <> string.inspect(customer_id)
+              <> "', scope='"
+              <> scope
+              <> "'",
+          )
 
           // Check if we should flush immediately (same interval) or batch for later
           let supabase_batch_interval =
@@ -979,7 +967,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
               case
                 supabase_client.store_metric(
                   business_id,
-                  client_id,
+                  customer_id,
                   state.default_metric.metric_name,
                   float.to_string(diff),
                   metric_types.metric_type_to_string(state.metric_type),
@@ -1018,7 +1006,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
               let batch =
                 metric_types.MetricBatch(
                   business_id: business_id,
-                  client_id: client_id,
+                  customer_id: customer_id,
                   metric_name: state.default_metric.metric_name,
                   aggregated_value: diff,
                   operation_count: 1,
@@ -1066,10 +1054,11 @@ fn flush_metrics_and_get_state(state: State) -> State {
 
   // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
-    metric_types.Checkpoint -> {
+    metric_types.Checkpoint | metric_types.StripeBilling -> {
+      // Both accumulate until explicitly reset
       logging.log(
         logging.Info,
-        "[MetricActor] ✅ Checkpoint metric (keeping current value)",
+        "[MetricActor] ✅ Accumulating metric (keeping current value)",
       )
     }
     metric_types.Reset -> {
@@ -1089,33 +1078,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
           )
       }
     }
-    metric_types.StripeBilling -> {
-      // ✅ Same as Reset behavior for now
-      logging.log(
-        logging.Info,
-        "[MetricActor] 💳 StripeBilling reset to initial value",
-      )
-      case
-        metric_store.reset_metric(
-          state.default_metric.account_id,
-          state.default_metric.metric_name,
-          state.initial_value,
-        )
-      {
-        Ok(_) ->
-          logging.log(
-            logging.Info,
-            "[MetricActor] ✅ StripeBilling reset successful",
-          )
-        Error(e) ->
-          logging.log(
-            logging.Warning,
-            "[MetricActor] ⚠️ StripeBilling reset failed: " <> string.inspect(e),
-          )
-      }
-    }
   }
-
   // ✅ Return the updated state
   State(
     ..state,

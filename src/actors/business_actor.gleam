@@ -1,5 +1,5 @@
 // src/actor/business_actors_actor.gleam 
-import actors/client_actor
+import actors/customer_actor
 import actors/metric_actor
 import gleam/dict.{type Dict}
 import gleam/dynamic
@@ -17,7 +17,7 @@ import glixir/supervisor
 import logging
 import storage/metric_store
 import types/business_types
-import types/client_types
+import types/customer_types
 import types/metric_types
 import utils/utils
 
@@ -41,9 +41,9 @@ pub type State {
       ),
       process.Subject(metric_types.Message),
     ),
-    clients_supervisor: glixir.DynamicSupervisor(
+    customers_supervisor: glixir.DynamicSupervisor(
       #(String, String),
-      process.Subject(client_types.Message),
+      process.Subject(customer_types.Message),
     ),
     last_accessed: Int,
     user_cleanup_threshold: Int,
@@ -137,7 +137,7 @@ fn handle_message(
 
   case message {
     business_types.RecordClientMetric(
-      client_id,
+      customer_id,
       metric_name,
       initial_value,
       tick_type,
@@ -155,24 +155,24 @@ fn handle_message(
         "[BusinessActor] Processing client metric: "
           <> updated_state.account_id
           <> "/client:"
-          <> client_id
+          <> customer_id
           <> "/"
           <> metric_name,
       )
 
       case
-        client_types.lookup_client_subject(updated_state.account_id, client_id)
+        customer_types.lookup_client_subject(updated_state.account_id, customer_id)
       {
         Ok(client_subject) -> {
           logging.log(
             logging.Info,
             "[BusinessActor] ✅ Found existing client, sending metric: "
-              <> client_id,
+              <> customer_id,
           )
 
           process.send(
             client_subject,
-            client_types.RecordMetric(
+            customer_types.RecordMetric(
               metric_name: metric_name,
               initial_value: initial_value,
               tick_type: tick_type,
@@ -191,26 +191,26 @@ fn handle_message(
         Error(_) -> {
           logging.log(
             logging.Info,
-            "[BusinessActor] Client not found, spawning: " <> client_id,
+            "[BusinessActor] Client not found, spawning: " <> customer_id,
           )
 
           case
             get_or_spawn_client_simple(
-              supervisor: updated_state.clients_supervisor,
+              supervisor: updated_state.customers_supervisor,
               business_id: updated_state.account_id,
-              client_id: client_id,
+              customer_id: customer_id,
             )
           {
             Ok(client_subject) -> {
               logging.log(
                 logging.Info,
                 "[BusinessActor] ✅ Client spawned, sending metric to mailbox: "
-                  <> client_id,
+                  <> customer_id,
               )
 
               process.send(
                 client_subject,
-                client_types.RecordMetric(
+                customer_types.RecordMetric(
                   metric_name: metric_name,
                   initial_value: initial_value,
                   tick_type: tick_type,
@@ -527,11 +527,11 @@ pub fn start_link(
     }),
   )
 
-  use clients_supervisor <- result.try(
-    glixir.start_dynamic_supervisor_named_safe("clients_" <> account_id)
+  use customers_supervisor <- result.try(
+    glixir.start_dynamic_supervisor_named_safe("customers_" <> account_id)
     |> result.map_error(fn(e) {
       actor.InitFailed(
-        "Failed to start clients supervisor: " <> string.inspect(e),
+        "Failed to start customers supervisor: " <> string.inspect(e),
       )
     }),
   )
@@ -546,7 +546,7 @@ pub fn start_link(
     State(
       account_id: account_id,
       metrics_supervisor: metrics_supervisor,
-      clients_supervisor: clients_supervisor,
+      customers_supervisor: customers_supervisor,
       last_accessed: current_time,
       user_cleanup_threshold: 3600,
     )
@@ -649,19 +649,19 @@ pub fn handle_business_cleanup_tick(
 fn get_or_spawn_client_simple(
   supervisor supervisor: glixir.DynamicSupervisor(
     #(String, String),
-    process.Subject(client_types.Message),
+    process.Subject(customer_types.Message),
   ),
   business_id business_id: String,
-  client_id client_id: String,
-) -> Result(process.Subject(client_types.Message), String) {
-  case client_types.lookup_client_subject(business_id, client_id) {
+  customer_id customer_id: String,
+) -> Result(process.Subject(customer_types.Message), String) {
+  case customer_types.lookup_client_subject(business_id, customer_id) {
     Ok(client_subject) -> {
       logging.log(
         logging.Debug,
         "[BusinessActor] ✅ Found existing client: "
           <> business_id
           <> "/"
-          <> client_id,
+          <> customer_id,
       )
       Ok(client_subject)
     }
@@ -671,15 +671,15 @@ fn get_or_spawn_client_simple(
         "[BusinessActor] Spawning new client: "
           <> business_id
           <> "/"
-          <> client_id,
+          <> customer_id,
       )
 
-      let client_spec = client_actor.start(business_id, client_id)
+      let client_spec = customer_actor.start(business_id, customer_id)
       case
         glixir.start_dynamic_child(
           supervisor,
           client_spec,
-          client_actor.encode_client_args,
+          customer_actor.encode_client_args,
           fn(_) { Ok(process.new_subject()) },
         )
       {
@@ -689,19 +689,19 @@ fn get_or_spawn_client_simple(
             "[BusinessActor] ✅ Client spawned: "
               <> business_id
               <> "/"
-              <> client_id
+              <> customer_id
               <> " PID: "
               <> string.inspect(child_pid),
           )
 
-          case client_types.lookup_client_subject(business_id, client_id) {
+          case customer_types.lookup_client_subject(business_id, customer_id) {
             Ok(client_subject) -> {
               logging.log(
                 logging.Info,
                 "[BusinessActor] ✅ Found newly spawned client: "
                   <> business_id
                   <> "/"
-                  <> client_id,
+                  <> customer_id,
               )
               Ok(client_subject)
             }
@@ -723,7 +723,7 @@ fn get_or_spawn_client_simple(
             "Failed to spawn client "
             <> business_id
             <> "/"
-            <> client_id
+            <> customer_id
             <> ": "
             <> error,
           )

@@ -24,7 +24,7 @@ pub type PlanLimitRequest {
     breach_operator: String,
     breach_action: String,
     webhook_urls: option.Option(String),
-    client_id: option.Option(String),
+    customer_id: option.Option(String),
   )
 }
 
@@ -137,8 +137,8 @@ fn plan_limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
     decode.optional(decode.string),
   )
 
-  use client_id <- decode.optional_field(
-    "client_id",
+  use customer_id <- decode.optional_field(
+    "customer_id",
     None,
     decode.optional(decode.string),
   )
@@ -150,7 +150,7 @@ fn plan_limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
     breach_operator: breach_operator,
     breach_action: breach_action,
     webhook_urls: webhook_urls,
-    client_id: client_id,
+    customer_id: customer_id,
   ))
 }
 
@@ -600,7 +600,7 @@ fn process_update_plan_limit(
       req.breach_operator,
       req.breach_action,
       req.webhook_urls,
-      req.client_id,
+      req.customer_id,
     )
   {
     Ok(limit) -> {

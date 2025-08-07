@@ -22,6 +22,7 @@ pub type StripeEventType {
   CustomerSubscriptionUpdated
   CustomerSubscriptionDeleted
   InvoicePaymentFailed
+  InvoiceCreated
   UnknownEvent(String)
 }
 
@@ -55,6 +56,59 @@ pub fn handle_stripe_webhook(req: Request) -> Response {
   case req.method {
     http.Post -> process_webhook(req)
     _ -> wisp.method_not_allowed([http.Post])
+  }
+}
+
+// Add this new function
+fn handle_invoice_created(event: StripeEvent) -> WebhookResult {
+  case extract_customer_id(event.data) {
+    Ok(stripe_customer_id) -> {
+      logging.log(
+        logging.Info,
+        "[StripeHandler] 💳 Invoice created for Stripe customer: "
+          <> stripe_customer_id,
+      )
+
+      // Look up OUR customer by Stripe's customer ID
+      case supabase_client.get_customer_by_stripe_customer(stripe_customer_id) {
+        Ok(customer) -> {
+          // Reset StripeBilling metrics for THIS customer
+          case
+            supabase_client.reset_customer_stripe_billing_metrics(
+              customer.business_id,
+              customer.customer_id,
+            )
+          {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] ✅ Reset billing metrics for customer: "
+                  <> customer.customer_id,
+              )
+              Success("Billing cycle reset for: " <> customer.customer_id)
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Error,
+                "[StripeHandler] ❌ Failed to reset metrics: "
+                  <> string.inspect(error),
+              )
+              ProcessingError("Reset failed: " <> string.inspect(error))
+            }
+          }
+        }
+        Error(_) -> {
+          // No customer found - they might not be using metered billing
+          logging.log(
+            logging.Info,
+            "[StripeHandler] No customer found for Stripe ID: "
+              <> stripe_customer_id,
+          )
+          Success("No metered billing customer for: " <> stripe_customer_id)
+        }
+      }
+    }
+    Error(error) -> ProcessingError("Failed to extract customer: " <> error)
   }
 }
 
@@ -264,6 +318,7 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
     "customer.subscription.updated" -> CustomerSubscriptionUpdated
     "customer.subscription.deleted" -> CustomerSubscriptionDeleted
     "invoice.payment_failed" -> InvoicePaymentFailed
+    "invoice.created" -> InvoiceCreated
     unknown -> UnknownEvent(unknown)
   }
   decode.success(StripeEvent(id, event_type, data, created))
@@ -283,6 +338,7 @@ fn process_stripe_event(event: StripeEvent) -> WebhookResult {
 
     CustomerSubscriptionDeleted -> handle_subscription_deleted(event)
     InvoicePaymentFailed -> handle_payment_failed(event)
+    InvoiceCreated -> handle_invoice_created(event)
     UnknownEvent(type_name) -> {
       logging.log(
         logging.Info,
@@ -293,7 +349,7 @@ fn process_stripe_event(event: StripeEvent) -> WebhookResult {
   }
 }
 
-/// Handle successful payment - activate/upgrade service
+// Handle successful payment - activate/upgrade service
 fn handle_payment_succeeded(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)

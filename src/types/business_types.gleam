@@ -21,7 +21,7 @@ pub type Message {
     plan_breach_action: String,
   )
   RecordClientMetric(
-    client_id: String,
+    customer_id: String,
     metric_name: String,
     initial_value: Float,
     tick_type: String,

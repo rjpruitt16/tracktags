@@ -32,9 +32,9 @@ pub type ApplicationMessage {
     plan_limit_operator: String,
     plan_breach_action: String,
   )
-  SendMetricToClient(
+  SendMetricToCustomer(
     business_id: String,
-    client_id: String,
+    customer_id: String,
     metric_name: String,
     tick_type: String,
     operation: String,
@@ -155,9 +155,9 @@ fn handle_application_message(
   )
 
   case message {
-    SendMetricToClient(
+    SendMetricToCustomer(
       business_id,
-      client_id,
+      customer_id,
       metric_name,
       tick_type,
       operation,
@@ -176,7 +176,7 @@ fn handle_application_message(
           process.send(
             business_subject,
             business_types.RecordClientMetric(
-              client_id,
+              customer_id,
               metric_name,
               initial_value,
               tick_type,
@@ -202,7 +202,7 @@ fn handle_application_message(
               process.send(
                 business_subject,
                 business_types.RecordClientMetric(
-                  client_id,
+                  customer_id,
                   metric_name,
                   initial_value,
                   tick_type,

@@ -3,14 +3,12 @@
 import gleam/float
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import logging
 import storage/metric_store
-import types/metric_types.{
-  type MetricBatch, type MetricMode, type SimpleOperation,
-}
+import types/metric_types.{type MetricBatch, type SimpleOperation}
 import utils/utils
 
 // ============================================================================
@@ -51,8 +49,16 @@ pub fn add_batch(
   tick_type: String,
   metric_batch: MetricBatch,
 ) -> Result(Nil, BatchStoreError) {
-  let metric_key = create_metric_key(metric_batch)
-  let composite_key = tick_type <> "|" <> metric_key
+  let composite_key =
+    create_batch_key(
+      tick_type,
+      metric_batch.business_id,
+      metric_batch.customer_id,
+      metric_batch.metric_name,
+      metric_batch.metric_type,
+      metric_batch.scope,
+      // NOW INCLUDED!
+    )
 
   logging.log(
     logging.Info,
@@ -255,32 +261,25 @@ fn parse_composite_key(
   composite_key: String,
   aggregated_value: Float,
 ) -> Result(MetricBatch, String) {
-  // Parse: "tick_15s|business_id|client_id|metric_name|metric_type"
-  case string.split(composite_key, "|") {
-    [tick_type, business_id, client_id_part, metric_name, metric_type] -> {
-      let client_id = case client_id_part {
-        "business_level" -> None
-        actual_client_id -> Some(actual_client_id)
-      }
-
+  case parse_batch_key(composite_key) {
+    Ok(#(tick_type, business_id, customer_id, metric_name, metric_type, scope)) -> {
       Ok(metric_types.MetricBatch(
         business_id: business_id,
-        client_id: client_id,
+        customer_id: customer_id,
         metric_name: metric_name,
         aggregated_value: aggregated_value,
         operation_count: 1,
-        // We don't track this separately for now
         metric_type: metric_type,
         metric_mode: metric_types.Simple(metric_types.Sum),
-        // Default mode
         window_start: utils.current_timestamp(),
         window_end: utils.current_timestamp(),
         flush_interval: tick_type,
-        scope: "business",
+        scope: scope,
+        // NOW FROM THE KEY!
         adapters: None,
       ))
     }
-    _ -> Error("Invalid composite key format: " <> composite_key)
+    Error(e) -> Error(e)
   }
 }
 
@@ -346,16 +345,47 @@ fn handle_simple_operation(
   }
 }
 
-/// Create a unique key for a metric batch (without tick_type prefix)
-fn create_metric_key(batch: MetricBatch) -> String {
-  batch.business_id
-  <> "|"
-  <> case batch.client_id {
+/// Create a composite key for batch storage
+/// Format: "tick_type|business_id|customer_id|metric_name|metric_type|scope"
+pub fn create_batch_key(
+  tick_type: String,
+  business_id: String,
+  customer_id: Option(String),
+  metric_name: String,
+  metric_type: String,
+  scope: String,
+) -> String {
+  let customer_part = case customer_id {
     Some(cid) -> cid
-    None -> "business_level"
+    None -> "none"
   }
+
+  tick_type
   <> "|"
-  <> batch.metric_name
+  <> business_id
   <> "|"
-  <> batch.metric_type
+  <> customer_part
+  <> "|"
+  <> metric_name
+  <> "|"
+  <> metric_type
+  <> "|"
+  <> scope
+  // NOW INCLUDED!
+}
+
+/// Parse a composite key back to its components
+pub fn parse_batch_key(
+  key: String,
+) -> Result(#(String, String, Option(String), String, String, String), String) {
+  case string.split(key, "|") {
+    [tick_type, business_id, customer_part, metric_name, metric_type, scope] -> {
+      let customer_id = case customer_part {
+        "none" -> None
+        cid -> Some(cid)
+      }
+      Ok(#(tick_type, business_id, customer_id, metric_name, metric_type, scope))
+    }
+    _ -> Error("Invalid batch key format: " <> key)
+  }
 }

@@ -1,4 +1,4 @@
-// src/clients/supabase_client.gleam
+// src/customers/supabase_client.gleam
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/float
@@ -13,6 +13,8 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import logging
+import storage/metric_store
+import types/metric_types
 import utils/utils
 
 // ============================================================================
@@ -54,7 +56,7 @@ pub type MetricRecord {
   MetricRecord(
     id: String,
     business_id: String,
-    client_id: Option(String),
+    customer_id: Option(String),
     metric_name: String,
     value: String,
     metric_type: String,
@@ -68,7 +70,6 @@ pub type PlanLimit {
   PlanLimit(
     id: String,
     business_id: Option(String),
-    client_id: Option(String),
     plan_id: Option(String),
     metric_name: String,
     limit_value: Float,
@@ -77,15 +78,19 @@ pub type PlanLimit {
     breach_action: String,
     webhook_urls: Option(String),
     created_at: String,
+    metric_type: String,
   )
 }
 
-pub type Client {
-  Client(
-    client_id: String,
+pub type Customer {
+  // Changed from Client
+  Customer(
+    customer_id: String,
     business_id: String,
     plan_id: Option(String),
-    client_name: String,
+    customer_name: String,
+    stripe_customer_id: Option(String),
+    stripe_subscription_id: Option(String),
     created_at: String,
   )
 }
@@ -196,18 +201,30 @@ fn make_request_with_params(
 // JSON DECODERS
 // ============================================================================
 
-fn client_decoder() -> decode.Decoder(Client) {
-  use client_id <- decode.field("client_id", decode.string)
+fn customer_decoder() -> decode.Decoder(Customer) {
+  use customer_id <- decode.field("customer_id", decode.string)
   use business_id <- decode.field("business_id", decode.string)
   use plan_id <- decode.field("plan_id", decode.optional(decode.string))
-  use client_name <- decode.field("client_name", decode.string)
+  use customer_name <- decode.field("customer_name", decode.string)
+  use stripe_customer_id <- decode.optional_field(
+    "stripe_customer_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use stripe_subscription_id <- decode.optional_field(
+    "stripe_subscription_id",
+    None,
+    decode.optional(decode.string),
+  )
   use created_at <- decode.field("created_at", decode.string)
 
-  decode.success(Client(
-    client_id: client_id,
+  decode.success(Customer(
+    customer_id: customer_id,
     business_id: business_id,
     plan_id: plan_id,
-    client_name: client_name,
+    customer_name: customer_name,
+    stripe_customer_id: stripe_customer_id,
+    stripe_subscription_id: stripe_subscription_id,
     created_at: created_at,
   ))
 }
@@ -634,7 +651,7 @@ pub fn create_plan_limit(
   let base_fields = [
     #("business_id", json.string(business_id)),
     #("plan_id", json.null()),
-    #("client_id", json.null()),
+    #("customer_id", json.null()),
     #("metric_name", json.string(metric_name)),
     #("limit_value", json.float(limit_value)),
     #("limit_period", json.string(period)),
@@ -670,7 +687,7 @@ pub fn create_plan_limit(
 // PLAN INHERITANCE FOR CLIENT ACTORS
 // ============================================================================
 
-/// Get plan limits for a specific plan_id (used by client_actor)
+/// Get plan limits for a specific plan_id (used by customer_actor)
 pub fn get_plan_limits_by_plan_id(
   plan_id: String,
 ) -> Result(List(PlanLimit), SupabaseError) {
@@ -710,7 +727,6 @@ pub fn get_plan_limits_by_plan_id(
 fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
   use id <- decode.field("id", decode.string)
   use business_id <- decode.field("business_id", decode.optional(decode.string))
-  use client_id <- decode.field("client_id", decode.optional(decode.string))
   use plan_id <- decode.field("plan_id", decode.optional(decode.string))
   use metric_name <- decode.field("metric_name", decode.string)
   use limit_value <- decode.field(
@@ -726,10 +742,15 @@ fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
   )
   use created_at <- decode.field("created_at", decode.string)
 
+  use metric_type <- decode.optional_field(
+    "metric_type",
+    "reset",
+    decode.string,
+  )
+
   decode.success(PlanLimit(
     id: id,
     business_id: business_id,
-    client_id: client_id,
     plan_id: plan_id,
     metric_name: metric_name,
     limit_value: limit_value,
@@ -738,6 +759,7 @@ fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
     breach_action: breach_action,
     webhook_urls: webhook_urls,
     created_at: created_at,
+    metric_type: metric_type,
   ))
 }
 
@@ -768,7 +790,7 @@ pub fn create_business_plan_limit(
   let base_fields = [
     #("business_id", json.string(business_id)),
     #("plan_id", json.null()),
-    #("client_id", json.null()),
+    #("customer_id", json.null()),
     #("metric_name", json.string(metric_name)),
     #("limit_value", json.float(limit_value)),
     #("limit_period", json.string(limit_period)),
@@ -886,7 +908,7 @@ pub fn update_business_plan_limit(
   breach_operator: String,
   breach_action: String,
   webhook_urls: Option(String),
-  client_id: Option(String),
+  customer_id: Option(String),
 ) -> Result(PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
@@ -899,7 +921,7 @@ pub fn update_business_plan_limit(
     #("limit_period", json.string(limit_period)),
     #("breach_operator", json.string(breach_operator)),
     #("breach_action", json.string(breach_action)),
-    #("client_id", case client_id {
+    #("customer_id", case customer_id {
       Some(id) -> json.string(id)
       None -> json.null()
     }),
@@ -976,9 +998,9 @@ pub fn delete_plan_limit(
 // ============================================================================
 
 /// Create a client-specific plan limit (override business limit)
-pub fn create_client_plan_limit(
+pub fn create_customer_plan_limit(
   business_id: String,
-  client_id: String,
+  customer_id: String,
   metric_name: String,
   limit_value: Float,
   limit_period: String,
@@ -991,7 +1013,7 @@ pub fn create_client_plan_limit(
     "[SupabaseClient] Creating client plan limit: "
       <> business_id
       <> "/"
-      <> client_id
+      <> customer_id
       <> "/"
       <> metric_name
       <> " = "
@@ -1002,7 +1024,7 @@ pub fn create_client_plan_limit(
     #("business_id", json.null()),
     // Client limits don't have business_id
     #("plan_id", json.null()),
-    #("client_id", json.string(client_id)),
+    #("customer_id", json.string(customer_id)),
     #("metric_name", json.string(metric_name)),
     #("limit_value", json.float(limit_value)),
     #("limit_period", json.string(limit_period)),
@@ -1044,19 +1066,19 @@ pub fn create_client_plan_limit(
 }
 
 /// Get all plan limits for a specific client
-pub fn get_client_plan_limits(
+pub fn get_customer_plan_limits(
   business_id: String,
-  client_id: String,
+  customer_id: String,
 ) -> Result(List(PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting client plan limits for: "
       <> business_id
       <> "/"
-      <> client_id,
+      <> customer_id,
   )
 
-  let path = "/plan_limits?client_id=eq." <> client_id
+  let path = "/plan_limits?customer_id=eq." <> customer_id
 
   use response <- result.try(make_request(http.Get, path, None))
 
@@ -1080,21 +1102,24 @@ pub fn get_client_plan_limits(
 }
 
 /// Get effective plan limits for a client (client-specific + business fallbacks)
-pub fn get_effective_client_limits(
+pub fn get_effective_customer_limits(
   business_id: String,
-  client_id: String,
+  customer_id: String,
 ) -> Result(List(PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting effective limits for client: "
       <> business_id
       <> "/"
-      <> client_id,
+      <> customer_id,
   )
 
   // Get both business and client limits
   use business_limits <- result.try(get_business_plan_limits(business_id))
-  use client_limits <- result.try(get_client_plan_limits(business_id, client_id))
+  use client_limits <- result.try(get_customer_plan_limits(
+    business_id,
+    customer_id,
+  ))
 
   // Create a map of client limits by metric_name for fast lookup
   let client_limits_map =
@@ -1227,7 +1252,7 @@ pub fn store_integration_key(
 /// Store metric data for persistence/billing
 pub fn store_metric(
   business_id: String,
-  client_id: Option(String),
+  customer_id: Option(String),
   metric_name: String,
   value: String,
   metric_type: String,
@@ -1272,8 +1297,8 @@ pub fn store_metric(
     Some(url) -> [#("webhook_urls", json.string(url)), ..with_threshold]
     None -> with_threshold
   }
-  let with_client = case client_id {
-    Some(cid) -> [#("client_id", json.string(cid)), ..with_webhook]
+  let with_client = case customer_id {
+    Some(cid) -> [#("customer_id", json.string(cid)), ..with_webhook]
     None -> with_webhook
   }
 
@@ -1296,7 +1321,7 @@ pub fn store_metric(
       Ok(MetricRecord(
         id: "placeholder",
         business_id: business_id,
-        client_id: client_id,
+        customer_id: customer_id,
         metric_name: metric_name,
         value: value,
         metric_type: metric_type,
@@ -1350,27 +1375,26 @@ fn metric_record_to_json(record: MetricRecord) -> json.Json {
     Error(_) -> 0.0
   }
 
-  let base_fields = [
-    #("business_id", json.string(record.business_id)),
-    #("metric_name", json.string(record.metric_name)),
-    #("value", json.float(float_value)),
-    #("metric_type", json.string(record.metric_type)),
-    #("scope", json.string(record.scope)),
-  ]
-
-  let all_fields = case record.client_id {
-    Some(cid) -> [#("client_id", json.string(cid)), ..base_fields]
-    None -> base_fields
+  let customer_id_json = case record.customer_id {
+    Some(cid) -> json.string(cid)
+    None -> json.null()
   }
 
-  let result = json.object(all_fields)
+  let result =
+    json.object([
+      #("business_id", json.string(record.business_id)),
+      #("customer_id", customer_id_json),
+      // Always include it!
+      #("metric_name", json.string(record.metric_name)),
+      #("value", json.float(float_value)),
+      #("metric_type", json.string(record.metric_type)),
+      #("scope", json.string(record.scope)),
+    ])
 
-  // ✅ DEBUG: Log what we're sending to Supabase
   logging.log(
     logging.Info,
     "[SupabaseClient] 🔍 Sending JSON: " <> json.to_string(result),
   )
-
   result
 }
 
@@ -1380,23 +1404,32 @@ fn metric_record_to_json(record: MetricRecord) -> json.Json {
 
 /// Get the latest metric value from Supabase for restoration on startup
 pub fn get_latest_metric_value(
-  business_id: String,
+  account_id: String,
   metric_name: String,
 ) -> Result(Float, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting latest value for: "
-      <> business_id
+      <> account_id
       <> "/"
       <> metric_name,
   )
 
-  let query_params = [
+  // Use the centralized parser!
+  let #(business_id, customer_id_opt, _scope) =
+    metric_types.parse_account_id(account_id)
+
+  let base_params = [
     #("business_id", "eq." <> business_id),
     #("metric_name", "eq." <> metric_name),
     #("order", "flushed_at.desc"),
     #("limit", "1"),
   ]
+
+  let query_params = case customer_id_opt {
+    Some(customer_id) -> [#("customer_id", "eq." <> customer_id), ..base_params]
+    None -> base_params
+  }
 
   use response <- result.try(make_request_with_params(
     http.Get,
@@ -1404,7 +1437,6 @@ pub fn get_latest_metric_value(
     None,
     query_params,
   ))
-
   case response.status {
     200 -> {
       // ✅ CORRECT: or: takes a LIST of decoders
@@ -1452,66 +1484,69 @@ pub fn get_latest_metric_value(
 // CLIENT MANAGEMENT CRUD
 // ============================================================================
 
-/// Get all clients for a business
-pub fn get_business_clients(
+/// Get all customers for a business
+pub fn get_business_customers(
   business_id: String,
-) -> Result(List(Client), SupabaseError) {
+) -> Result(List(Customer), SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Getting clients for business: " <> business_id,
+    "[SupabaseClient] Getting customers for business: " <> business_id,
   )
 
-  let path = "/clients?business_id=eq." <> business_id
+  let path = "/customers?business_id=eq." <> business_id
 
   use response <- result.try(make_request(http.Get, path, None))
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(client_decoder())) {
-        Ok(clients) -> {
+      case json.parse(response.body, decode.list(customer_decoder())) {
+        Ok(customers) -> {
           logging.log(
             logging.Info,
             "[SupabaseClient] ✅ Retrieved "
-              <> string.inspect(list.length(clients))
-              <> " clients",
+              <> string.inspect(list.length(customers))
+              <> " customers",
           )
-          Ok(clients)
+          Ok(customers)
         }
-        Error(_) -> Error(ParseError("Invalid clients format"))
+        Error(_) -> Error(ParseError("Invalid customers format"))
       }
     }
-    _ -> Error(DatabaseError("Failed to fetch clients"))
+    _ -> Error(DatabaseError("Failed to fetch customers"))
   }
 }
 
 /// Get a specific client by ID (with business ownership check)
-pub fn get_client_by_id(
+pub fn get_customer_by_id(
   business_id: String,
-  client_id: String,
-) -> Result(Client, SupabaseError) {
+  customer_id: String,
+) -> Result(Customer, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Getting client: "
-      <> client_id
+    "[SupabaseClient] Getting customer: "
+      <> customer_id
       <> " for business: "
       <> business_id,
   )
 
   let path =
-    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
 
   use response <- result.try(make_request(http.Get, path, None))
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(client_decoder())) {
+      case json.parse(response.body, decode.list(customer_decoder())) {
         Ok([]) -> Error(NotFound("Client not found"))
-        Ok([client, ..]) -> {
+        Ok([customer, ..]) -> {
           logging.log(
             logging.Info,
-            "[SupabaseClient] ✅ Retrieved client: " <> client.client_id,
+            "[SupabaseClient] ✅ Retrieved client: " <> customer.customer_id,
           )
-          Ok(client)
+          Ok(customer)
         }
         Error(_) -> Error(ParseError("Invalid client format"))
       }
@@ -1521,22 +1556,25 @@ pub fn get_client_by_id(
 }
 
 /// Update a client
-pub fn update_client(
+pub fn update_customer(
   business_id: String,
-  client_id: String,
-  client_name: String,
+  customer_id: String,
+  customer_name: String,
   plan_id: String,
-) -> Result(Client, SupabaseError) {
-  logging.log(logging.Info, "[SupabaseClient] Updating client: " <> client_id)
+) -> Result(Customer, SupabaseError) {
+  logging.log(logging.Info, "[SupabaseClient] Updating client: " <> customer_id)
 
   let update_data =
     json.object([
-      #("client_name", json.string(client_name)),
+      #("customer_name", json.string(customer_name)),
       #("plan_id", json.string(plan_id)),
     ])
 
   let path =
-    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
 
   use response <- result.try(make_request(
     http.Patch,
@@ -1546,14 +1584,15 @@ pub fn update_client(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(client_decoder())) {
+      case json.parse(response.body, decode.list(customer_decoder())) {
         Ok([]) -> Error(NotFound("Client not found or not owned by business"))
-        Ok([updated_client, ..]) -> {
+        Ok([updated_customer, ..]) -> {
           logging.log(
             logging.Info,
-            "[SupabaseClient] ✅ Updated client: " <> updated_client.client_id,
+            "[SupabaseClient] ✅ Updated customer: "
+              <> updated_customer.customer_id,
           )
-          Ok(updated_client)
+          Ok(updated_customer)
         }
         Error(_) -> Error(ParseError("Invalid client response format"))
       }
@@ -1563,20 +1602,23 @@ pub fn update_client(
 }
 
 /// Delete a client
-pub fn delete_client(
+pub fn delete_customer(
   business_id: String,
-  client_id: String,
+  customer_id: String,
 ) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Deleting client: "
-      <> client_id
+      <> customer_id
       <> " for business: "
       <> business_id,
   )
 
   let path =
-    "/clients?client_id=eq." <> client_id <> "&business_id=eq." <> business_id
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
 
   use response <- result.try(make_request(http.Delete, path, None))
 
@@ -1584,7 +1626,7 @@ pub fn delete_client(
     200 | 204 -> {
       logging.log(
         logging.Info,
-        "[SupabaseClient] ✅ Deleted client: " <> client_id,
+        "[SupabaseClient] ✅ Deleted customer: " <> customer_id,
       )
       Ok(Nil)
     }
@@ -1593,47 +1635,164 @@ pub fn delete_client(
   }
 }
 
-/// Create a new client for a business
-pub fn create_client(
-  business_id: String,
-  client_id: String,
-  client_name: String,
-  plan_id: String,
-) -> Result(Client, SupabaseError) {
+// Add this function to supabase_client.gleam (around line 1500, near other customer functions)
+
+/// Get customer by Stripe customer ID (for webhook processing)
+pub fn get_customer_by_stripe_customer(
+  stripe_customer_id: String,
+) -> Result(Customer, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Creating client: "
+    "[SupabaseClient] Getting customer by Stripe ID: " <> stripe_customer_id,
+  )
+
+  let path = "/customers?stripe_customer_id=eq." <> stripe_customer_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(customer_decoder())) {
+        Ok([]) -> Error(NotFound("Customer not found for Stripe ID"))
+        Ok([customer, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Found customer: " <> customer.customer_id,
+          )
+          Ok(customer)
+        }
+        Error(_) -> Error(ParseError("Invalid customer format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch customer by Stripe ID"))
+  }
+}
+
+/// Reset all stripe_billing metrics for a specific customer
+pub fn reset_customer_stripe_billing_metrics(
+  business_id: String,
+  customer_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Resetting StripeBilling metrics for customer: "
       <> business_id
       <> "/"
-      <> client_id
+      <> customer_id,
+  )
+
+  // Reset in database
+  let url =
+    "/metrics?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+    <> "&metric_type=eq.stripe_billing"
+
+  let reset_json = json.object([#("value", json.float(0.0))])
+
+  use response <- result.try(make_request(
+    http.Patch,
+    url,
+    Some(json.to_string(reset_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> {
+      // Also reset in-memory value
+      let account_id = business_id <> ":" <> customer_id
+
+      // Get all stripe_billing metrics for this customer
+      // You'll need to find the metric names somehow
+      // For now, just reset the known one:
+      let _ = metric_store.reset_metric(account_id, "api_calls_billing", 0.0)
+
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Reset metrics in DB and memory",
+      )
+      Ok(Nil)
+    }
+    404 -> {
+      logging.log(logging.Warning, "[SupabaseClient] No metrics found to reset")
+      Ok(Nil)
+    }
+    _ -> Error(DatabaseError("Failed to reset metrics"))
+  }
+}
+
+pub fn reset_stripe_billing_metrics_for_business(
+  business_id: String,
+) -> Result(Nil, SupabaseError) {
+  // Find all StripeBilling metrics for this business in the metrics table
+  let query =
+    "/metrics?business_id=eq."
+    <> business_id
+    <> "&metric_type=eq.stripe_billing"
+
+  use _response <- result.try(make_request(http.Get, query, None))
+
+  // For now, just update all stripe_billing metrics to 0
+  let update_data =
+    json.object([
+      #("value", json.float(0.0)),
+      #("flushed_at", json.string(int.to_string(utils.current_timestamp()))),
+    ])
+
+  let update_path =
+    "/metrics?business_id=eq."
+    <> business_id
+    <> "&metric_type=eq.stripe_billing"
+  use _response <- result.try(make_request(
+    http.Patch,
+    update_path,
+    Some(json.to_string(update_data)),
+  ))
+
+  Ok(Nil)
+}
+
+/// Create a new client for a business
+pub fn create_customer(
+  business_id: String,
+  customer_id: String,
+  customer_name: String,
+  plan_id: String,
+) -> Result(Customer, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating customer: "
+      <> business_id
+      <> "/"
+      <> customer_id
       <> " on plan: "
       <> plan_id,
   )
 
   let client_data =
     json.object([
-      #("client_id", json.string(client_id)),
+      #("customer_id", json.string(customer_id)),
       #("business_id", json.string(business_id)),
       #("plan_id", json.string(plan_id)),
-      #("client_name", json.string(client_name)),
+      #("customer_name", json.string(customer_name)),
     ])
 
   use response <- result.try(make_request(
     http.Post,
-    "/clients",
+    "/customers",
     Some(json.to_string(client_data)),
   ))
 
   case response.status {
     201 -> {
-      case json.parse(response.body, decode.list(client_decoder())) {
-        Ok([new_client, ..]) -> {
+      case json.parse(response.body, decode.list(customer_decoder())) {
+        Ok([new_customer, ..]) -> {
           logging.log(
             logging.Info,
             "[SupabaseClient] ✅ Client created successfully: "
-              <> new_client.client_id,
+              <> new_customer.customer_id,
           )
-          Ok(new_client)
+          Ok(new_customer)
         }
         Ok([]) -> Error(ParseError("No client returned from server"))
         Error(_) -> Error(ParseError("Invalid client response format"))

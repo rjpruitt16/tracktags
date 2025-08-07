@@ -1,4 +1,5 @@
 // src/utils/utils.gleam
+import birl
 import envoy
 import gleam/erlang/atom
 import gleam/option.{None, Some}
@@ -59,6 +60,12 @@ pub fn get_env_or(key: String, default: String) -> String {
     },
     default,
   )
+}
+
+/// Get current ISO 8601 timestamp string
+pub fn current_iso_timestamp() -> String {
+  birl.now()
+  |> birl.to_iso8601()
 }
 
 // ============================================================================

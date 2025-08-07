@@ -1,9 +1,7 @@
 import actors/application
-import envoy
 import gleam/erlang/process
 import gleam/int
 import gleam/io
-import gleam/option.{None, Some}
 import gleam/string
 import logging
 import mist

@@ -49,7 +49,7 @@ pub type UpdateMetricRequest {
 const valid_operations = ["SUM", "AVG", "MAX", "MIN", "COUNT"]
 
 const valid_intervals = [
-  "1s", "5s", "30s", "1m", "15m", "30m", "1h", "6h", "1d",
+  "5s", "15s", "30s", "1m", "15m", "30m", "1h", "6h", "1d",
 ]
 
 const valid_cleanup_periods = [
@@ -78,8 +78,8 @@ fn cleanup_to_seconds(cleanup_period: String) -> Int {
 
 fn interval_to_tick_type(interval: String) -> String {
   case interval {
-    "1s" -> "tick_1s"
     "5s" -> "tick_5s"
+    "15s" -> "ticks_15s"
     "30s" -> "tick_30s"
     "1m" -> "tick_1m"
     "15m" -> "tick_15m"
@@ -352,18 +352,29 @@ fn validate_stripe_billing_interval(
 ) -> Result(MetricRequest, List(decode.DecodeError)) {
   case req.metric_type {
     "stripe_billing" -> {
+      // Enforce 1h minimum for StripeBilling metrics
       case req.flush_interval {
-        "1s" | "5s" | "30s" | "1m" | "15m" | "30m" -> {
+        "1s" | "5s" | "15s" | "30s" | "1m" | "5m" | "15m" | "30m" -> {
           logging.log(
             logging.Info,
-            "[MetricHandler] ⚡ StripeBilling metric forced to 1h interval for performance",
+            "[MetricHandler] ⚡ StripeBilling metric forced to 1h interval (was "
+              <> req.flush_interval
+              <> ") for performance",
           )
           Ok(MetricRequest(..req, flush_interval: "1h"))
         }
-        "1h" | "6h" | "1d" -> Ok(req)
-        // Already good intervals
-        _ -> Ok(MetricRequest(..req, flush_interval: "1h"))
-        // Default to 1h
+        "1h" | "6h" | "12h" | "1d" -> Ok(req)
+        // These are fine
+        _ -> {
+          // Unknown interval, default to 1h
+          logging.log(
+            logging.Warning,
+            "[MetricHandler] Unknown interval '"
+              <> req.flush_interval
+              <> "' for StripeBilling, defaulting to 1h",
+          )
+          Ok(MetricRequest(..req, flush_interval: "1h"))
+        }
       }
     }
     _ -> Ok(req)
@@ -407,7 +418,7 @@ pub fn create_metric(req: Request) -> Response {
     Error(_) -> "business"
   }
 
-  let client_id = case wisp.get_query(req) |> list.key_find("client_id") {
+  let customer_id = case wisp.get_query(req) |> list.key_find("customer_id") {
     Ok(cid) -> Some(cid)
     Error(_) -> None
   }
@@ -417,10 +428,10 @@ pub fn create_metric(req: Request) -> Response {
     use validated_req <- result.try(validate_metric_request(metric_req))
 
     // Route based on scope using your existing infrastructure
-    case metric_types.string_to_scope(scope_str, business_id, client_id) {
+    case metric_types.string_to_scope(scope_str, business_id, customer_id) {
       Ok(metric_types.Business(_)) ->
         Ok(process_create_metric(business_id, validated_req))
-      Ok(metric_types.Client(_, cid)) ->
+      Ok(metric_types.Customer(_, cid)) ->
         Ok(process_create_client_metric(business_id, cid, validated_req))
       Error(error) -> Error([decode.DecodeError("Invalid", error, [])])
     }
@@ -566,8 +577,8 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
   }
 
   let lookup_key = case scope {
-    "client" -> {
-      case wisp.get_query(req) |> list.key_find("client_id") {
+    "customer" -> {
+      case wisp.get_query(req) |> list.key_find("customer_id") {
         Ok(cid) -> business_id <> ":" <> cid
         Error(_) -> business_id
       }
@@ -640,8 +651,8 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
   }
 
   let lookup_key = case scope {
-    "client" -> {
-      case wisp.get_query(req) |> list.key_find("client_id") {
+    "customer" -> {
+      case wisp.get_query(req) |> list.key_find("customer_id") {
         Ok(cid) -> business_id <> ":" <> cid
         // "biz_001:mobile_app"
         Error(_) -> business_id
@@ -934,13 +945,13 @@ fn process_update_metric(
 
 fn process_create_client_metric(
   business_id: String,
-  client_id: String,
+  customer_id: String,
   req: MetricRequest,
 ) -> Response {
   case
     create_client_metric_internal(
       business_id,
-      client_id,
+      customer_id,
       req.metric_name,
       req.operation,
       req.flush_interval,
@@ -959,7 +970,7 @@ fn process_create_client_metric(
         json.object([
           #("status", json.string("created")),
           #("business_id", json.string(business_id)),
-          #("client_id", json.string(client_id)),
+          #("customer_id", json.string(customer_id)),
           #("metric_name", json.string(req.metric_name)),
           #("operation", json.string(req.operation)),
           #("flush_interval", json.string(req.flush_interval)),
@@ -983,7 +994,7 @@ fn process_create_client_metric(
 // NEW: Internal function for proxy_handler to use
 pub fn create_client_metric_internal(
   business_id: String,
-  client_id: String,
+  customer_id: String,
   metric_name: String,
   operation: String,
   flush_interval: String,
@@ -1004,9 +1015,9 @@ pub fn create_client_metric_internal(
     Ok(app_actor) -> {
       process.send(
         app_actor,
-        application.SendMetricToClient(
+        application.SendMetricToCustomer(
           business_id: business_id,
-          client_id: client_id,
+          customer_id: customer_id,
           metric_name: metric_name,
           tick_type: tick_type,
           operation: operation,

@@ -113,9 +113,9 @@ defmodule SupabaseRealtime do
         Logger.info("[SupabaseRealtime] 📨 Received message: #{String.slice(message, 0..200)}...")
         
         case parse_realtime_event(message) do
-          {:plan_limit_update, business_id, client_id, metric_name, limit_value, limit_operator, breach_action} ->
-          Logger.info("[SupabaseRealtime] 🎯 Plan limit update: #{business_id}/#{client_id}")
-  :actors@supabase_actor.process_plan_limit_update(business_id, client_id, metric_name, limit_value, limit_operator, breach_action)         
+          {:plan_limit_update, business_id, customer_id, metric_name, limit_value, limit_operator, breach_action} ->
+          Logger.info("[SupabaseRealtime] 🎯 Plan limit update: #{business_id}/#{customer_id}")
+  :actors@supabase_actor.process_plan_limit_update(business_id, customer_id, metric_name, limit_value, limit_operator, breach_action)         
           
           {:join_reply, ref} ->
             Logger.info("[SupabaseRealtime] ✅ Successfully joined channel (ref: #{ref})")
@@ -162,7 +162,7 @@ defmodule SupabaseRealtime do
         case payload do
           %{"data" => %{"type" => "UPDATE", "record" => record}} ->
             business_id = Map.get(record, "business_id", "")
-            client_id = case Map.get(record, "client_id") do
+            customer_id = case Map.get(record, "customer_id") do
               nil -> ""
               value -> value
             end
@@ -171,7 +171,7 @@ defmodule SupabaseRealtime do
             limit_operator = Map.get(record, "breach_operator", "gte") 
             breach_action = Map.get(record, "breach_action", "allow_overage")
             
-            {:plan_limit_update, business_id, client_id, metric_name, limit_value, limit_operator, breach_action}
+            {:plan_limit_update, business_id, customer_id, metric_name, limit_value, limit_operator, breach_action}
           _ ->
             :ignore
         end

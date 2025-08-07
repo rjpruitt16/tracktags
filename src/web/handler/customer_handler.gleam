@@ -1,4 +1,4 @@
-// src/web/handler/client_handler.gleam
+// src/web/handler/customer_handler.gleam
 import clients/supabase_client
 import gleam/dynamic/decode
 import gleam/http
@@ -15,17 +15,17 @@ import wisp.{type Request, type Response}
 // TYPES
 // ============================================================================
 
-pub type ClientRequest {
-  ClientRequest(
-    client_id: String,
+pub type CustomerRequest {
+  CustomerRequest(
+    customer_id: String,
     name: String,
     description: String,
     plan_id: String,
   )
 }
 
-pub type ClientKeyRequest {
-  ClientKeyRequest(
+pub type CustomerKeyRequest {
+  CustomerKeyRequest(
     external_key: String,
     name: String,
     description: String,
@@ -52,7 +52,7 @@ fn extract_api_key(req: Request) -> Result(String, String) {
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
   case extract_api_key(req) {
     Error(error) -> {
-      logging.log(logging.Warning, "[ClientHandler] Auth failed: " <> error)
+      logging.log(logging.Warning, "[CustomerHandler] Auth failed: " <> error)
       let error_json =
         json.object([
           #("error", json.string("Unauthorized")),
@@ -65,7 +65,7 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
         Ok(business_id) -> {
           logging.log(
             logging.Info,
-            "[ClientHandler] ✅ API key validated for business: " <> business_id,
+            "[CustomerHandler] ✅ API key validated for business: " <> business_id,
           )
           handler(business_id)
         }
@@ -94,35 +94,17 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
 // JSON DECODERS
 // ============================================================================
 
-fn client_request_decoder() -> decode.Decoder(ClientRequest) {
-  use client_id <- decode.field("client_id", decode.string)
+fn customer_request_decoder() -> decode.Decoder(CustomerRequest) {
+  use customer_id <- decode.field("customer_id", decode.string)
   use plan_id <- decode.field("plan_id", decode.string)
   use name <- decode.optional_field("name", "", decode.string)
   use description <- decode.optional_field("description", "", decode.string)
 
-  decode.success(ClientRequest(
-    client_id: client_id,
+  decode.success(CustomerRequest(
+    customer_id: customer_id,
     name: name,
     description: description,
     plan_id: plan_id,
-  ))
-}
-
-fn client_key_request_decoder() -> decode.Decoder(ClientKeyRequest) {
-  use external_key <- decode.field("external_key", decode.string)
-  use name <- decode.optional_field("name", "", decode.string)
-  use description <- decode.optional_field("description", "", decode.string)
-  use permissions <- decode.optional_field(
-    "permissions",
-    ["metrics.read", "metrics.write"],
-    decode.list(decode.string),
-  )
-
-  decode.success(ClientKeyRequest(
-    external_key: external_key,
-    name: name,
-    description: description,
-    permissions: permissions,
   ))
 }
 
@@ -130,15 +112,20 @@ fn client_key_request_decoder() -> decode.Decoder(ClientKeyRequest) {
 // VALIDATION
 // ============================================================================
 
-fn validate_client_request(
-  req: ClientRequest,
-) -> Result(ClientRequest, List(decode.DecodeError)) {
-  // Validate client_id
-  case string.length(req.client_id) {
-    0 -> Error([decode.DecodeError("Invalid", "client_id cannot be empty", [])])
+fn validate_customer_request(
+  req: CustomerRequest,
+) -> Result(CustomerRequest, List(decode.DecodeError)) {
+  // Validate customer_id
+  case string.length(req.customer_id) {
+    0 ->
+      Error([decode.DecodeError("Invalid", "customer_id cannot be empty", [])])
     n if n > 100 ->
       Error([
-        decode.DecodeError("Invalid", "client_id too long (max 100 chars)", []),
+        decode.DecodeError(
+          "Invalid",
+          "customer_id too long (max 100 chars)",
+          [],
+        ),
       ])
     _ -> Ok(Nil)
   }
@@ -158,11 +145,11 @@ fn validate_client_request(
 // CRUD ENDPOINTS
 // ============================================================================
 
-pub fn create_client(req: Request) -> Response {
+pub fn create_customer(req: Request) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 CREATE CLIENT REQUEST START - ID: " <> request_id,
+    "[CustomerHandler] 🔍 CREATE CUSTOMER REQUEST START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Post)
@@ -170,14 +157,14 @@ pub fn create_client(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use client_req <- result.try(decode.run(json_data, client_request_decoder()))
-    use validated_req <- result.try(validate_client_request(client_req))
-    Ok(process_create_client(business_id, validated_req))
+    use customer_req <- result.try(decode.run(json_data, customer_request_decoder()))
+    use validated_req <- result.try(validate_customer_request(customer_req))
+    Ok(process_create_customer(business_id, validated_req))
   }
 
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 CREATE CLIENT REQUEST END - ID: " <> request_id,
+    "[CustomerHandler] 🔍 CREATE CUSTOMER REQUEST END - ID: " <> request_id,
   )
 
   case result {
@@ -185,7 +172,7 @@ pub fn create_client(req: Request) -> Response {
     Error(decode_errors) -> {
       logging.log(
         logging.Warning,
-        "[ClientHandler] Bad request: " <> string.inspect(decode_errors),
+        "[CustomerHandler] Bad request: " <> string.inspect(decode_errors),
       )
       let error_json =
         json.object([
@@ -197,11 +184,11 @@ pub fn create_client(req: Request) -> Response {
   }
 }
 
-pub fn list_clients(req: Request) -> Response {
+pub fn list_customers(req: Request) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 LIST CLIENTS REQUEST START - ID: " <> request_id,
+    "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Get)
@@ -209,18 +196,18 @@ pub fn list_clients(req: Request) -> Response {
 
   logging.log(
     logging.Info,
-    "[ClientHandler] 📋 Listing clients for business: " <> business_id,
+    "[CustomerHandler] 📋 Listing customers for business: " <> business_id,
   )
 
-  case supabase_client.get_business_clients(business_id) {
-    Ok(clients) -> {
+  case supabase_client.get_business_customers(business_id) {
+    Ok(customers) -> {
       let response_data =
-        clients
-        |> list.map(fn(client) {
+        customers
+        |> list.map(fn(customer) {
           json.object([
-            #("client_id", json.string(client.client_id)),
-            #("client_name", json.string(client.client_name)),
-            #("plan_id", case client.plan_id {
+            #("customer_id", json.string(customer.customer_id)),
+            #("customer_name", json.string(customer.customer_name)),
+            #("plan_id", case customer.plan_id {
               Some(pid) -> json.string(pid)
               None -> json.null()
             }),
@@ -230,14 +217,13 @@ pub fn list_clients(req: Request) -> Response {
 
       let success_json =
         json.object([
-          #("clients", response_data),
-          #("count", json.int(list.length(clients))),
-          #("business_id", json.string(business_id)),
+          #("customers", response_data),
+          #("count", json.int(list.length(customers))),
         ])
 
       logging.log(
         logging.Info,
-        "[ClientHandler] 🔍 LIST CLIENTS REQUEST END - ID: " <> request_id,
+        "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(json.to_string_tree(success_json), 200)
@@ -246,11 +232,11 @@ pub fn list_clients(req: Request) -> Response {
       let error_json =
         json.object([
           #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to fetch clients")),
+          #("message", json.string("Failed to fetch customers")),
         ])
       logging.log(
         logging.Info,
-        "[ClientHandler] 🔍 LIST CLIENTS REQUEST END - ID: " <> request_id,
+        "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(json.to_string_tree(error_json), 500)
@@ -258,14 +244,14 @@ pub fn list_clients(req: Request) -> Response {
   }
 }
 
-pub fn get_client(req: Request, client_id: String) -> Response {
+pub fn get_client(req: Request, customer_id: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 GET CLIENT REQUEST START - ID: "
+    "[CustomerHandler] 🔍 GET CUSTOMER REQUEST START - ID: "
       <> request_id
       <> " client: "
-      <> client_id,
+      <> customer_id,
   )
 
   use <- wisp.require_method(req, http.Get)
@@ -273,21 +259,21 @@ pub fn get_client(req: Request, client_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 Getting client: " <> business_id <> "/" <> client_id,
+    "[CustomerHandler] 🔍 Getting customer: " <> business_id <> "/" <> customer_id,
   )
 
-  case supabase_client.get_client_by_id(business_id, client_id) {
-    Ok(client) -> {
+  case supabase_client.get_customer_by_id(business_id, customer_id) {
+    Ok(customer) -> {
       logging.log(
         logging.Info,
-        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       let success_json =
         json.object([
-          #("client_id", json.string(client.client_id)),
-          #("client_name", json.string(client.client_name)),
-          #("plan_id", case client.plan_id {
+          #("customer_id", json.string(customer.customer_id)),
+          #("customer_name", json.string(customer.customer_name)),
+          #("plan_id", case customer.plan_id {
             Some(pid) -> json.string(pid)
             None -> json.null()
           }),
@@ -297,14 +283,14 @@ pub fn get_client(req: Request, client_id: String) -> Response {
     Error(supabase_client.NotFound(_)) -> {
       logging.log(
         logging.Info,
-        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(
         json.to_string_tree(
           json.object([
             #("error", json.string("Not Found")),
-            #("message", json.string("Client not found")),
+            #("message", json.string("Customer not found")),
           ]),
         ),
         404,
@@ -313,7 +299,7 @@ pub fn get_client(req: Request, client_id: String) -> Response {
     Error(_) -> {
       logging.log(
         logging.Info,
-        "[ClientHandler] 🔍 GET CLIENT REQUEST END - ID: " <> request_id,
+        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(
@@ -326,14 +312,14 @@ pub fn get_client(req: Request, client_id: String) -> Response {
   }
 }
 
-pub fn delete_client(req: Request, client_id: String) -> Response {
+pub fn delete_customer(req: Request, customer_id: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 DELETE CLIENT REQUEST START - ID: "
+    "[CustomerHandler] 🔍 DELETE CUSTOMER REQUEST START - ID: "
       <> request_id
       <> " client: "
-      <> client_id,
+      <> customer_id,
   )
 
   use <- wisp.require_method(req, http.Delete)
@@ -341,19 +327,19 @@ pub fn delete_client(req: Request, client_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[ClientHandler] 🗑️ Deleting client: " <> business_id <> "/" <> client_id,
+    "[CustomerHandler] 🗑️ Deleting customer: " <> business_id <> "/" <> customer_id,
   )
 
   let success_json =
     json.object([
-      #("message", json.string("Delete client - LOGGED")),
+      #("message", json.string("Delete customer - LOGGED")),
       #("business_id", json.string(business_id)),
-      #("client_id", json.string(client_id)),
+      #("customer_id", json.string(customer_id)),
     ])
 
   logging.log(
     logging.Info,
-    "[ClientHandler] 🔍 DELETE CLIENT REQUEST END - ID: " <> request_id,
+    "[CustomerHandler] 🔍 DELETE CUSTOMER REQUEST END - ID: " <> request_id,
   )
 
   wisp.json_response(json.to_string_tree(success_json), 200)
@@ -363,13 +349,13 @@ pub fn delete_client(req: Request, client_id: String) -> Response {
 // PROCESSING FUNCTIONS
 // ============================================================================
 
-fn process_create_client(business_id: String, req: ClientRequest) -> Response {
+fn process_create_customer(business_id: String, req: CustomerRequest) -> Response {
   logging.log(
     logging.Info,
-    "[ClientHandler] 🏗️ Processing CREATE client: "
+    "[CustomerHandler] 🏗️ Processing CREATE customer: "
       <> business_id
       <> "/"
-      <> req.client_id
+      <> req.customer_id
       <> " (name: "
       <> req.name
       <> ")",
@@ -377,9 +363,9 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
 
   // Actually create the client in the database
   case
-    supabase_client.create_client(
+    supabase_client.create_customer(
       business_id,
-      req.client_id,
+      req.customer_id,
       req.name,
       req.plan_id,
     )
@@ -387,14 +373,14 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
     Ok(_) -> {
       logging.log(
         logging.Info,
-        "[ClientHandler] ✅ Client created successfully in database",
+        "[CustomerHandler] ✅ Customer created successfully in database",
       )
 
       let success_json =
         json.object([
           #("status", json.string("created")),
           #("business_id", json.string(business_id)),
-          #("client_id", json.string(req.client_id)),
+          #("customer_id", json.string(req.customer_id)),
           #("name", json.string(req.name)),
           #("description", json.string(req.description)),
           #("timestamp", json.int(utils.current_timestamp())),
@@ -405,13 +391,13 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
     Error(supabase_client.DatabaseError(msg)) -> {
       logging.log(
         logging.Error,
-        "[ClientHandler] ❌ Failed to create client: " <> msg,
+        "[CustomerHandler] ❌ Failed to create customer: " <> msg,
       )
 
       let error_json =
         json.object([
           #("error", json.string("Database Error")),
-          #("message", json.string("Failed to create client: " <> msg)),
+          #("message", json.string("Failed to create customer: " <> msg)),
         ])
 
       wisp.json_response(json.to_string_tree(error_json), 500)
@@ -419,7 +405,7 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[ClientHandler] ❌ Failed to create client: " <> string.inspect(error),
+        "[CustomerHandler] ❌ Failed to create customer: " <> string.inspect(error),
       )
 
       let error_json =
@@ -433,39 +419,39 @@ fn process_create_client(business_id: String, req: ClientRequest) -> Response {
   }
 }
 
-pub fn create_client_key(req: Request, client_id: String) -> Response {
+pub fn create_client_key(req: Request, customer_id: String) -> Response {
   use <- wisp.require_method(req, http.Post)
   use business_id <- with_auth(req)
 
   logging.log(
     logging.Info,
-    "[ClientHandler] Creating key for client: " <> client_id,
+    "[CustomerHandler] Creating key for customer: " <> customer_id,
   )
 
   let success_json =
     json.object([
-      #("message", json.string("Create client key - LOGGED")),
+      #("message", json.string("Create customer key - LOGGED")),
       #("business_id", json.string(business_id)),
-      #("client_id", json.string(client_id)),
+      #("customer_id", json.string(customer_id)),
     ])
 
   wisp.json_response(json.to_string_tree(success_json), 201)
 }
 
-pub fn list_client_keys(req: Request, client_id: String) -> Response {
+pub fn list_client_keys(req: Request, customer_id: String) -> Response {
   use <- wisp.require_method(req, http.Get)
   use business_id <- with_auth(req)
 
   logging.log(
     logging.Info,
-    "[ClientHandler] Listing keys for client: " <> client_id,
+    "[CustomerHandler] Listing keys for customer: " <> customer_id,
   )
 
   let success_json =
     json.object([
-      #("message", json.string("List client keys - LOGGED")),
+      #("message", json.string("List customer keys - LOGGED")),
       #("business_id", json.string(business_id)),
-      #("client_id", json.string(client_id)),
+      #("customer_id", json.string(customer_id)),
     ])
 
   wisp.json_response(json.to_string_tree(success_json), 200)
@@ -473,7 +459,7 @@ pub fn list_client_keys(req: Request, client_id: String) -> Response {
 
 pub fn delete_client_key(
   req: Request,
-  client_id: String,
+  customer_id: String,
   key_id: String,
 ) -> Response {
   use <- wisp.require_method(req, http.Delete)
@@ -481,14 +467,14 @@ pub fn delete_client_key(
 
   logging.log(
     logging.Info,
-    "[ClientHandler] Deleting key: " <> key_id <> " for client: " <> client_id,
+    "[CustomerHandler] Deleting key: " <> key_id <> " for customer: " <> customer_id,
   )
 
   let success_json =
     json.object([
-      #("message", json.string("Delete client key - LOGGED")),
+      #("message", json.string("Delete customer key - LOGGED")),
       #("business_id", json.string(business_id)),
-      #("client_id", json.string(client_id)),
+      #("customer_id", json.string(customer_id)),
       #("key_id", json.string(key_id)),
     ])
 

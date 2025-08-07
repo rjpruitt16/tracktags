@@ -37,6 +37,7 @@ pub type TickInterval {
 fn get_tick_intervals() -> Dict(String, Int) {
   dict.from_list([
     #("tick_5s", 5),
+    #("tick_15s", 15),
     #("tick_30s", 30),
     #("tick_1m", 60),
     #("tick_15m", 900),
