@@ -29,9 +29,9 @@ pub type Message {
     metric_type: MetricType,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
-    plan_limit_value: Float,
-    plan_limit_operator: String,
-    plan_breach_action: String,
+    limit_value: Float,
+    limit_operator: String,
+    breach_action: String,
   )
   CleanupTick(timestamp: String, tick_type: String)
   GetMetricActor(

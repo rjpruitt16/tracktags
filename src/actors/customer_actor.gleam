@@ -55,52 +55,6 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
   })
 }
 
-fn encode_metric_args(
-  args: #(
-    String,
-    String,
-    String,
-    Float,
-    String,
-    String,
-    Int,
-    String,
-    String,
-    Float,
-    String,
-    String,
-  ),
-) -> List(dynamic.Dynamic) {
-  let #(
-    account_id,
-    metric_name,
-    tick_type,
-    initial_value,
-    tags_json,
-    operation,
-    cleanup_after_seconds,
-    metric_type,
-    metadata,
-    plan_limit_value,
-    plan_limit_operator,
-    plan_breach_action,
-  ) = args
-  [
-    dynamic.string(account_id),
-    dynamic.string(metric_name),
-    dynamic.string(tick_type),
-    dynamic.float(initial_value),
-    dynamic.string(tags_json),
-    dynamic.string(operation),
-    dynamic.int(cleanup_after_seconds),
-    dynamic.string(metric_type),
-    dynamic.string(metadata),
-    dynamic.float(plan_limit_value),
-    dynamic.string(plan_limit_operator),
-    dynamic.string(plan_breach_action),
-  ]
-}
-
 // ============================================================================
 // CLIENT ACTOR PLAN INHERITANCE (Add to customer_actor.gleam)
 // ============================================================================
@@ -258,7 +212,7 @@ fn create_limit_checking_metric(
     glixir.start_dynamic_child(
       metrics_supervisor,
       metric_spec,
-      encode_metric_args,
+      metric_types.encode_metric_args,
       fn(_) { Ok(process.new_subject()) },
     )
   {
@@ -475,9 +429,9 @@ fn handle_message(
       metric_type,
       tags,
       metadata,
-      plan_limit_value,
-      plan_limit_operator,
-      plan_breach_action,
+      limit_value,
+      limit_operator,
+      breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -552,16 +506,16 @@ fn handle_message(
               cleanup_after_seconds,
               metric_type_string,
               metric_types.encode_metadata_to_string(metadata),
-              plan_limit_value,
-              plan_limit_operator,
-              plan_breach_action,
+              limit_value,
+              limit_operator,
+              breach_action,
             )
 
           case
             glixir.start_dynamic_child(
               updated_state.metrics_supervisor,
               metric_spec,
-              encode_metric_args,
+              metric_types.encode_metric_args,
               fn(_) { Ok(process.new_subject()) },
             )
           {

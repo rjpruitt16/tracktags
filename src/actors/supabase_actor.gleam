@@ -439,7 +439,7 @@ pub fn realtime_reconnect(retry_count: Int) {
 }
 
 // Update the function signature:
-pub fn process_plan_limit_update(
+pub fn process_limit_update(
   business_id: String,
   customer_id: String,
   metric_name: String,

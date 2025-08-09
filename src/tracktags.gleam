@@ -5,6 +5,7 @@ import gleam/io
 import gleam/string
 import logging
 import mist
+import utils/utils
 import web/router
 import wisp
 import wisp/wisp_mist
@@ -15,8 +16,22 @@ pub fn main() {
 
   let port = 8080
 
+  // Determine deployment mode from environment
+  let self_hosted_env = utils.get_env_or("SELF_HOSTED", "false")
+  let self_hosted =
+    case string.lowercase(self_hosted_env) == "true" {
+      True -> True
+      False -> False
+    }
+
+  // Log the current mode
+  case self_hosted {
+    True -> logging.log(logging.Info, "[Main] 🏠 Running in SELF-HOSTED mode")
+    False -> logging.log(logging.Info, "[Main] 🏢 Running in CLOUD mode")
+  }
+
   // Start the TrackTags application (actors, registry, etc.)
-  case application.start_app() {
+  case application.start_app(self_hosted) {
     Ok(_app_actor) -> {
       logging.log(
         logging.Info,

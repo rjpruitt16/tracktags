@@ -14,16 +14,17 @@ import logging
 import storage/metric_store
 
 pub type Message {
-
   RecordMetric(metric: Metric)
   FlushTick(timestamp: String, tick_type: String)
   ForceFlush
   GetStatus(reply_with: process.Subject(Metric))
   Shutdown
+  GetValue(reply_with: process.Subject(Float))
   UpdatePlanLimit(Float, String, String)
   GetLimitStatus(reply_with: process.Subject(LimitStatus))
   GetMetricType(reply_to: process.Subject(MetricType))
   ResetToInitialValue
+  CheckAndAdd(delta: Float, reply_to: process.Subject(Bool))
 }
 
 // ============================================================================
@@ -140,7 +141,10 @@ pub type StripeConfig {
   StripeConfig(
     enabled: Bool,
     price_id: Option(String),
+    key_name: Option(String),
     billing_threshold: Option(Float),
+    overage_item_id: Option(String),
+    overage_threshold: Option(Int),
   )
 }
 
@@ -242,20 +246,6 @@ pub fn metric_type_to_string(metric_type: MetricType) -> String {
     Checkpoint -> "checkpoint"
     StripeBilling -> "stripe_billing"
     // ✅ NEW
-  }
-}
-
-fn metric_type_decoder() -> decode.Decoder(MetricType) {
-  use type_string <- decode.then(decode.string)
-  case type_string {
-    "reset" -> decode.success(Reset)
-    "checkpoint" -> decode.success(Checkpoint)
-    "stripe_billing" -> decode.success(StripeBilling)
-    _ ->
-      decode.failure(
-        Reset,
-        "Invalid metric_type. Must be one of: reset, checkpoint, stripe_billing",
-      )
   }
 }
 
@@ -374,6 +364,29 @@ pub fn should_send_to_supabase(
   }
 }
 
+pub fn should_report_overage(
+  metadata: Option(MetricMetadata),
+  is_breached: Bool,
+  breach_action: String,
+) -> Option(#(Option(String), String, Int)) {
+  // Returns (key_name, item_id, threshold)
+  case is_breached, breach_action {
+    True, "allow_overage" -> {
+      case get_stripe_config(metadata) {
+        Some(stripe_config) -> {
+          case stripe_config.overage_item_id, stripe_config.overage_threshold {
+            Some(item_id), Some(threshold) ->
+              Some(#(stripe_config.key_name, item_id, threshold))
+            _, _ -> None
+          }
+        }
+        None -> None
+      }
+    }
+    _, _ -> None
+  }
+}
+
 // ============================================================================
 // METADATA SERIALIZATION (FOR ELIXIR BRIDGE)
 // ============================================================================
@@ -483,8 +496,11 @@ fn supabase_config_to_json(config: SupabaseConfig) -> json.Json {
 fn stripe_config_to_json(config: StripeConfig) -> json.Json {
   json.object([
     #("enabled", json.bool(config.enabled)),
+    #("key_name", json.nullable(config.key_name, json.string)),
     #("price_id", json.nullable(config.price_id, json.string)),
     #("billing_threshold", json.nullable(config.billing_threshold, json.float)),
+    #("overage_item_id", json.nullable(config.overage_item_id, json.string)),
+    #("overage_threshold", json.nullable(config.overage_threshold, json.int)),
   ])
 }
 
@@ -623,6 +639,12 @@ pub fn should_restore_on_startup(
 
 fn stripe_config_decoder() -> decode.Decoder(StripeConfig) {
   use enabled <- decode.field("enabled", decode.bool)
+  use key_name <- decode.optional_field(
+    // ADD THIS
+    "key_name",
+    None,
+    decode.optional(decode.string),
+  )
   use price_id <- decode.optional_field(
     "price_id",
     None,
@@ -633,11 +655,25 @@ fn stripe_config_decoder() -> decode.Decoder(StripeConfig) {
     None,
     decode.optional(decode.float),
   )
+  use overage_item_id <- decode.optional_field(
+    "overage_item_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use overage_threshold <- decode.optional_field(
+    "overage_threshold",
+    None,
+    decode.optional(decode.int),
+  )
 
   decode.success(StripeConfig(
     enabled: enabled,
+    key_name: key_name,
+    // ADD THIS
     price_id: price_id,
     billing_threshold: billing_threshold,
+    overage_item_id: overage_item_id,
+    overage_threshold: overage_threshold,
   ))
 }
 
@@ -745,4 +781,77 @@ pub fn metadata_to_adapters(
     }
     None -> None
   }
+}
+
+// Helper to extract Stripe config from metadata
+pub fn get_stripe_config(
+  metadata: Option(MetricMetadata),
+) -> Option(StripeConfig) {
+  case metadata {
+    Some(meta) -> {
+      case meta.integrations {
+        Some(integrations) -> integrations.stripe
+        None -> None
+      }
+    }
+    None -> None
+  }
+}
+
+// Check if we should report overage and get the config
+pub fn get_overage_config(
+  metadata: Option(MetricMetadata),
+  is_breached: Bool,
+  breach_action: String,
+) -> Option(StripeConfig) {
+  case is_breached, breach_action {
+    True, "allow_overage" -> get_stripe_config(metadata)
+    _, _ -> None
+  }
+}
+
+pub fn encode_metric_args(
+  args: #(
+    String,
+    String,
+    String,
+    Float,
+    String,
+    String,
+    Int,
+    String,
+    String,
+    Float,
+    String,
+    String,
+  ),
+) -> List(dynamic.Dynamic) {
+  let #(
+    account_id,
+    metric_name,
+    tick_type,
+    initial_value,
+    tags_json,
+    operation,
+    cleanup_after_seconds,
+    metric_type,
+    metadata,
+    limit_value,
+    limit_operator,
+    breach_action,
+  ) = args
+  [
+    dynamic.string(account_id),
+    dynamic.string(metric_name),
+    dynamic.string(tick_type),
+    dynamic.float(initial_value),
+    dynamic.string(tags_json),
+    dynamic.string(operation),
+    dynamic.int(cleanup_after_seconds),
+    dynamic.string(metric_type),
+    dynamic.string(metadata),
+    dynamic.float(limit_value),
+    dynamic.string(limit_operator),
+    dynamic.string(breach_action),
+  ]
 }

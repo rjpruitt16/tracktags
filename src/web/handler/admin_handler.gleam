@@ -6,6 +6,7 @@ import gleam/http
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/string
 import logging
 import utils/utils
 import web/handler/stripe_handler
@@ -97,7 +98,6 @@ pub fn replay_webhook(
   }
 }
 
-/// Override subscription status for emergency fixes
 pub fn override_subscription_status(
   req: Request,
   business_id: String,
@@ -113,38 +113,72 @@ pub fn override_subscription_status(
 
   // Parse override request
   case parse_override_request(json_data) {
-    Ok(#(status, subscription_id)) -> {
-      case
-        supabase_client.update_business_subscription(
-          business_id,
-          subscription_id,
-          status,
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[AdminHandler] ✅ Subscription override successful: "
-              <> business_id
-              <> " -> "
-              <> status,
-          )
-          let success_json =
-            json.object([
-              #("status", json.string("success")),
-              #("business_id", json.string(business_id)),
-              #("subscription_status", json.string(status)),
-              #("message", json.string("Subscription status updated")),
-            ])
-          wisp.json_response(json.to_string_tree(success_json), 200)
+    Ok(#(status, price_id)) -> {
+      // First, get the business to find stripe_customer_id
+      case supabase_client.get_business(business_id) {
+        Ok(business) -> {
+          case business.stripe_customer_id {
+            Some(stripe_customer_id) -> {
+              case
+                supabase_client.update_business_subscription(
+                  stripe_customer_id,
+                  // Use stripe_customer_id
+                  status,
+                  // status second
+                  option.unwrap(price_id, "price_unknown"),
+                  // price_id third
+                )
+              {
+                Ok(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[AdminHandler] ✅ Subscription override successful: "
+                      <> business_id
+                      <> " -> "
+                      <> status,
+                  )
+                  let success_json =
+                    json.object([
+                      #("status", json.string("success")),
+                      #("business_id", json.string(business_id)),
+                      #("subscription_status", json.string(status)),
+                      #("message", json.string("Subscription status updated")),
+                    ])
+                  wisp.json_response(json.to_string_tree(success_json), 200)
+                }
+                Error(_) -> {
+                  let error_json =
+                    json.object([
+                      #("error", json.string("Update Failed")),
+                      #(
+                        "message",
+                        json.string("Failed to update subscription status"),
+                      ),
+                    ])
+                  wisp.json_response(json.to_string_tree(error_json), 500)
+                }
+              }
+            }
+            None -> {
+              let error_json =
+                json.object([
+                  #("error", json.string("No Stripe Customer")),
+                  #(
+                    "message",
+                    json.string("Business has no Stripe customer ID"),
+                  ),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 400)
+            }
+          }
         }
         Error(_) -> {
           let error_json =
             json.object([
-              #("error", json.string("Update Failed")),
-              #("message", json.string("Failed to update subscription status")),
+              #("error", json.string("Business Not Found")),
+              #("message", json.string("Could not find business")),
             ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
+          wisp.json_response(json.to_string_tree(error_json), 404)
         }
       }
     }
@@ -207,22 +241,22 @@ pub fn get_business_admin(req: Request, business_id: String) -> Response {
 // HELPERS
 // ============================================================================
 
-// Fix parse_override_request function:
 fn parse_override_request(
-  json_data: Dynamic,
+  data: Dynamic,
 ) -> Result(#(String, Option(String)), String) {
-  case decode.run(json_data, override_decoder()) {
-    Ok(data) -> Ok(data)
-    Error(_) -> Error("Invalid override request format")
+  let decoder = {
+    use status <- decode.field("status", decode.string)
+    use price_id_opt <- decode.optional_field(
+      "price_id",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(#(status, price_id_opt))
   }
-}
 
-fn override_decoder() {
-  use status <- decode.field("status", decode.string)
-  use subscription_id <- decode.optional_field(
-    "subscription_id",
-    None,
-    decode.optional(decode.string),
-  )
-  decode.success(#(status, subscription_id))
+  case decode.run(data, decoder) {
+    Ok(result) -> Ok(result)
+    Error(errors) ->
+      Error("Invalid override payload: " <> string.inspect(errors))
+  }
 }

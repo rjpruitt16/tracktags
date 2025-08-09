@@ -70,53 +70,6 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
   })
 }
 
-// FIXED: Updated encoder function to match bridge signature (10 args)
-fn encode_metric_args(
-  args: #(
-    String,
-    String,
-    String,
-    Float,
-    String,
-    String,
-    Int,
-    String,
-    String,
-    Float,
-    String,
-    String,
-  ),
-) -> List(dynamic.Dynamic) {
-  let #(
-    account_id,
-    metric_name,
-    tick_type,
-    initial_value,
-    tags_json,
-    operation,
-    cleanup_after_seconds,
-    metric_type,
-    metadata,
-    plan_limit_value,
-    plan_limit_operator,
-    plan_breach_action,
-  ) = args
-  [
-    dynamic.string(account_id),
-    dynamic.string(metric_name),
-    dynamic.string(tick_type),
-    dynamic.float(initial_value),
-    dynamic.string(tags_json),
-    dynamic.string(operation),
-    dynamic.int(cleanup_after_seconds),
-    dynamic.string(metric_type),
-    dynamic.string(metadata),
-    dynamic.float(plan_limit_value),
-    dynamic.string(plan_limit_operator),
-    dynamic.string(plan_breach_action),
-  ]
-}
-
 fn handle_message(
   state: State,
   message: business_types.Message,
@@ -146,9 +99,9 @@ fn handle_message(
       metric_type,
       tags,
       metadata,
-      plan_limit_value,
-      plan_limit_operator,
-      plan_breach_action,
+      limit_value,
+      limit_operator,
+      breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -161,7 +114,10 @@ fn handle_message(
       )
 
       case
-        customer_types.lookup_client_subject(updated_state.account_id, customer_id)
+        customer_types.lookup_client_subject(
+          updated_state.account_id,
+          customer_id,
+        )
       {
         Ok(client_subject) -> {
           logging.log(
@@ -181,9 +137,9 @@ fn handle_message(
               metric_type: metric_type,
               tags: tags,
               metadata: metadata,
-              plan_limit_value: plan_limit_value,
-              plan_limit_operator: plan_limit_operator,
-              plan_breach_action: plan_breach_action,
+              limit_value: limit_value,
+              limit_operator: limit_operator,
+              breach_action: breach_action,
             ),
           )
           actor.continue(updated_state)
@@ -219,9 +175,9 @@ fn handle_message(
                   metric_type: metric_type,
                   tags: tags,
                   metadata: metadata,
-                  plan_limit_value: plan_limit_value,
-                  plan_limit_operator: plan_limit_operator,
-                  plan_breach_action: plan_breach_action,
+                  limit_value: limit_value,
+                  limit_operator: limit_operator,
+                  breach_action: breach_action,
                 ),
               )
               actor.continue(updated_state)
@@ -316,9 +272,9 @@ fn handle_message(
       metric_type,
       tags,
       metadata,
-      plan_limit_value,
-      plan_limit_operator,
-      plan_breach_action,
+      limit_value,
+      limit_operator,
+      breach_action,
     ) -> {
       logging.log(
         logging.Info,
@@ -378,16 +334,16 @@ fn handle_message(
               cleanup_after_seconds,
               metric_type_string,
               metric_types.encode_metadata_to_string(metadata),
-              plan_limit_value,
-              plan_limit_operator,
-              plan_breach_action,
+              limit_value,
+              limit_operator,
+              breach_action,
             )
 
           case
             glixir.start_dynamic_child(
               updated_state.metrics_supervisor,
               metric_spec,
-              encode_metric_args,
+              metric_types.encode_metric_args,
               fn(_) { Ok(process.new_subject()) },
             )
           {

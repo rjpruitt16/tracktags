@@ -1,11 +1,18 @@
 -- TrackTags Sample Data v4 - Using customers table
 -- Run this after schema.sql to get demo data
 
--- Insert test businesses
-INSERT INTO businesses (business_id, business_name, email, plan_type, stripe_customer_id, stripe_subscription_id, subscription_status) VALUES 
-  ('biz_001', 'Acme SaaS Co', 'founder@acme-saas.com', 'pro', 'cus_acme123', 'sub_acme456', 'active'),
-  ('biz_002', 'StartupXYZ', 'hello@startupxyz.com', 'free', NULL, NULL, 'active'),
-  ('biz_003', 'Scale Corp', 'team@scalecorp.com', 'enterprise', 'cus_scale789', 'sub_scale012', 'active');
+INSERT INTO businesses (
+    business_id,
+    business_name,
+    email,
+    plan_type,
+    stripe_customer_id,
+    stripe_subscription_id,
+    stripe_subscription_status,
+    stripe_price_id
+) VALUES
+    ('biz_001', 'Acme SaaS Co', 'founder@acme-saas.com', 'pro', 'cus_acme123', 'sub_acme456', 'active', 'price_pro_123'),
+    ('biz_002', 'Beta Startup', 'ceo@beta.io', 'starter', 'cus_beta456', 'sub_beta789', 'active', 'price_starter_456');
 
 -- Insert test plans
 INSERT INTO plans (business_id, plan_name, stripe_price_id, plan_status) VALUES

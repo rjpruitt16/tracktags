@@ -1,4 +1,5 @@
 import actors/supabase_actor
+import clients/stripe_client
 import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
@@ -7,7 +8,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
 import glixir
@@ -30,9 +31,9 @@ pub type State {
     metadata: Option(MetricMetadata),
     metric_operation: metric_store.Operation,
     last_flushed_value: Float,
-    plan_limit_value: Float,
-    plan_limit_operator: String,
-    plan_breach_action: String,
+    limit_value: Float,
+    limit_operator: String,
+    breach_action: String,
     is_breached: Bool,
   )
 }
@@ -147,9 +148,9 @@ pub fn start_link(
   cleanup_after_seconds: Int,
   metric_type: String,
   metadata_json: String,
-  plan_limit_value: Float,
-  plan_limit_operator: String,
-  plan_breach_action: String,
+  limit_value: Float,
+  limit_operator: String,
+  breach_action: String,
 ) -> Result(process.Subject(Message), actor.StartError) {
   logging.log(
     logging.Info,
@@ -169,12 +170,12 @@ pub fn start_link(
       <> metric_type
       <> ", cleanup_after: "
       <> int.to_string(cleanup_after_seconds)
-      <> ", plan_limit_value: "
-      <> float.to_string(plan_limit_value)
-      <> ", plan_limit_operator: "
-      <> plan_limit_operator
-      <> ", plan_breach_action: "
-      <> plan_breach_action
+      <> ", limit_value: "
+      <> float.to_string(limit_value)
+      <> ", limit_operator: "
+      <> limit_operator
+      <> ", breach_action: "
+      <> breach_action
       <> ")"
       <> ", metric_json: "
       <> metadata_json,
@@ -213,9 +214,9 @@ pub fn start_link(
       metadata: metric_types.decode_metadata_from_string(metadata_json),
       metric_operation: metric_operation,
       last_flushed_value: initial_value,
-      plan_limit_value: plan_limit_value,
-      plan_limit_operator: plan_limit_operator,
-      plan_breach_action: plan_breach_action,
+      limit_value: limit_value,
+      limit_operator: limit_operator,
+      breach_action: breach_action,
       is_breached: False,
     )
   case metric_store.init_store(account_id) {
@@ -442,6 +443,72 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
   )
 
   case message {
+    metric_types.CheckAndAdd(delta, reply) -> {
+      // read current
+      let current = case
+        metric_store.get_value(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+        )
+      {
+        Ok(v) -> v
+        Error(_) -> state.initial_value
+      }
+
+      let new_value = current +. delta
+      let will_breach = check_plan_breach(new_value, state)
+
+      case will_breach && state.breach_action == "deny" {
+        True -> {
+          process.send(reply, False)
+          actor.continue(state)
+        }
+        False -> {
+          // persist the add
+          case
+            metric_store.add_value(
+              state.default_metric.account_id,
+              state.default_metric.metric_name,
+              delta,
+            )
+          {
+            Ok(_nv) -> {
+              process.send(reply, True)
+              actor.continue(
+                State(
+                  ..state,
+                  current_metric: metric_types.Metric(
+                    ..state.current_metric,
+                    value: new_value,
+                    timestamp: utils.current_timestamp(),
+                  ),
+                  is_breached: check_plan_breach(new_value, state),
+                ),
+              )
+            }
+            Error(_) -> {
+              process.send(reply, False)
+              actor.continue(state)
+            }
+          }
+        }
+      }
+    }
+    metric_types.GetValue(reply_with) -> {
+      // Get current value from metric_store
+      let current_value = case
+        metric_store.get_value(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+        )
+      {
+        Ok(value) -> value
+        Error(_) -> state.initial_value
+      }
+      process.send(reply_with, current_value)
+      actor.continue(state)
+    }
+
     // Add handler in loop function
     metric_types.GetMetricType(reply_to) -> {
       // Send back our metric type
@@ -478,60 +545,67 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
       actor.continue(reset_state)
     }
+
     metric_types.RecordMetric(metric) -> {
-      // Store in ETS instead of just state
-      case
-        metric_store.add_value(
-          updated_state.default_metric.account_id,
-          updated_state.default_metric.metric_name,
-          metric.value,
-        )
-      {
-        Ok(new_value) -> {
-          logging.log(
-            logging.Info,
-            "[MetricActor] Value updated: " <> float.to_string(new_value),
-          )
+      // If this metric is breached and the action is "disabled", drop the write.
+      case state.is_breached && state.breach_action == "disabled" {
+        True -> actor.continue(state)
 
-          // ✅ NEW: Update current_metric state to match store
-          let updated_current_metric =
-            metric_types.Metric(
-              ..updated_state.current_metric,
-              value: new_value,
-              timestamp: utils.current_timestamp(),
+        False -> {
+          // Store in ETS instead of just state
+          case
+            metric_store.add_value(
+              state.default_metric.account_id,
+              state.default_metric.metric_name,
+              metric.value,
             )
-
-          // Check for plan limit breach
-          let new_breach_state = check_plan_breach(new_value, updated_state)
-          let state_with_breach =
-            State(
-              ..updated_state,
-              is_breached: new_breach_state,
-              current_metric: updated_current_metric,
-              // ✅ NEW: Update state
-            )
-
-          case new_breach_state != updated_state.is_breached {
-            True -> {
+          {
+            Ok(new_value) -> {
               logging.log(
-                logging.Warning,
-                "[MetricActor] 🚨 BREACH STATE CHANGED: "
-                  <> string.inspect(new_breach_state)
-                  <> " action="
-                  <> updated_state.plan_breach_action,
+                logging.Info,
+                "[MetricActor] Value updated: " <> float.to_string(new_value),
               )
-            }
-            False -> Nil
-          }
 
-          actor.continue(state_with_breach)
-        }
-        Error(e) -> {
-          logging.log(
-            logging.Error,
-            "[MetricActor] Store error: " <> string.inspect(e),
-          )
-          actor.continue(updated_state)
+              // Update current_metric state to match store
+              let updated_current_metric =
+                metric_types.Metric(
+                  ..state.current_metric,
+                  value: new_value,
+                  timestamp: utils.current_timestamp(),
+                )
+
+              // Check for plan limit breach
+              let new_breach_state = check_plan_breach(new_value, state)
+              let next_state =
+                State(
+                  ..state,
+                  is_breached: new_breach_state,
+                  current_metric: updated_current_metric,
+                )
+
+              case new_breach_state != state.is_breached {
+                True ->
+                  logging.log(
+                    logging.Warning,
+                    "[MetricActor] 🚨 BREACH STATE CHANGED: "
+                      <> string.inspect(new_breach_state)
+                      <> " action="
+                      <> next_state.breach_action,
+                  )
+                False -> Nil
+              }
+
+              actor.continue(next_state)
+            }
+
+            Error(e) -> {
+              logging.log(
+                logging.Error,
+                "[MetricActor] Store error: " <> string.inspect(e),
+              )
+              actor.continue(state)
+            }
+          }
         }
       }
     }
@@ -546,69 +620,158 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           <> timestamp,
       )
 
-      // ✅ Call flush_metrics_and_get_state to get the updated state
-      let flushed_state = flush_metrics_and_get_state(updated_state)
+      // CHECK: Is this the actual flush tick or just cleanup?
+      case tick_type == updated_state.tick_type {
+        True -> {
+          // This is the real flush tick - do the reset
+          // capture pre-flush value BEFORE resetting
+          let preflush_value = updated_state.current_metric.value
+          let preflush_limit = updated_state.limit_value
+          let preflush_breached =
+            check_plan_breach(preflush_value, updated_state)
+          let flushed_state = flush_metrics_and_get_state(updated_state)
 
-      case flushed_state.cleanup_after_seconds {
-        -1 -> {
-          logging.log(
-            logging.Debug,
-            "[MetricActor] Ignoring cleanup tick (cleanup disabled): "
-              <> flushed_state.default_metric.metric_name,
-          )
-          actor.continue(flushed_state)
-          // ✅ Use flushed_state
-        }
-        cleanup_threshold -> {
-          let inactive_duration = current_time - flushed_state.last_accessed
-          case inactive_duration > cleanup_threshold {
-            True -> {
-              logging.log(
-                logging.Info,
-                "[MetricActor] 🧹 Auto-cleanup triggered for: "
-                  <> flushed_state.default_metric.metric_name
-                  <> " (inactive for "
-                  <> int.to_string(inactive_duration)
-                  <> "s, threshold: "
-                  <> int.to_string(cleanup_threshold)
-                  <> "s)",
-              )
+          // After flushing, check for overage reporting
+          case
+            metric_types.should_report_overage(
+              flushed_state.metadata,
+              preflush_breached,
+              flushed_state.breach_action,
+            )
+          {
+            Some(#(key_name, item_id, threshold)) -> {
+              let overage = preflush_value -. preflush_limit
+              let units_f = overage /. int.to_float(threshold)
+              let units_i = float.truncate(float.floor(units_f))
+              case units_i > 0 {
+                True -> {
+                  let #(business_id, _, _) =
+                    metric_types.parse_account_id(
+                      flushed_state.default_metric.account_id,
+                    )
 
-              let key =
-                flushed_state.default_metric.account_id
-                <> "_"
-                <> flushed_state.default_metric.metric_name
-              case
-                glixir.unregister_subject_string(
-                  utils.tracktags_registry(),
-                  key,
-                )
-              {
-                Ok(_) ->
-                  logging.log(
-                    logging.Info,
-                    "[MetricActor] ✅ Unregistered during cleanup: " <> key,
-                  )
-                Error(_) ->
-                  logging.log(
-                    logging.Warning,
-                    "[MetricActor] ⚠️ Failed to unregister during cleanup: "
-                      <> key,
-                  )
+                  case
+                    stripe_client.report_usage(
+                      business_id,
+                      key_name,
+                      item_id,
+                      units_i,
+                      utils.current_timestamp(),
+                    )
+                  {
+                    Ok(_) ->
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] 💰 Reported "
+                          <> int.to_string(units_i)
+                          <> " overage units",
+                      )
+                    Error(e) ->
+                      logging.log(
+                        logging.Error,
+                        "[MetricActor] Failed to report overage: " <> e,
+                      )
+                  }
+                }
+                False -> Nil
               }
-              actor.stop()
             }
-            False -> {
+            None -> Nil
+          }
+
+          // Continue with cleanup check
+          case flushed_state.cleanup_after_seconds {
+            -1 -> {
               logging.log(
                 logging.Debug,
-                "[MetricActor] Still active: "
-                  <> flushed_state.default_metric.metric_name
-                  <> " (inactive for "
-                  <> int.to_string(inactive_duration)
-                  <> "s)",
+                "[MetricActor] Ignoring cleanup tick (cleanup disabled): "
+                  <> flushed_state.default_metric.metric_name,
               )
               actor.continue(flushed_state)
-              // ✅ Use flushed_state
+            }
+            cleanup_threshold -> {
+              let current_time = utils.current_timestamp()
+              let inactive_duration = current_time - flushed_state.last_accessed
+              case inactive_duration > cleanup_threshold {
+                True -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] 🧹 Auto-cleanup triggered for: "
+                      <> flushed_state.default_metric.metric_name
+                      <> " (inactive for "
+                      <> int.to_string(inactive_duration)
+                      <> "s, threshold: "
+                      <> int.to_string(cleanup_threshold)
+                      <> "s)",
+                  )
+
+                  let key =
+                    flushed_state.default_metric.account_id
+                    <> "_"
+                    <> flushed_state.default_metric.metric_name
+                  case
+                    glixir.unregister_subject_string(
+                      utils.tracktags_registry(),
+                      key,
+                    )
+                  {
+                    Ok(_) ->
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] ✅ Unregistered during cleanup: " <> key,
+                      )
+                    Error(_) ->
+                      logging.log(
+                        logging.Warning,
+                        "[MetricActor] ⚠️ Failed to unregister during cleanup: "
+                          <> key,
+                      )
+                  }
+                  actor.stop()
+                }
+                False -> {
+                  logging.log(
+                    logging.Debug,
+                    "[MetricActor] Still active: "
+                      <> flushed_state.default_metric.metric_name
+                      <> " (inactive for "
+                      <> int.to_string(inactive_duration)
+                      <> "s)",
+                  )
+                  actor.continue(flushed_state)
+                }
+              }
+            }
+          }
+        }
+        False -> {
+          // This is just cleanup tick - DON'T reset or flush
+          logging.log(
+            logging.Debug,
+            "[MetricActor] Skipping reset on cleanup tick: "
+              <> tick_type
+              <> " (flush tick is "
+              <> updated_state.tick_type
+              <> ")",
+          )
+
+          // Still check for cleanup but don't flush/reset
+          case updated_state.cleanup_after_seconds {
+            -1 -> actor.continue(updated_state)
+            cleanup_threshold -> {
+              let current_time = utils.current_timestamp()
+              let inactive_duration = current_time - updated_state.last_accessed
+              case inactive_duration > cleanup_threshold {
+                True -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] 🧹 Auto-cleanup triggered for: "
+                      <> updated_state.default_metric.metric_name,
+                  )
+                  actor.stop()
+                }
+                False -> actor.continue(updated_state)
+              }
             }
           }
         }
@@ -652,9 +815,9 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       let updated_state =
         State(
           ..state,
-          plan_limit_value: new_limit,
-          plan_limit_operator: operator,
-          plan_breach_action: action,
+          limit_value: new_limit,
+          limit_operator: operator,
+          breach_action: action,
         )
       logging.log(logging.Info, "[MetricActor] ✅ Plan limit updated in-memory")
       actor.continue(updated_state)
@@ -664,11 +827,11 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       let limit_status =
         metric_types.LimitStatus(
           current_value: updated_state.current_metric.value,
-          limit_value: updated_state.plan_limit_value,
+          limit_value: updated_state.limit_value,
           // TODO: Rename to limit_value
-          limit_operator: updated_state.plan_limit_operator,
+          limit_operator: updated_state.limit_operator,
           // TODO: Rename to limit_operator  
-          breach_action: updated_state.plan_breach_action,
+          breach_action: updated_state.breach_action,
           // TODO: Rename to breach_action
           is_breached: updated_state.is_breached,
         )
@@ -688,9 +851,9 @@ pub fn start(
   cleanup_after_seconds cleanup_after_seconds: Int,
   metric_type metric_type: String,
   metadata metadata: String,
-  plan_limit_value plan_limit_value: Float,
-  plan_limit_operator plan_limit_operator: String,
-  plan_breach_action plan_breach_action: String,
+  limit_value limit_value: Float,
+  limit_operator limit_operator: String,
+  breach_action breach_action: String,
 ) -> supervisor.ChildSpec(
   #(
     String,
@@ -722,9 +885,9 @@ pub fn start(
       cleanup_after_seconds,
       metric_type,
       metadata,
-      plan_limit_value,
-      plan_limit_operator,
-      plan_breach_action,
+      limit_value,
+      limit_operator,
+      breach_action,
     ),
     restart: supervisor.Permanent,
     shutdown_timeout: 5000,
@@ -1089,11 +1252,11 @@ fn flush_metrics_and_get_state(state: State) -> State {
 
 /// Check if current metric value breaches plan limit
 fn check_plan_breach(current_value: Float, state: State) -> Bool {
-  case state.plan_limit_value {
+  case state.limit_value {
     0.0 -> False
     // No limit set
     limit -> {
-      case state.plan_limit_operator {
+      case state.limit_operator {
         "gt" -> current_value >. limit
         "gte" -> current_value >=. limit
         "lt" -> current_value <. limit
@@ -1107,5 +1270,5 @@ fn check_plan_breach(current_value: Float, state: State) -> Bool {
 
 /// Check if metric is currently disabled due to breach
 pub fn is_metric_disabled(state: State) -> Bool {
-  state.is_breached && state.plan_breach_action == "disabled"
+  state.is_breached && state.breach_action == "disabled"
 }

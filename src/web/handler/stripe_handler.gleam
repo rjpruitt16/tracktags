@@ -3,7 +3,6 @@ import clients/supabase_client
 import gleam/bit_array
 import gleam/crypto as gleam_crypto
 import gleam/dynamic/decode
-import gleam/float
 import gleam/http
 import gleam/json
 import gleam/list
@@ -15,6 +14,11 @@ import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
 
+// Add at top of stripe_handler.gleam
+fn is_test_mode() -> Bool {
+  utils.get_env_or("STRIPE_MOCK_MODE", "false") == "true"
+}
+
 // Stripe webhook event types we care about
 pub type StripeEventType {
   InvoicePaymentSucceeded
@@ -22,12 +26,18 @@ pub type StripeEventType {
   CustomerSubscriptionUpdated
   CustomerSubscriptionDeleted
   InvoicePaymentFailed
-  InvoiceCreated
+  InvoiceFinalized
   UnknownEvent(String)
 }
 
+// It SHOULD have:
 pub type StripeData {
-  StripeData(customer: String, subscription_id: Option(String))
+  StripeData(
+    customer: String,
+    subscription_id: Option(String),
+    status: Option(String),
+    price_id: Option(String),
+  )
 }
 
 pub type StripeEvent {
@@ -60,12 +70,12 @@ pub fn handle_stripe_webhook(req: Request) -> Response {
 }
 
 // Add this new function
-fn handle_invoice_created(event: StripeEvent) -> WebhookResult {
+fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Ok(stripe_customer_id) -> {
       logging.log(
         logging.Info,
-        "[StripeHandler] 💳 Invoice created for Stripe customer: "
+        "[StripeHandler] 💳 Invoice finalized for Stripe customer: "
           <> stripe_customer_id,
       )
 
@@ -204,23 +214,38 @@ fn get_stripe_signature(req: Request) -> Result(String, Nil) {
   |> result.map(fn(header) { header.1 })
 }
 
-/// Verify Stripe signature and process webhook
 fn verify_and_process(body: String, signature: String) -> WebhookResult {
-  // Get webhook secret from environment
-  case get_webhook_secret() {
-    Error(_) -> ProcessingError("Missing webhook secret")
-    Ok(secret) -> {
-      case verify_stripe_signature(body, signature, secret) {
-        False -> InvalidSignature
-        True -> {
-          // Parse and process the webhook event
-          case parse_stripe_event(body) {
-            Error(error) -> InvalidPayload(error)
-            Ok(event) -> process_stripe_event(event)
-          }
-        }
+  let self_hosted = utils.get_env_or("SELF_HOSTED", "false") == "true"
+  let mock_mode = is_test_mode()
+
+  // Block mock mode in cloud deployments
+  case mock_mode, self_hosted {
+    True, False ->
+      ProcessingError(
+        "STRIPE_MOCK_MODE is not allowed when SELF_HOSTED is false",
+      )
+
+    // Self-hosted + mock mode: skip signature verification
+    True, True ->
+      case parse_stripe_event(body) {
+        Ok(event) -> process_stripe_event(event)
+        Error(err) -> InvalidPayload(err)
       }
-    }
+
+    // Normal path: verify signature
+    False, _ ->
+      case get_webhook_secret() {
+        Error(_) -> ProcessingError("Missing Stripe webhook secret")
+        Ok(secret) ->
+          case verify_stripe_signature(body, signature, secret) {
+            False -> InvalidSignature
+            True ->
+              case parse_stripe_event(body) {
+                Ok(event) -> process_stripe_event(event)
+                Error(err) -> InvalidPayload(err)
+              }
+          }
+      }
   }
 }
 
@@ -297,17 +322,25 @@ fn stripe_data_decoder() -> decode.Decoder(StripeData) {
   use subscription_id <- decode.optional_field(
     "id",
     None,
-    // default value
     decode.optional(decode.string),
   )
-  decode.success(StripeData(customer, subscription_id))
+  use status <- decode.optional_field(
+    "status",
+    None,
+    decode.optional(decode.string),
+  )
+  use price_id <- decode.optional_field(
+    "price_id",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(StripeData(customer, subscription_id, status, price_id))
 }
 
 // Then use it in the main event decoder - CORRECTED for new API
 fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
   use id <- decode.field("id", decode.string)
   use event_type_string <- decode.field("type", decode.string)
-  // ✅ CORRECTED: Use subfield to access nested data.object
   use data <- decode.subfield(["data", "object"], stripe_data_decoder())
   use created <- decode.field("created", decode.int)
 
@@ -318,7 +351,7 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
     "customer.subscription.updated" -> CustomerSubscriptionUpdated
     "customer.subscription.deleted" -> CustomerSubscriptionDeleted
     "invoice.payment_failed" -> InvoicePaymentFailed
-    "invoice.created" -> InvoiceCreated
+    "invoice.finalized" -> InvoiceFinalized
     unknown -> UnknownEvent(unknown)
   }
   decode.success(StripeEvent(id, event_type, data, created))
@@ -338,7 +371,7 @@ fn process_stripe_event(event: StripeEvent) -> WebhookResult {
 
     CustomerSubscriptionDeleted -> handle_subscription_deleted(event)
     InvoicePaymentFailed -> handle_payment_failed(event)
-    InvoiceCreated -> handle_invoice_created(event)
+    InvoiceFinalized -> handle_invoice_finalized(event)
     UnknownEvent(type_name) -> {
       logging.log(
         logging.Info,
@@ -377,41 +410,40 @@ fn handle_payment_succeeded(event: StripeEvent) -> WebhookResult {
 
 /// Handle new subscription - provision initial resources
 fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
-  case extract_customer_id(event.data) {
-    Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
-    Ok(customer_id) -> {
-      logging.log(
-        logging.Info,
-        "[StripeHandler] New subscription created for customer: " <> customer_id,
-      )
-
-      // Provision initial resources and set up plan limits
-      case provision_subscription_resources(customer_id, event.data) {
-        Error(error) ->
-          ProcessingError("Failed to provision resources: " <> error)
-        Ok(_) ->
-          Success("Subscription provisioned for customer: " <> customer_id)
+  case extract_subscription_data(event.data) {
+    Ok(#(stripe_customer_id, price_id, status)) -> {
+      case
+        supabase_client.update_business_subscription(
+          stripe_customer_id,
+          status,
+          price_id,
+        )
+      {
+        Ok(_) -> Success("Subscription created")
+        Error(e) -> ProcessingError(string.inspect(e))
       }
     }
+    Error(error) -> ProcessingError(error)
   }
 }
 
 /// Handle subscription update - adjust limits and features
 fn handle_subscription_updated(event: StripeEvent) -> WebhookResult {
-  case extract_customer_id(event.data) {
-    Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
-    Ok(customer_id) -> {
-      logging.log(
-        logging.Info,
-        "[StripeHandler] 🔄 Subscription updated for customer: " <> customer_id,
-      )
-
-      // Update subscription status and plan
-      case update_subscription_limits(customer_id, event.data) {
-        Error(error) -> ProcessingError("Failed to update limits: " <> error)
-        Ok(_) -> Success("Subscription updated for customer: " <> customer_id)
+  case extract_subscription_data(event.data) {
+    // Use correct function!
+    Ok(#(stripe_customer_id, price_id, status)) -> {
+      case
+        supabase_client.update_business_subscription(
+          stripe_customer_id,
+          status,
+          price_id,
+        )
+      {
+        Ok(_) -> Success("Subscription updated")
+        Error(e) -> ProcessingError(string.inspect(e))
       }
     }
+    Error(error) -> ProcessingError(error)
   }
 }
 
@@ -454,56 +486,18 @@ fn handle_subscription_deleted(event: StripeEvent) -> WebhookResult {
   }
 }
 
-/// Update subscription limits after plan change
-fn update_subscription_limits(
-  customer_id: String,
+fn extract_subscription_data(
   data: StripeData,
-) -> Result(Nil, String) {
-  logging.log(
-    logging.Info,
-    "[StripeHandler] 🔄 Processing subscription update for: " <> customer_id,
-  )
+  // Correct type!
+) -> Result(#(String, String, String), String) {
+  // Extract from StripeData fields
+  let status = option.unwrap(data.status, "active")
+  let price_id = option.unwrap(data.price_id, "price_unknown")
 
-  case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
-      // Update subscription status (might be changing from past_due to active)
-      case
-        supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
-          "active",
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] ✅ Updated subscription status to active",
-          )
-          // TODO: In future, detect plan changes and update limits accordingly
-          // For now, just ensure status is current
-          Ok(Nil)
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] ❌ Failed to update subscription: "
-              <> string.inspect(error),
-          )
-          Error("Failed to update subscription")
-        }
-      }
-    }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
-      )
-      Error("Business lookup failed")
-    }
-  }
+  Ok(#(data.customer, price_id, status))
 }
 
-/// Handle payment failure with graceful degradation
+// Handle payment failure with graceful degradation
 fn handle_payment_failure_gracefully(
   customer_id: String,
   data: StripeData,
@@ -513,41 +507,31 @@ fn handle_payment_failure_gracefully(
     "[StripeHandler] ⚠️ Processing payment failure for: " <> customer_id,
   )
 
-  case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
-      // Mark subscription as past_due (don't immediately cancel)
-      case
-        supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
-          "past_due",
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] ✅ Marked subscription as past_due",
-          )
-          // TODO: Send notification email to customer
-          // TODO: Reduce to free tier limits temporarily
-          Ok(Nil)
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] ❌ Failed to update subscription: "
-              <> string.inspect(error),
-          )
-          Error("Failed to update subscription")
-        }
-      }
+  // Just mark as past_due
+  case
+    supabase_client.update_business_subscription(
+      customer_id,
+      // stripe_customer_id
+      "past_due",
+      // status
+      option.unwrap(data.price_id, "unknown"),
+      // price_id
+    )
+  {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[StripeHandler] ✅ Marked subscription as past_due",
+      )
+      Ok(Nil)
     }
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
+        "[StripeHandler] ❌ Failed to update subscription: "
+          <> string.inspect(error),
       )
-      Error("Business lookup failed")
+      Error("Failed to update subscription")
     }
   }
 }
@@ -567,9 +551,9 @@ fn handle_subscription_cancellation(
       // Mark subscription as canceled
       case
         supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
+          customer_id,
           "canceled",
+          option.unwrap(data.price_id, "unknown"),
         )
       {
         Ok(_) -> {
@@ -621,146 +605,6 @@ fn extract_customer_id(data: StripeData) -> Result(String, String) {
   Ok(data.customer)
 }
 
-// Helper functions to extract from Stripe data
-fn extract_customer_name(data: StripeData) -> String {
-  // TODO: Extract actual customer name from Stripe webhook data
-  // For now, use customer ID as name - customer can rename in dashboard
-  data.customer
-}
-
-fn extract_customer_email(data: StripeData) -> String {
-  // TODO: Extract actual email from Stripe webhook data
-  // For now, generate placeholder - customer must update in dashboard
-  string.lowercase(data.customer) <> "@placeholder.com"
-}
-
-fn extract_plan_name_from_stripe(data: StripeData) -> String {
-  // Simple: if they have a subscription, call it their subscription ID
-  // User can rename it later in TrackTags dashboard
-  case data.subscription_id {
-    Some(sub_id) -> "plan_" <> string.slice(sub_id, 4, 8)
-    // "plan_abc123"
-    None -> "free"
-  }
-}
-
-/// Provision resources for new subscription
-fn provision_subscription_resources(
-  customer_id: String,
-  data: StripeData,
-) -> Result(Nil, String) {
-  logging.log(
-    logging.Info,
-    "[StripeHandler] 🚀 Provisioning subscription for customer: " <> customer_id,
-  )
-
-  // 1. Find business by stripe_customer_id
-  case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
-      logging.log(
-        logging.Info,
-        "[StripeHandler] ✅ Found business: " <> business.business_id,
-      )
-
-      // 2. Update subscription status
-      case
-        supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
-          "active",
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] ✅ Updated business subscription status",
-          )
-
-          // 3. Create default plan limits (you can customize this)
-          case create_default_plan_limits(business.business_id) {
-            Ok(_) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] ✅ Created default plan limits",
-              )
-              Ok(Nil)
-            }
-            Error(error) -> {
-              logging.log(
-                logging.Error,
-                "[StripeHandler] ❌ Failed to create plan limits: " <> error,
-              )
-              Error("Failed to create plan limits")
-            }
-          }
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] ❌ Failed to update subscription: "
-              <> string.inspect(error),
-          )
-          Error("Failed to update subscription")
-        }
-      }
-    }
-    Error(supabase_client.NotFound(_)) -> {
-      logging.log(
-        logging.Info,
-        "[StripeHandler] ⚠️ Business not found, creating new business for customer: "
-          <> customer_id,
-      )
-      // Updated function call
-      let business_name = extract_customer_name(data)
-      let email = extract_customer_email(data)
-
-      let plan_name = extract_plan_name_from_stripe(data)
-
-      case
-        supabase_client.create_business_for_stripe_customer(
-          customer_id,
-          business_name,
-          email,
-          plan_name,
-        )
-      {
-        Ok(business) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] ✅ Created new business: " <> business.business_id,
-          )
-          // Now create plan limits for the new business
-          case create_default_plan_limits(business.business_id) {
-            Ok(_) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] ✅ Created default plan limits for new business",
-              )
-              Ok(Nil)
-            }
-            Error(error) -> Error("Failed to create plan limits: " <> error)
-          }
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] ❌ Failed to create business: "
-              <> string.inspect(error),
-          )
-          Error("Failed to create business")
-        }
-      }
-    }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[StripeHandler] ❌ Database error: " <> string.inspect(error),
-      )
-      Error("Database error")
-    }
-  }
-}
-
 /// Update business plan after successful payment
 fn update_business_plan_after_payment(
   customer_id: String,
@@ -773,13 +617,13 @@ fn update_business_plan_after_payment(
 
   // 1. Find business by stripe_customer_id
   case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
+    Ok(_business) -> {
       // 2. Update subscription status to active (in case it was past_due)
       case
         supabase_client.update_business_subscription(
-          business.business_id,
-          data.subscription_id,
+          customer_id,
           "active",
+          option.unwrap(data.price_id, "unknown"),
         )
       {
         Ok(_) -> {
@@ -807,55 +651,6 @@ fn update_business_plan_after_payment(
       Error("Business lookup failed")
     }
   }
-}
-
-/// Create default plan limits for new subscription
-fn create_default_plan_limits(business_id: String) -> Result(Nil, String) {
-  // Example: Create a "pro" plan with default limits
-  let default_limits = [
-    #("api_calls", 10_000.0, "monthly"),
-    #("storage_mb", 1000.0, "monthly"),
-    #("users", 50.0, "monthly"),
-  ]
-
-  list.try_each(default_limits, fn(limit) {
-    let #(metric_name, limit_value, period) = limit
-    case
-      supabase_client.create_plan_limit(
-        business_id,
-        metric_name,
-        limit_value,
-        period,
-        "gte",
-        // breach_operator
-        "allow_overage",
-        // breach_action
-        None,
-        // webhook_url
-      )
-    {
-      Ok(_) -> {
-        logging.log(
-          logging.Info,
-          "[StripeHandler] ✅ Created limit: "
-            <> metric_name
-            <> " = "
-            <> float.to_string(limit_value),
-        )
-        Ok(Nil)
-      }
-      Error(error) -> {
-        logging.log(
-          logging.Error,
-          "[StripeHandler] ❌ Failed to create limit "
-            <> metric_name
-            <> ": "
-            <> string.inspect(error),
-        )
-        Error("Failed to create limit: " <> metric_name)
-      }
-    }
-  })
 }
 
 /// Handle payment failure with graceful degradation
@@ -1010,24 +805,36 @@ fn get_customer_webhook_secret(business_id: String) -> Result(String, String) {
   }
 }
 
-/// Process customer's Stripe events - simple acknowledgment for Phase 3
 fn process_customer_stripe_event(
   event: StripeEvent,
   business_id: String,
 ) -> WebhookResult {
-  logging.log(
-    logging.Info,
-    "[StripeHandler] Processing customer Stripe event: "
-      <> event.id
-      <> " for business: "
-      <> business_id,
-  )
-
-  // For Phase 3: Just log and acknowledge 
-  // Customer gets their webhook data validated and confirmed
-  Success(
-    "Customer event processed: " <> event.id <> " for business: " <> business_id,
-  )
+  case event.event_type {
+    CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
+      case extract_subscription_data(event.data) {
+        Ok(#(stripe_customer_id, price_id, status)) -> {
+          case
+            supabase_client.update_customer_subscription(
+              business_id,
+              stripe_customer_id,
+              status,
+              price_id,
+            )
+          {
+            Ok(_) -> Success("Customer subscription updated")
+            Error(e) -> ProcessingError(string.inspect(e))
+          }
+        }
+        Error(e) -> ProcessingError("Failed to extract data: " <> e)
+        // ADD THIS!
+      }
+    }
+    CustomerSubscriptionDeleted -> {
+      // Handle customer cancellation differently than business cancellation
+      Success("Customer subscription deleted for business: " <> business_id)
+    }
+    _ -> Success("Event acknowledged: " <> string.inspect(event.event_type))
+  }
 }
 
 /// Decoder for stored Stripe credentials

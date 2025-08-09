@@ -35,9 +35,9 @@ pub type MetricRequest {
     initial_value: Float,
     tags: Dict(String, String),
     metadata: Option(MetricMetadata),
-    plan_limit_value: Float,
-    plan_limit_operator: String,
-    plan_breach_action: String,
+    limit_value: Float,
+    limit_operator: String,
+    breach_action: String,
   )
 }
 
@@ -227,18 +227,18 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     decode.optional(metric_types.metadata_decoder()),
   )
 
-  use plan_limit_value <- decode.optional_field(
-    "plan_limit_value",
+  use limit_value <- decode.optional_field(
+    "limit_value",
     0.0,
     decode.float,
   )
-  use plan_limit_operator <- decode.optional_field(
-    "plan_limit_operator",
+  use limit_operator <- decode.optional_field(
+    "limit_operator",
     "gte",
     decode.string,
   )
-  use plan_breach_action <- decode.optional_field(
-    "plan_breach_action",
+  use breach_action <- decode.optional_field(
+    "breach_action",
     "disabled",
     decode.string,
   )
@@ -252,9 +252,9 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     initial_value: initial_value,
     tags: tags,
     metadata: metadata,
-    plan_limit_value: plan_limit_value,
-    plan_limit_operator: plan_limit_operator,
-    plan_breach_action: plan_breach_action,
+    limit_value: limit_value,
+    limit_operator: limit_operator,
+    breach_action: breach_action,
   ))
 }
 
@@ -794,9 +794,9 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
   let initial_value = req.initial_value
   let tick_type = interval_to_tick_type(interval)
   let cleanup_seconds = cleanup_to_seconds(cleanup_after)
-  let plan_limit_value = req.plan_limit_value
-  let plan_limit_operator = req.plan_limit_operator
-  let plan_breach_action = req.plan_breach_action
+  let limit_value = req.limit_value
+  let limit_operator = req.limit_operator
+  let breach_action = req.breach_action
 
   logging.log(
     logging.Info,
@@ -831,9 +831,9 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
           initial_value: initial_value,
           tags: req.tags,
           metadata: req.metadata,
-          plan_limit_value: plan_limit_value,
-          plan_limit_operator: plan_limit_operator,
-          plan_breach_action: plan_breach_action,
+          limit_value: limit_value,
+          limit_operator: limit_operator,
+          breach_action: breach_action,
         ),
       )
 
@@ -960,9 +960,9 @@ fn process_create_client_metric(
       req.initial_value,
       req.tags,
       req.metadata,
-      req.plan_limit_value,
-      req.plan_limit_operator,
-      req.plan_breach_action,
+      req.limit_value,
+      req.limit_operator,
+      req.breach_action,
     )
   {
     Ok(_) -> {
@@ -1003,9 +1003,9 @@ pub fn create_client_metric_internal(
   initial_value: Float,
   tags: Dict(String, String),
   metadata: Option(MetricMetadata),
-  plan_limit_value: Float,
-  plan_limit_operator: String,
-  plan_breach_action: String,
+  limit_value: Float,
+  limit_operator: String,
+  breach_action: String,
 ) -> Result(Nil, String) {
   let metric_type_parsed = metric_types.string_to_metric_type(metric_type)
   let tick_type = interval_to_tick_type(flush_interval)
@@ -1026,9 +1026,9 @@ pub fn create_client_metric_internal(
           initial_value: initial_value,
           tags: tags,
           metadata: metadata,
-          plan_limit_value: plan_limit_value,
-          plan_limit_operator: plan_limit_operator,
-          plan_breach_action: plan_breach_action,
+          limit_value: limit_value,
+          limit_operator: limit_operator,
+          breach_action: breach_action,
         ),
       )
       Ok(Nil)

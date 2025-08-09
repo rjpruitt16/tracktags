@@ -251,11 +251,12 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
   use id <- decode.field("id", decode.string)
   use business_id <- decode.field("business_id", decode.string)
   use key_type <- decode.field("key_type", decode.string)
-  use key_name <- decode.field("key_name", decode.string)
-  // Now expects a string, not optional
+  // Make key_name optional to handle NULLs
+  use key_name <- decode.optional_field("key_name", "", decode.string)
   use encrypted_key <- decode.field("encrypted_key", decode.string)
   use _metadata <- decode.field("metadata", decode.optional(decode.dynamic))
   use is_active <- decode.field("is_active", decode.bool)
+
   decode.success(IntegrationKey(
     id: id,
     business_id: business_id,
@@ -263,7 +264,6 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
     key_name: key_name,
     encrypted_key: encrypted_key,
     metadata: None,
-    // TODO: Convert Dynamic to Dict later if needed
     is_active: is_active,
   ))
 }
@@ -533,46 +533,44 @@ pub fn create_business_for_stripe_customer(
   }
 }
 
+// For TrackTags platform webhooks
 pub fn update_business_subscription(
-  business_id: String,
-  subscription_id: Option(String),
+  stripe_customer_id: String,
+  // TrackTags customer
   status: String,
-) -> Result(Nil, SupabaseError) {
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Updating subscription for business: " <> business_id,
-  )
+  price_id: String,
+) -> Result(response.Response(String), SupabaseError) {
+  // Update businesses table WHERE stripe_customer_id matches
+  let update_json =
+    json.object([
+      #("stripe_subscription_status", json.string(status)),
+      #("stripe_price_id", json.string(price_id)),
+    ])
 
-  let base_fields = [#("subscription_status", json.string(status))]
+  let url = "/businesses?stripe_customer_id=eq." <> stripe_customer_id
+  make_request(http.Patch, url, Some(json.to_string(update_json)))
+}
 
-  let all_fields = case subscription_id {
-    Some(sub_id) -> [
-      #("stripe_subscription_id", json.string(sub_id)),
-      ..base_fields
-    ]
-    None -> base_fields
-  }
+// For customer's own Stripe webhooks
+pub fn update_customer_subscription(
+  business_id: String,
+  stripe_customer_id: String,
+  status: String,
+  price_id: String,
+) -> Result(response.Response(String), SupabaseError) {
+  // Update customers table WHERE business_id AND stripe_customer_id match
+  let update_json =
+    json.object([
+      #("stripe_subscription_status", json.string(status)),
+      #("stripe_price_id", json.string(price_id)),
+    ])
 
-  let update_data = json.object(all_fields)
-
-  let path = "/businesses?business_id=eq." <> business_id
-
-  use response <- result.try(make_request(
-    http.Patch,
-    path,
-    Some(json.to_string(update_data)),
-  ))
-
-  case response.status {
-    200 | 204 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] ✅ Updated subscription status to: " <> status,
-      )
-      Ok(Nil)
-    }
-    _ -> Error(DatabaseError("Failed to update business subscription"))
-  }
+  let url =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&stripe_customer_id=eq."
+    <> stripe_customer_id
+  make_request(http.Patch, url, Some(json.to_string(update_json)))
 }
 
 /// Get business by Stripe customer ID (for webhook processing)

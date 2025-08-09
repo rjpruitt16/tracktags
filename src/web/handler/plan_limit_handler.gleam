@@ -1,4 +1,4 @@
-// src/web/handler/plan_limit_handler.gleam
+// src/web/handler/limit_handler.gleam
 import clients/supabase_client
 import gleam/dynamic/decode
 import gleam/float
@@ -113,7 +113,7 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
 // JSON DECODERS
 // ============================================================================
 
-fn plan_limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
+fn limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
   use metric_name <- decode.field("metric_name", decode.string)
   use limit_value <- decode.field("limit_value", decode.float)
   use limit_period <- decode.optional_field(
@@ -158,7 +158,7 @@ fn plan_limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
 // VALIDATION
 // ============================================================================
 
-fn validate_plan_limit_request(
+fn validate_limit_request(
   req: PlanLimitRequest,
 ) -> Result(PlanLimitRequest, List(decode.DecodeError)) {
   // Validate metric_name
@@ -247,9 +247,9 @@ pub fn create_plan_limit(req: Request) -> Response {
   let result = {
     use limit_req <- result.try(decode.run(
       json_data,
-      plan_limit_request_decoder(),
+      limit_request_decoder(),
     ))
-    use validated_req <- result.try(validate_plan_limit_request(limit_req))
+    use validated_req <- result.try(validate_limit_request(limit_req))
     Ok(process_create_plan_limit(business_id, validated_req))
   }
 
@@ -290,7 +290,7 @@ pub fn list_plan_limits(req: Request) -> Response {
     Ok(limits) -> {
       let response_data =
         limits
-        |> list.map(plan_limit_to_json)
+        |> list.map(limit_to_json)
         |> json.array(from: _, of: fn(item) { item })
 
       let success_json =
@@ -347,7 +347,7 @@ pub fn get_plan_limit(req: Request, limit_id: String) -> Response {
 
   case supabase_client.get_plan_limit_by_id(business_id, limit_id) {
     Ok(limit) -> {
-      let success_json = plan_limit_to_json(limit)
+      let success_json = limit_to_json(limit)
       logging.log(
         logging.Info,
         "[PlanLimitHandler] 🔍 GET PLAN LIMIT END - ID: " <> request_id,
@@ -401,9 +401,9 @@ pub fn update_plan_limit(req: Request, limit_id: String) -> Response {
   let result = {
     use limit_req <- result.try(decode.run(
       json_data,
-      plan_limit_request_decoder(),
+      limit_request_decoder(),
     ))
-    use validated_req <- result.try(validate_plan_limit_request(limit_req))
+    use validated_req <- result.try(validate_limit_request(limit_req))
     Ok(process_update_plan_limit(business_id, limit_id, validated_req))
   }
 
@@ -609,7 +609,7 @@ fn process_update_plan_limit(
         "[PlanLimitHandler] ✅ Plan limit updated successfully",
       )
 
-      let success_json = plan_limit_to_json(limit)
+      let success_json = limit_to_json(limit)
       wisp.json_response(json.to_string_tree(success_json), 200)
     }
     Error(supabase_client.NotFound(_)) -> {
@@ -642,7 +642,7 @@ fn process_update_plan_limit(
 // HELPER FUNCTIONS
 // ============================================================================
 
-fn plan_limit_to_json(limit: supabase_client.PlanLimit) -> json.Json {
+fn limit_to_json(limit: supabase_client.PlanLimit) -> json.Json {
   json.object([
     #("id", json.string(limit.id)),
     #("metric_name", json.string(limit.metric_name)),

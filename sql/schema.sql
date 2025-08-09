@@ -1,15 +1,16 @@
 -- TrackTags Database Schema v4 - Clean with customers table
 -- Run this in Supabase SQL Editor after dropping all tables
 
--- 1. Businesses table (top level)
+-- In sql/schema.sql, update the businesses table definition:
 CREATE TABLE businesses (
   business_id TEXT PRIMARY KEY,
   stripe_customer_id TEXT UNIQUE,
   stripe_subscription_id TEXT,
+  stripe_subscription_status TEXT DEFAULT 'free',
+  stripe_price_id TEXT,  -- ADD THIS LINE
   business_name TEXT NOT NULL,
   email TEXT NOT NULL,
   plan_type TEXT DEFAULT 'free',
-  subscription_status TEXT DEFAULT 'active',
   current_plan_id UUID,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -78,8 +79,8 @@ CREATE TABLE plan_limits (
   UNIQUE(business_id, metric_name, limit_period),
   UNIQUE(customer_id, metric_name, limit_period)
 );
-
 ALTER PUBLICATION supabase_realtime ADD TABLE plan_limits;
+
 -- 6. Customer billing periods (for individual billing cycles)
 CREATE TABLE customer_billing_periods (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -126,7 +127,7 @@ ALTER TABLE plan_limits ADD CONSTRAINT check_plan_webhook_urls_count
 CREATE INDEX idx_businesses_stripe_customer ON businesses(stripe_customer_id);
 CREATE INDEX idx_businesses_stripe_subscription ON businesses(stripe_subscription_id);
 CREATE INDEX idx_businesses_email ON businesses(email);
-CREATE INDEX idx_businesses_status ON businesses(subscription_status);
+CREATE INDEX idx_businesses_status ON businesses(stripe_subscription_status);
 
 CREATE INDEX idx_customers_business ON customers(business_id);
 CREATE INDEX idx_customers_plan ON customers(plan_id);

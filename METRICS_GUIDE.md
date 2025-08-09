@@ -192,9 +192,9 @@ curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cu
     "metric_name": "requests_per_minute",
     "metric_type": "reset",
     "flush_interval": "1m",
-    "plan_limit_value": 1000.0,
-    "plan_limit_operator": "gte",
-    "plan_breach_action": "block"
+    "limit_value": 1000.0,
+    "limit_operator": "gte",
+    "breach_action": "deny"
   }'
 ```
 
@@ -218,6 +218,33 @@ curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cu
 - Set `restore_on_startup: true` in metadata
 - Check metrics exist in database
 - Verify scope matches (business/customer)
-```
 
-This documentation should save us from these painful debugging sessions in the future!
+
+### Usage Limits & Overage
+
+Track usage against limits with automatic overage reporting:
+
+```bash
+# Create metric with usage limit and overage reporting
+curl -X POST "http://localhost:8080/api/v1/metrics" \
+  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metric_name": "api_calls",
+    "metric_type": "reset",
+    "flush_interval": "5s",
+    "initial_value": 0.0,
+    "limit_value": 1000.0,
+    "limit_operator": "gte",
+    "breach_action": "allow_overage",
+    "metadata": {
+      "integrations": {
+        "stripe": {
+          "enabled": true,
+          "overage_product_id": "prod_xyz",
+          "overage_threshold": 100
+        }
+      }
+    }
+  }'
+```
