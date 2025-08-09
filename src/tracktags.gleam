@@ -1,7 +1,6 @@
 import actors/application
 import gleam/erlang/process
-import gleam/int
-import gleam/io
+import gleam/result
 import gleam/string
 import logging
 import mist
@@ -11,57 +10,35 @@ import wisp
 import wisp/wisp_mist
 
 pub fn main() {
-  // Configure logging first
+  case start_link() {
+    Ok(_pid) -> process.sleep_forever()
+    Error(_e) -> panic as "TrackTags failed to boot"
+  }
+}
+
+pub fn start_link() -> Result(process.Pid, String) {
   logging.configure()
-
   let port = 8080
-
-  // Determine deployment mode from environment
-  let self_hosted_env = utils.get_env_or("SELF_HOSTED", "false")
   let self_hosted =
-    case string.lowercase(self_hosted_env) == "true" {
-      True -> True
-      False -> False
-    }
+    string.lowercase(utils.get_env_or("SELF_HOSTED", "false")) == "true"
 
-  // Log the current mode
-  case self_hosted {
-    True -> logging.log(logging.Info, "[Main] 🏠 Running in SELF-HOSTED mode")
-    False -> logging.log(logging.Info, "[Main] 🏢 Running in CLOUD mode")
-  }
+  // boot actor tree
+  use _app_actor <- result.try(
+    application.start_app(self_hosted)
+    |> result.map_error(fn(e) {
+      "Failed to start TrackTags: " <> string.inspect(e)
+    }),
+  )
 
-  // Start the TrackTags application (actors, registry, etc.)
-  case application.start_app(self_hosted) {
-    Ok(_app_actor) -> {
-      logging.log(
-        logging.Info,
-        "[Main] ✅ TrackTags application started successfully!",
-      )
-      // Configure Wisp
-      wisp.configure_logger()
-      let secret_key_base = wisp.random_string(64)
-      // Create the Wisp handler for Mist using wisp_mist submodule
-      let handler = wisp_mist.handler(router.handle_request, secret_key_base)
-      // Start the web server
-      let assert Ok(_) =
-        handler
-        |> mist.new
-        |> mist.port(port)
-        |> mist.start
-      logging.log(logging.Info, "[Main] ✅ Web server started successfully!")
+  // boot HTTP server
+  wisp.configure_logger()
+  let secret_key_base = wisp.random_string(64)
+  let handler = wisp_mist.handler(router.handle_request, secret_key_base)
 
-      io.println("🎉 TrackTags is running!")
-      io.println("📡 API: http://localhost:" <> int.to_string(port))
-
-      process.sleep_forever()
-    }
-    Error(e) -> {
-      logging.log(
-        logging.Error,
-        "[Main] ❌ Failed to start application: " <> string.inspect(e),
-      )
-      io.println("[Main] Failed to start: " <> string.inspect(e))
-      panic as "Failed to start TrackTags application"
-    }
-  }
+  handler
+  |> mist.new
+  |> mist.port(port)
+  |> mist.start()
+  |> result.map(fn(started) { started.pid })
+  |> result.map_error(fn(e) { "Failed to start Mist: " <> string.inspect(e) })
 }
