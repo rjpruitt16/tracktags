@@ -51,7 +51,7 @@ pub fn require_env(key: String) -> String {
   }
 }
 
-/// Get environment variable with default fallback
+// Get environment variable with default fallback
 pub fn get_env_or(key: String, default: String) -> String {
   option.unwrap(
     case envoy.get(key) {
