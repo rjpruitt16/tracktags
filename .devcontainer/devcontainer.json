@@ -1,0 +1,49 @@
+{
+  "name": "TrackTags Development",
+  "dockerFile": "Dockerfile",
+  
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {}
+  },
+  
+  // Build and start Gleam
+  "postCreateCommand": "gleam deps download && gleam build",
+  "postStartCommand": "gleam run",
+  
+  // Forward the TrackTags port
+  "forwardPorts": [4001],
+  "portsAttributes": {
+    "4001": {
+      "label": "TrackTags API",
+      "onAutoForward": "notify",
+      "protocol": "http"
+    }
+  },
+  
+  // VS Code customizations
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "gleam.gleam",
+        "github.copilot"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "files.watcherExclude": {
+          "**/build/**": true
+        }
+      }
+    }
+  },
+  
+  // Environment for contributors - they add their own secrets
+  "remoteEnv": {
+    "TRACKTAGS_PORT": "4001",
+    "SELF_HOSTED": "true",
+    // Contributors will add their own via Codespaces secrets:
+    // SUPABASE_URL, SUPABASE_KEY, STRIPE_SECRET, etc.
+  },
+  
+  // Welcome message for contributors
+  "postAttachCommand": "echo '🚀 Welcome to TrackTags! \\n⚠️  Add your own Supabase/Stripe secrets in Codespace settings if needed.\\nRun `gleam test` for tests or `gleam run` to start the server.'"
+}
