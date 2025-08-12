@@ -1,5 +1,6 @@
 import actors/application
 import gleam/erlang/process
+import gleam/int
 import gleam/result
 import gleam/string
 import logging
@@ -18,7 +19,16 @@ pub fn main() {
 
 pub fn start_link() -> Result(process.Pid, String) {
   logging.configure()
-  let port = 8080
+
+  // Prefer TRACKTAGS_PORT, then generic PORT, default 4001
+  let port_str =
+    utils.get_env_or("TRACKTAGS_PORT", utils.get_env_or("PORT", "4001"))
+
+  let port = case int.parse(port_str) {
+    Ok(p) -> p
+    Error(_) -> 4001
+  }
+
   let self_hosted =
     string.lowercase(utils.get_env_or("SELF_HOSTED", "false")) == "true"
 
