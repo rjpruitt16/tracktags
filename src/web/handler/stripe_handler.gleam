@@ -2,6 +2,7 @@
 import clients/supabase_client
 import gleam/bit_array
 import gleam/crypto as gleam_crypto
+import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/http
 import gleam/json
@@ -37,6 +38,7 @@ pub type StripeData {
     subscription_id: Option(String),
     status: Option(String),
     price_id: Option(String),
+    metadata: Option(Dict(String, String)),
   )
 }
 
@@ -316,7 +318,7 @@ fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
   }
 }
 
-// First, decode the nested data object
+// UPDATE the stripe_data_decoder (around line 275)
 fn stripe_data_decoder() -> decode.Decoder(StripeData) {
   use customer <- decode.field("customer", decode.string)
   use subscription_id <- decode.optional_field(
@@ -334,7 +336,19 @@ fn stripe_data_decoder() -> decode.Decoder(StripeData) {
     None,
     decode.optional(decode.string),
   )
-  decode.success(StripeData(customer, subscription_id, status, price_id))
+  // ADD metadata extraction
+  use metadata <- decode.optional_field(
+    "metadata",
+    None,
+    decode.optional(decode.dict(decode.string, decode.string)),
+  )
+  decode.success(StripeData(
+    customer,
+    subscription_id,
+    status,
+    price_id,
+    metadata,
+  ))
 }
 
 // Then use it in the main event decoder - CORRECTED for new API
@@ -408,19 +422,73 @@ fn handle_payment_succeeded(event: StripeEvent) -> WebhookResult {
   }
 }
 
-/// Handle new subscription - provision initial resources
+// REPLACE handle_subscription_created (around line 350)
 fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
   case extract_subscription_data(event.data) {
     Ok(#(stripe_customer_id, price_id, status)) -> {
-      case
-        supabase_client.update_business_subscription(
-          stripe_customer_id,
-          status,
-          price_id,
-        )
-      {
-        Ok(_) -> Success("Subscription created")
-        Error(e) -> ProcessingError(string.inspect(e))
+      // Check if this customer already exists
+      case supabase_client.get_business_by_stripe_customer(stripe_customer_id) {
+        Ok(_existing_business) -> {
+          // Customer exists, just update subscription
+          case
+            supabase_client.update_business_subscription(
+              stripe_customer_id,
+              status,
+              price_id,
+            )
+          {
+            Ok(_) -> Success("Subscription updated for existing customer")
+            Error(e) -> ProcessingError(string.inspect(e))
+          }
+        }
+        Error(_) -> {
+          // NEW CUSTOMER - need to map them using metadata!
+          case event.data.metadata {
+            Some(metadata) -> {
+              case dict.get(metadata, "business_id") {
+                Ok(business_id) -> {
+                  // First, set the stripe_customer_id on the business
+                  case
+                    supabase_client.set_stripe_customer_id(
+                      business_id,
+                      stripe_customer_id,
+                    )
+                  {
+                    Ok(_) -> {
+                      // Now update subscription details
+                      case
+                        supabase_client.update_business_subscription(
+                          stripe_customer_id,
+                          status,
+                          price_id,
+                        )
+                      {
+                        Ok(_) -> Success("New subscription created and mapped")
+                        Error(e) ->
+                          ProcessingError(
+                            "Failed to update subscription: "
+                            <> string.inspect(e),
+                          )
+                      }
+                    }
+                    Error(e) ->
+                      ProcessingError(
+                        "Failed to map customer: " <> string.inspect(e),
+                      )
+                  }
+                }
+                Error(_) ->
+                  ProcessingError(
+                    "No business_id in metadata - cannot map customer!",
+                  )
+              }
+            }
+            None ->
+              ProcessingError(
+                "No metadata in webhook - cannot map new customer!",
+              )
+          }
+        }
       }
     }
     Error(error) -> ProcessingError(error)

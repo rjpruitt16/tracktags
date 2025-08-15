@@ -482,6 +482,47 @@ pub fn downgrade_to_free_limits(
 // BUSINESS MANAGEMENT
 // ============================================================================
 
+// ADD this function (around line 900, near other business functions)
+/// Set stripe_customer_id for a business (initial mapping from Stripe webhook)
+pub fn set_stripe_customer_id(
+  business_id: String,
+  stripe_customer_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Mapping Stripe customer "
+      <> stripe_customer_id
+      <> " to business "
+      <> business_id,
+  )
+
+  let update_json =
+    json.object([
+      #("stripe_customer_id", json.string(stripe_customer_id)),
+      #("stripe_subscription_status", json.string("active")),
+    ])
+
+  let url = "/businesses?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    url,
+    Some(json.to_string(update_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Mapped Stripe customer to business",
+      )
+      Ok(Nil)
+    }
+    404 -> Error(NotFound("Business not found: " <> business_id))
+    _ -> Error(DatabaseError("Failed to set stripe_customer_id"))
+  }
+}
+
 /// Create business for new Stripe customer (webhook auto-creation)
 pub fn create_business_for_stripe_customer(
   stripe_customer_id: String,
