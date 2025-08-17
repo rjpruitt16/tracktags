@@ -38,11 +38,29 @@ pub type KeyRequest {
 // CONSTANTS
 // ============================================================================
 
-const valid_key_types = ["stripe", "supabase", "fly"]
+const valid_key_types = ["stripe", "supabase", "fly", "business"]
 
 // ============================================================================
 // VALIDATION & CONVERSION
 // ============================================================================
+
+fn validate_business_credentials(
+  credentials: Dict(String, String),
+) -> Result(Nil, String) {
+  case dict.get(credentials, "business_id") {
+    Ok("biz_" <> _) -> Ok(Nil)
+    Ok(_) -> Error("Business ID must start with biz_")
+    Error(_) -> Error("Missing business_id for business key")
+  }
+  |> result.try(fn(_) {
+    case dict.get(credentials, "api_key") {
+      Ok("tk_live_" <> _) -> Ok(Nil)
+      Ok("tk_test_" <> _) -> Ok(Nil)
+      Ok(_) -> Error("API key must start with tk_live_ or tk_test_")
+      Error(_) -> Error("Missing api_key for business key")
+    }
+  })
+}
 
 fn validate_stripe_credentials(
   credentials: Dict(String, String),
@@ -126,6 +144,7 @@ fn validate_credentials(
     "stripe" -> validate_stripe_credentials(credentials)
     "supabase" -> validate_supabase_credentials(credentials)
     "fly" -> validate_fly_credentials(credentials)
+    "business" -> validate_business_credentials(credentials)
     _ -> Error("Unknown key type")
   }
 }
@@ -182,22 +201,37 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
       wisp.json_response(json.to_string_tree(error_json), 401)
     }
     Ok(api_key) -> {
-      case supabase_client.validate_api_key(api_key) {
-        Error(_) -> {
-          logging.log(
-            logging.Warning,
-            "[KeyHandler] Invalid API key: "
-              <> string.slice(api_key, 0, 10)
-              <> "...",
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Unauthorized")),
-              #("message", json.string("Invalid API key")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 401)
+      // Check if it's the admin key first
+      let admin_key = utils.require_env("ADMIN_API_KEY")
+      case api_key == admin_key {
+        True -> {
+          // Admin can create keys - extract business_id from request body
+          logging.log(logging.Info, "[KeyHandler] Admin auth successful")
+          // For admin, we need to get business_id from the request body
+          // The credentials should contain it
+          handler("admin_override")
+          // Special marker for admin
         }
-        Ok(business_id) -> handler(business_id)
+        False -> {
+          // Regular API key validation
+          case supabase_client.validate_api_key(api_key) {
+            Error(_) -> {
+              logging.log(
+                logging.Warning,
+                "[KeyHandler] Invalid API key: "
+                  <> string.slice(api_key, 0, 10)
+                  <> "...",
+              )
+              let error_json =
+                json.object([
+                  #("error", json.string("Unauthorized")),
+                  #("message", json.string("Invalid API key")),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 401)
+            }
+            Ok(business_id) -> handler(business_id)
+          }
+        }
       }
     }
   }
@@ -469,7 +503,26 @@ fn validate_key_request(
   })
 }
 
-fn process_create_key(business_id: String, req: KeyRequest) -> Response {
+fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
+  // If admin, get business_id from credentials
+  let business_id = case business_id_param {
+    "admin_override" -> {
+      // Admin is creating a key, get the actual business_id from credentials
+      case dict.get(req.credentials, "business_id") {
+        Ok(bid) -> bid
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[KeyHandler] Admin request missing business_id in credentials",
+          )
+          business_id_param
+          // This will likely fail, but gives better error
+        }
+      }
+    }
+    _ -> business_id_param
+  }
+
   logging.log(
     logging.Info,
     "[KeyHandler] Processing CREATE key: "
@@ -498,6 +551,7 @@ fn process_create_key(business_id: String, req: KeyRequest) -> Response {
       case
         supabase_client.store_integration_key(
           business_id,
+          // Now uses the extracted business_id
           req.key_type,
           req.key_name,
           encrypted_credentials,
@@ -514,7 +568,6 @@ fn process_create_key(business_id: String, req: KeyRequest) -> Response {
               #("key_name", json.string(req.key_name)),
               #("is_active", json.bool(key_key.is_active)),
               #("encrypted", json.bool(True)),
-              // NEW: Indicate encryption is used
             ])
 
           logging.log(

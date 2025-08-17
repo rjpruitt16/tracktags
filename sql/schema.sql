@@ -1,13 +1,14 @@
 -- TrackTags Database Schema v4 - Clean with customers table
 -- Run this in Supabase SQL Editor after dropping all tables
 
--- In sql/schema.sql, update the businesses table definition:
+-- In schema.sql, update the businesses table CREATE statement:
 CREATE TABLE businesses (
   business_id TEXT PRIMARY KEY,
+  user_id UUID REFERENCES auth.users(id),  -- ADD THIS LINE
   stripe_customer_id TEXT UNIQUE,
   stripe_subscription_id TEXT,
   stripe_subscription_status TEXT DEFAULT 'free',
-  stripe_price_id TEXT,  -- ADD THIS LINE
+  stripe_price_id TEXT,
   business_name TEXT NOT NULL,
   email TEXT NOT NULL,
   plan_type TEXT DEFAULT 'free',
@@ -16,20 +17,11 @@ CREATE TABLE businesses (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 2. Plans table  
-CREATE TABLE plans (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  business_id TEXT REFERENCES businesses(business_id) ON DELETE CASCADE,
-  plan_name TEXT NOT NULL,
-  stripe_price_id TEXT,
-  plan_status TEXT DEFAULT 'active',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- 3. Customers table (was clients)
+-- In schema.sql, update the customers table CREATE statement:
 CREATE TABLE customers (
   customer_id TEXT PRIMARY KEY,
   business_id TEXT REFERENCES businesses(business_id) ON DELETE CASCADE,
+  user_id UUID REFERENCES auth.users(id),  -- ADD THIS LINE
   plan_id UUID REFERENCES plans(id) ON DELETE SET NULL,
   customer_name TEXT NOT NULL,
   stripe_customer_id TEXT,
@@ -124,6 +116,9 @@ ALTER TABLE plan_limits ADD CONSTRAINT check_plan_webhook_urls_count
   CHECK (array_length(string_to_array(webhook_urls, ','), 1) <= 5 OR webhook_urls IS NULL);
 
 -- Indexes for performance
+CREATE INDEX idx_businesses_user ON businesses(user_id);
+CREATE INDEX idx_customers_user ON customers(user_id);- 3. Customers table (was clients)
+
 CREATE INDEX idx_businesses_stripe_customer ON businesses(stripe_customer_id);
 CREATE INDEX idx_businesses_stripe_subscription ON businesses(stripe_subscription_id);
 CREATE INDEX idx_businesses_email ON businesses(email);

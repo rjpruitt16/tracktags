@@ -1,8 +1,10 @@
 -- TrackTags Sample Data v4 - Using customers table
 -- Run this after schema.sql to get demo data
 
+-- Insert test businesses with NULL user_id for easy testing
 INSERT INTO businesses (
     business_id,
+    user_id,  -- NULL for test data
     business_name,
     email,
     plan_type,
@@ -11,10 +13,22 @@ INSERT INTO businesses (
     stripe_subscription_status,
     stripe_price_id
 ) VALUES
-    ('biz_001', 'Acme SaaS Co', 'founder@acme-saas.com', 'pro', 'cus_acme123', 'sub_acme456', 'active', 'price_pro_123'),
-    ('biz_002', 'Beta Startup', 'ceo@beta.io', 'starter', 'cus_beta456', 'sub_beta789', 'active', 'price_starter_456');
+    ('biz_001', NULL, 'Acme SaaS Co', 'founder@acme-saas.com', 'pro', 'cus_acme123', 'sub_acme456', 'active', 'price_pro_123'),
+    ('biz_002', NULL, 'Beta Startup', 'ceo@beta.io', 'starter', 'cus_beta456', 'sub_beta789', 'active', 'price_starter_456'),
+    ('biz_003', NULL, 'Scale Corp', 'enterprise@scalecorp.com', 'enterprise', 'cus_scale789', 'sub_scale012', 'active', 'price_ent_789');
 
--- Insert test plans
+-- Insert test customers with NULL user_id
+INSERT INTO customers (customer_id, business_id, user_id, plan_id, customer_name) VALUES
+  ('mobile_app', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Mobile Application'),
+  ('web_portal', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Web Portal'),
+  ('api_service', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'enterprise'), 'API Service'),
+  ('customer_app', 'biz_002', NULL, (SELECT id FROM plans WHERE business_id = 'biz_002' AND plan_name = 'free'), 'Main Customer App'),
+  ('enterprise_customer', 'biz_003', NULL, (SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'Enterprise Integration');
+
+-- Note: When creating businesses through LiveTags dashboard, user_id will be set
+-- Example of how LiveTags would insert:
+-- INSERT INTO businesses (business_id, user_id, business_name, email, plan_type)
+-- VALUES ('biz_xyz', 'actual-user-uuid-here', 'New Business', 'user@example.com', 'free');-- Insert test plans
 INSERT INTO plans (business_id, plan_name, stripe_price_id, plan_status) VALUES
   ('biz_001', 'free', NULL, 'active'),
   ('biz_001', 'pro', 'price_pro_123', 'active'),
@@ -38,14 +52,6 @@ UPDATE businesses SET current_plan_id = (
 UPDATE businesses SET current_plan_id = (
   SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'
 ) WHERE business_id = 'biz_003';
-
--- Insert test customers (was clients)
-INSERT INTO customers (customer_id, business_id, plan_id, customer_name) VALUES
-  ('mobile_app', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Mobile Application'),
-  ('web_portal', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Web Portal'),
-  ('api_service', 'biz_001', (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'enterprise'), 'API Service'),
-  ('customer_app', 'biz_002', (SELECT id FROM plans WHERE business_id = 'biz_002' AND plan_name = 'free'), 'Main Customer App'),
-  ('enterprise_customer', 'biz_003', (SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'Enterprise Integration');
 
 -- Insert test API keys
 INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key) VALUES

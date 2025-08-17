@@ -227,11 +227,7 @@ fn metric_request_decoder() -> decode.Decoder(MetricRequest) {
     decode.optional(metric_types.metadata_decoder()),
   )
 
-  use limit_value <- decode.optional_field(
-    "limit_value",
-    0.0,
-    decode.float,
-  )
+  use limit_value <- decode.optional_field("limit_value", 0.0, decode.float)
   use limit_operator <- decode.optional_field(
     "limit_operator",
     "gte",
