@@ -104,12 +104,24 @@ fn validate_api_key(api_key: String) -> Result(String, String) {
   )
 
   case supabase_client.validate_api_key(api_key) {
-    Ok(business_id) -> {
+    Ok(supabase_client.BusinessKey(business_id)) -> {
       logging.log(
         logging.Info,
         "[MetricHandler] ✅ API key validated for business: " <> business_id,
       )
       Ok(business_id)
+    }
+    Ok(supabase_client.CustomerKey(business_id, customer_id)) -> {
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Customer key validated: "
+          <> business_id
+          <> "/"
+          <> customer_id,
+      )
+      // For metrics, we can allow customers to create their own metrics
+      // Return the customer scope as the "business_id" for scoping
+      Ok(business_id <> ":" <> customer_id)
     }
     Error(supabase_client.NotFound(_)) -> {
       logging.log(

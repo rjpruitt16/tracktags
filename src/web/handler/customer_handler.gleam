@@ -1,4 +1,4 @@
-// src/web/handler/customer_handler.gleam
+// src/web/handler/customer_handler.gleam=
 import clients/supabase_client
 import gleam/dynamic/decode
 import gleam/http
@@ -62,12 +62,26 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
     }
     Ok(api_key) -> {
       case supabase_client.validate_api_key(api_key) {
-        Ok(business_id) -> {
+        Ok(supabase_client.BusinessKey(business_id)) -> {
           logging.log(
             logging.Info,
-            "[CustomerHandler] ✅ API key validated for business: " <> business_id,
+            "[CustomerHandler] ✅ API key validated for business: "
+              <> business_id,
           )
           handler(business_id)
+        }
+        Ok(supabase_client.CustomerKey(business_id, _)) -> {
+          logging.log(
+            logging.Warning,
+            "[CustomerHandler] Customer key cannot manage customers for business: "
+              <> business_id,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Forbidden")),
+              #("message", json.string("Customer keys cannot manage customers")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 403)
         }
         Error(supabase_client.Unauthorized) -> {
           let error_json =
@@ -157,7 +171,10 @@ pub fn create_customer(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use customer_req <- result.try(decode.run(json_data, customer_request_decoder()))
+    use customer_req <- result.try(decode.run(
+      json_data,
+      customer_request_decoder(),
+    ))
     use validated_req <- result.try(validate_customer_request(customer_req))
     Ok(process_create_customer(business_id, validated_req))
   }
@@ -244,13 +261,13 @@ pub fn list_customers(req: Request) -> Response {
   }
 }
 
-pub fn get_client(req: Request, customer_id: String) -> Response {
+pub fn get_customer(req: Request, customer_id: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[CustomerHandler] 🔍 GET CUSTOMER REQUEST START - ID: "
       <> request_id
-      <> " client: "
+      <> " customer: "
       <> customer_id,
   )
 
@@ -259,7 +276,10 @@ pub fn get_client(req: Request, customer_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 Getting customer: " <> business_id <> "/" <> customer_id,
+    "[CustomerHandler] 🔍 Getting customer: "
+      <> business_id
+      <> "/"
+      <> customer_id,
   )
 
   case supabase_client.get_customer_by_id(business_id, customer_id) {
@@ -327,7 +347,10 @@ pub fn delete_customer(req: Request, customer_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🗑️ Deleting customer: " <> business_id <> "/" <> customer_id,
+    "[CustomerHandler] 🗑️ Deleting customer: "
+      <> business_id
+      <> "/"
+      <> customer_id,
   )
 
   let success_json =
@@ -349,7 +372,10 @@ pub fn delete_customer(req: Request, customer_id: String) -> Response {
 // PROCESSING FUNCTIONS
 // ============================================================================
 
-fn process_create_customer(business_id: String, req: CustomerRequest) -> Response {
+fn process_create_customer(
+  business_id: String,
+  req: CustomerRequest,
+) -> Response {
   logging.log(
     logging.Info,
     "[CustomerHandler] 🏗️ Processing CREATE customer: "
@@ -405,7 +431,8 @@ fn process_create_customer(business_id: String, req: CustomerRequest) -> Respons
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[CustomerHandler] ❌ Failed to create customer: " <> string.inspect(error),
+        "[CustomerHandler] ❌ Failed to create customer: "
+          <> string.inspect(error),
       )
 
       let error_json =
@@ -417,25 +444,6 @@ fn process_create_customer(business_id: String, req: CustomerRequest) -> Respons
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
   }
-}
-
-pub fn create_client_key(req: Request, customer_id: String) -> Response {
-  use <- wisp.require_method(req, http.Post)
-  use business_id <- with_auth(req)
-
-  logging.log(
-    logging.Info,
-    "[CustomerHandler] Creating key for customer: " <> customer_id,
-  )
-
-  let success_json =
-    json.object([
-      #("message", json.string("Create customer key - LOGGED")),
-      #("business_id", json.string(business_id)),
-      #("customer_id", json.string(customer_id)),
-    ])
-
-  wisp.json_response(json.to_string_tree(success_json), 201)
 }
 
 pub fn list_client_keys(req: Request, customer_id: String) -> Response {
@@ -467,7 +475,10 @@ pub fn delete_client_key(
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] Deleting key: " <> key_id <> " for customer: " <> customer_id,
+    "[CustomerHandler] Deleting key: "
+      <> key_id
+      <> " for customer: "
+      <> customer_id,
   )
 
   let success_json =

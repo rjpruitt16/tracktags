@@ -38,7 +38,13 @@ pub type KeyRequest {
 // CONSTANTS
 // ============================================================================
 
-const valid_key_types = ["stripe", "supabase", "fly", "business"]
+const valid_key_types = [
+  "stripe",
+  "supabase",
+  "fly",
+  "business",
+  "customer_api",
+]
 
 // ============================================================================
 // VALIDATION & CONVERSION
@@ -596,4 +602,52 @@ fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
       }
     }
   }
+}
+
+pub fn create_customer_key(req: Request, customer_id: String) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use business_id <- with_auth(req)
+
+  let customer_key = utils.create_customer_key(customer_id)
+
+  case
+    supabase_client.store_integration_key(
+      business_id,
+      "customer_api",
+      customer_id,
+      customer_key,
+      None,
+    )
+  {
+    Ok(_) -> {
+      let success_json =
+        json.object([
+          #("status", json.string("created")),
+          #("customer_key", json.string(customer_key)),
+          #("customer_id", json.string(customer_id)),
+        ])
+      wisp.json_response(json.to_string_tree(success_json), 201)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Internal Server Error")),
+          #("message", json.string("Failed to create customer key")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
+}
+
+pub fn list_customer_keys(req: Request, customer_id: String) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use business_id <- with_auth(req)
+
+  let success_json =
+    json.object([
+      #("message", json.string("List customer keys - TODO")),
+      #("business_id", json.string(business_id)),
+      #("customer_id", json.string(customer_id)),
+    ])
+  wisp.json_response(json.to_string_tree(success_json), 200)
 }

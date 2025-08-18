@@ -581,14 +581,10 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
     }
     Ok(api_key) -> {
       case supabase_client.validate_api_key(api_key) {
-        Ok(business_id) -> {
-          logging.log(
-            logging.Info,
-            "[ProxyHandler] ✅ API key validated for business: " <> business_id,
-          )
-          handler(business_id)
-        }
-        Error(supabase_client.Unauthorized) -> {
+        Ok(supabase_client.BusinessKey(business_id)) -> handler(business_id)
+        Ok(supabase_client.CustomerKey(business_id, customer_id)) ->
+          handle_customer_request(req, business_id, customer_id)
+        Error(_) -> {
           let error_json =
             json.object([
               #("error", json.string("Unauthorized")),
@@ -596,15 +592,21 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
             ])
           wisp.json_response(json.to_string_tree(error_json), 401)
         }
-        Error(_) -> {
-          let error_json =
-            json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("API key validation failed")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
-        }
       }
     }
   }
+}
+
+fn handle_customer_request(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  let success_json =
+    json.object([
+      #("status", json.string("customer_request_processed")),
+      #("business_id", json.string(business_id)),
+      #("customer_id", json.string(customer_id)),
+    ])
+  wisp.json_response(json.to_string_tree(success_json), 200)
 }

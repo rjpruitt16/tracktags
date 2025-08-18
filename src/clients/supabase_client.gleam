@@ -95,6 +95,11 @@ pub type Customer {
   )
 }
 
+pub type KeyValidation {
+  BusinessKey(business_id: String)
+  CustomerKey(business_id: String, customer_id: String)
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -273,18 +278,16 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
 // ============================================================================
 
 /// Validate an API key and return the business_id
-pub fn validate_api_key(api_key: String) -> Result(String, SupabaseError) {
+pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Validating API key: "
+    "[SupabaseClient] Enhanced validation for: "
       <> string.slice(api_key, 0, 10)
       <> "...",
   )
 
   let path =
-    "/integration_keys?key_type=eq.api&encrypted_key=eq."
-    <> api_key
-    <> "&is_active=eq.true"
+    "/integration_keys?encrypted_key=eq." <> api_key <> "&is_active=eq.true"
 
   use response <- result.try(make_request(http.Get, path, None))
 
@@ -296,28 +299,32 @@ pub fn validate_api_key(api_key: String) -> Result(String, SupabaseError) {
           Error(NotFound("API key not found"))
         }
         Ok([integration_key, ..]) -> {
-          logging.log(
-            logging.Info,
-            "[SupabaseClient] API key validated for business: "
-              <> integration_key.business_id,
-          )
-          Ok(integration_key.business_id)
+          case integration_key.key_type {
+            "api" -> {
+              logging.log(
+                logging.Info,
+                "[SupabaseClient] Business key validated",
+              )
+              Ok(BusinessKey(integration_key.business_id))
+            }
+            "customer_api" -> {
+              logging.log(
+                logging.Info,
+                "[SupabaseClient] Customer key validated",
+              )
+              Ok(CustomerKey(
+                integration_key.business_id,
+                integration_key.key_name,
+              ))
+            }
+            _ -> Error(NotFound("Invalid key type"))
+          }
         }
-        Error(decode_errors) -> {
-          logging.log(
-            logging.Error,
-            "[SupabaseClient] Failed to parse response: "
-              <> string.inspect(decode_errors),
-          )
-          Error(ParseError("Invalid response format"))
-        }
+        Error(_) -> Error(ParseError("Invalid response format"))
       }
     }
     401 -> Error(Unauthorized)
-    _ ->
-      Error(DatabaseError(
-        "Unexpected response: " <> int.to_string(response.status),
-      ))
+    _ -> Error(DatabaseError("Key validation failed"))
   }
 }
 

@@ -62,7 +62,7 @@ pub fn handle_request(req: Request) -> Response {
     // Individual client operations
     ["api", "v1", "customers", customer_id] ->
       case req.method {
-        Get -> customer_handler.get_client(req, customer_id)
+        Get -> customer_handler.get_customer(req, customer_id)
         Delete -> customer_handler.delete_customer(req, customer_id)
         _ -> wisp.method_not_allowed([Get, Delete])
       }
@@ -70,11 +70,10 @@ pub fn handle_request(req: Request) -> Response {
     // Client key management
     ["api", "v1", "customers", customer_id, "keys"] ->
       case req.method {
-        Post -> customer_handler.create_client_key(req, customer_id)
-        Get -> customer_handler.list_client_keys(req, customer_id)
+        Post -> key_handler.create_customer_key(req, customer_id)
+        Get -> key_handler.list_customer_keys(req, customer_id)
         _ -> wisp.method_not_allowed([Post, Get])
       }
-
     // Individual client key operations
     ["api", "v1", "customers", customer_id, "keys", key_id] ->
       case req.method {
