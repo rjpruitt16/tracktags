@@ -2,7 +2,9 @@
 import birl
 import envoy
 import gleam/erlang/atom
+import gleam/int
 import gleam/option.{None, Some}
+import gleam/string
 import logging
 
 // ============================================================================
@@ -89,3 +91,17 @@ pub fn generate_request_id() -> String {
 
 @external(erlang, "erlang", "integer_to_binary")
 fn to_string(int: Int) -> String
+
+pub fn generate_random() -> String {
+  // Generate 8 random characters
+  let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+  string.slice(int.to_string(system_time()), -8, 8)
+}
+
+pub fn create_business_key() -> String {
+  "tk_live_" <> generate_random()
+}
+
+pub fn create_customer_key(customer_id: String) -> String {
+  "ck_live_" <> customer_id <> "_" <> generate_random()
+}

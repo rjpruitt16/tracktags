@@ -80,13 +80,29 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
     }
     Ok(api_key) -> {
       case supabase_client.validate_api_key(api_key) {
-        Ok(business_id) -> {
+        Ok(supabase_client.BusinessKey(business_id)) -> {
           logging.log(
             logging.Info,
             "[PlanLimitHandler] ✅ API key validated for business: "
               <> business_id,
           )
           handler(business_id)
+        }
+        Ok(supabase_client.CustomerKey(business_id, _)) -> {
+          logging.log(
+            logging.Warning,
+            "[PlanLimitHandler] Customer key cannot manage plan limits for business: "
+              <> business_id,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Forbidden")),
+              #(
+                "message",
+                json.string("Customer keys cannot manage plan limits"),
+              ),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 403)
         }
         Error(supabase_client.Unauthorized) -> {
           let error_json =
@@ -245,10 +261,7 @@ pub fn create_plan_limit(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use limit_req <- result.try(decode.run(
-      json_data,
-      limit_request_decoder(),
-    ))
+    use limit_req <- result.try(decode.run(json_data, limit_request_decoder()))
     use validated_req <- result.try(validate_limit_request(limit_req))
     Ok(process_create_plan_limit(business_id, validated_req))
   }
@@ -399,10 +412,7 @@ pub fn update_plan_limit(req: Request, limit_id: String) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use limit_req <- result.try(decode.run(
-      json_data,
-      limit_request_decoder(),
-    ))
+    use limit_req <- result.try(decode.run(json_data, limit_request_decoder()))
     use validated_req <- result.try(validate_limit_request(limit_req))
     Ok(process_update_plan_limit(business_id, limit_id, validated_req))
   }
