@@ -221,6 +221,29 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
         False -> {
           // Regular API key validation
           case supabase_client.validate_api_key(api_key) {
+            Ok(supabase_client.BusinessKey(business_id)) -> {
+              logging.log(
+                logging.Info,
+                "[KeyHandler] ✅ Business key validated for: " <> business_id,
+              )
+              handler(business_id)
+            }
+            Ok(supabase_client.CustomerKey(business_id, _)) -> {
+              logging.log(
+                logging.Warning,
+                "[KeyHandler] Customer key cannot manage keys for business: "
+                  <> business_id,
+              )
+              let error_json =
+                json.object([
+                  #("error", json.string("Forbidden")),
+                  #(
+                    "message",
+                    json.string("Customer keys cannot manage other keys"),
+                  ),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 403)
+            }
             Error(_) -> {
               logging.log(
                 logging.Warning,
@@ -235,7 +258,6 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
                 ])
               wisp.json_response(json.to_string_tree(error_json), 401)
             }
-            Ok(business_id) -> handler(business_id)
           }
         }
       }
