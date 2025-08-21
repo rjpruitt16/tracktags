@@ -53,22 +53,23 @@ UPDATE businesses SET current_plan_id = (
   SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'
 ) WHERE business_id = 'biz_003';
 
--- Insert test API keys
-INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key) VALUES
-  -- Business API keys
-  ('biz_001', 'api', 'production', 'tk_live_test123'),
-  ('biz_001', 'api', 'staging', 'tk_test_staging456'),
-  ('biz_002', 'api', 'main', 'tk_live_test456'),
-  ('biz_003', 'api', 'main', 'tk_live_test789'),
-  ('biz_003', 'stripe', 'production', 'sk_live_encrypted_stripe_key'),
+-- Insert test API keys with hashes
+INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key, key_hash) VALUES
+  -- Business API keys (these need hashes for validation)
+  ('biz_001', 'api', 'production', 'ENCRYPTED_tk_live_test123', 'HASH_tk_live_test123'),
+  ('biz_001', 'api', 'staging', 'ENCRYPTED_tk_test_staging456', 'HASH_tk_test_staging456'),
+  ('biz_002', 'api', 'main', 'ENCRYPTED_tk_live_test456', 'HASH_tk_live_test456'),
+  ('biz_003', 'api', 'main', 'ENCRYPTED_tk_live_test789', 'HASH_tk_live_test789'),
   
-  -- Customer API keys (for proxy API rate limiting)
-  ('biz_001', 'customer', 'customer_001', 'cust_key_abc123'),
-  ('biz_001', 'customer', 'customer_002', 'cust_key_def456'),
-  ('biz_002', 'customer', 'user_123', 'cust_key_xyz789'),
-  ('biz_003', 'customer', 'enterprise_user_1', 'cust_key_ent001');
+  -- Integration keys (encrypted but no hash needed)
+  ('biz_003', 'stripe', 'production', 'ENCRYPTED_stripe_credentials', NULL),
+  
+  -- Customer API keys (these need hashes for validation)
+  ('biz_001', 'customer_api', 'customer_001', 'ENCRYPTED_ck_live_customer_001_abc123', 'HASH_ck_live_customer_001_abc123'),
+  ('biz_001', 'customer_api', 'customer_002', 'ENCRYPTED_ck_live_customer_002_def456', 'HASH_ck_live_customer_002_def456'),
+  ('biz_002', 'customer_api', 'customer_123', 'ENCRYPTED_ck_live_customer_123_xyz789', 'HASH_ck_live_customer_123_xyz789'),
+  ('biz_003', 'customer_api', 'customer_ent_001', 'ENCRYPTED_ck_live_customer_ent_001_ent001', 'HASH_ck_live_customer_ent_001_ent001');-- Insert plan limits
 
--- Insert plan limits
 INSERT INTO plan_limits (plan_id, metric_name, limit_value, limit_period, breach_operator, breach_action, webhook_urls) VALUES
   -- Free plan limits
   ((SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'free'), 'api_calls', 1000, 'monthly', 'gte', 'deny', NULL),

@@ -30,17 +30,19 @@ CREATE TABLE customers (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- 4. Integration keys
+-- 4. Integration keys (UPDATED with key_hash)
 CREATE TABLE integration_keys (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   business_id TEXT REFERENCES businesses(business_id) ON DELETE CASCADE,
   key_type TEXT NOT NULL,
   key_name TEXT,
   encrypted_key TEXT NOT NULL,
+  key_hash TEXT,  -- NEW: SHA256 hash of the plain key for validation
   metadata JSONB,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   is_active BOOLEAN DEFAULT TRUE,
-  UNIQUE(business_id, key_type, key_name)
+  UNIQUE(business_id, key_type, key_name),
+  UNIQUE(business_id, key_hash)  -- NEW: Ensure hash uniqueness
 );
 
 -- 5. Plan limits - Flexible for business/customer/plan level
@@ -132,6 +134,7 @@ CREATE INDEX idx_customers_stripe_subscription ON customers(stripe_subscription_
 CREATE INDEX idx_integration_keys_business ON integration_keys(business_id);
 CREATE INDEX idx_integration_keys_type ON integration_keys(key_type);
 CREATE INDEX idx_integration_keys_active ON integration_keys(is_active);
+CREATE INDEX idx_integration_keys_hash ON integration_keys(key_hash);  -- NEW: For fast hash lookups
 
 CREATE INDEX idx_metrics_business_time ON metrics(business_id, flushed_at DESC);
 CREATE INDEX idx_metrics_customer_time ON metrics(customer_id, flushed_at DESC);

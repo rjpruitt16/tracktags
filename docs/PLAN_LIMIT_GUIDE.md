@@ -67,8 +67,9 @@ curl -X POST https://your-tracktags.com/api/v1/customers/customer_123/keys \
 ```json
 {
   "status": "created",
-  "customer_key": "ck_live_customer_123_45678901",
-  "customer_id": "customer_123"
+  "api_key": "ck_live_customer_123_45678901",
+  "customer_id": "customer_123",
+  "warning": "Save this key securely. It will not be shown again"
 }
 ```
 
@@ -85,6 +86,7 @@ curl -X POST https://your-tracktags.com/api/v1/proxy \
   -d '{
     "scope": "customer",
     "customer_id": "customer_123",
+  "warning": "Save this key securely. It will not be shown again",
     "metric_name": "api_calls", 
     "target_url": "https://your-api.com/endpoint",
     "method": "POST",

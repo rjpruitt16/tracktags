@@ -182,3 +182,11 @@ pub fn rotate_encryption_key(
     "Key rotation not yet implemented - see GitHub issue #3",
   ))
 }
+
+/// Hash an API key using SHA256 for secure comparison
+pub fn hash_api_key(api_key: String) -> String {
+  api_key
+  |> bit_array.from_string
+  |> crypto.hash(crypto.Sha256, _)
+  |> bit_array.base64_encode(True)
+}

@@ -561,100 +561,265 @@ fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
       <> req.key_name,
   )
 
-  // UPDATED: Now uses encryption
-  case encrypt_credentials(req.credentials) {
-    Error(encryption_error) -> {
-      logging.log(
-        logging.Error,
-        "[KeyHandler] ❌ Encryption failed: " <> encryption_error,
-      )
-      let error_json =
-        json.object([
-          #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to encrypt credentials")),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 500)
-    }
-    Ok(encrypted_credentials) -> {
-      case
-        supabase_client.store_integration_key(
-          business_id,
-          // Now uses the extracted business_id
-          req.key_type,
-          req.key_name,
-          encrypted_credentials,
-          None,
-        )
-      {
-        Ok(key_key) -> {
-          let success_json =
-            json.object([
-              #("status", json.string("created")),
-              #("key_id", json.string(key_key.id)),
-              #("business_id", json.string(business_id)),
-              #("key_type", json.string(req.key_type)),
-              #("key_name", json.string(req.key_name)),
-              #("is_active", json.bool(key_key.is_active)),
-              #("encrypted", json.bool(True)),
-            ])
+  // For business keys, check if we need to hash
+  case req.key_type {
+    "business" | "api" -> {
+      // Business keys should also be hashed
+      case dict.get(req.credentials, "api_key") {
+        Ok(api_key) -> {
+          // Hash the API key
+          let key_hash = crypto.hash_api_key(api_key)
 
-          logging.log(
-            logging.Info,
-            "[KeyHandler] ✅ Key created with encryption: " <> key_key.id,
-          )
-          wisp.json_response(json.to_string_tree(success_json), 201)
-        }
-        Error(supabase_client.DatabaseError(msg)) -> {
-          logging.log(logging.Error, "[KeyHandler] ❌ Database error: " <> msg)
-          let error_json =
-            json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to store key")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
+          // Encrypt the credentials
+          case encrypt_credentials(req.credentials) {
+            Ok(encrypted_credentials) -> {
+              case
+                supabase_client.store_integration_key_with_hash(
+                  business_id,
+                  req.key_type,
+                  req.key_name,
+                  encrypted_credentials,
+                  key_hash,
+                  None,
+                )
+              {
+                Ok(stored_key) -> {
+                  let success_json =
+                    json.object([
+                      #("status", json.string("created")),
+                      #("key_id", json.string(stored_key.id)),
+                      #("business_id", json.string(business_id)),
+                      #("key_type", json.string(req.key_type)),
+                      #("key_name", json.string(req.key_name)),
+                      #("api_key", json.string(api_key)),
+                      // Return plain key ONCE
+                      #("is_active", json.bool(stored_key.is_active)),
+                      #(
+                        "warning",
+                        json.string(
+                          "Save this key securely. It will not be shown again.",
+                        ),
+                      ),
+                    ])
+
+                  logging.log(
+                    logging.Info,
+                    "[KeyHandler] ✅ Business key created with hash: "
+                      <> stored_key.id,
+                  )
+                  wisp.json_response(json.to_string_tree(success_json), 201)
+                }
+                Error(err) -> {
+                  logging.log(
+                    logging.Error,
+                    "[KeyHandler] ❌ Database error: " <> string.inspect(err),
+                  )
+                  let error_json =
+                    json.object([
+                      #("error", json.string("Internal Server Error")),
+                      #("message", json.string("Failed to store key")),
+                    ])
+                  wisp.json_response(json.to_string_tree(error_json), 500)
+                }
+              }
+            }
+            Error(encryption_error) -> {
+              logging.log(
+                logging.Error,
+                "[KeyHandler] ❌ Encryption failed: " <> encryption_error,
+              )
+              let error_json =
+                json.object([
+                  #("error", json.string("Internal Server Error")),
+                  #("message", json.string("Failed to encrypt credentials")),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 500)
+            }
+          }
         }
         Error(_) -> {
           let error_json =
             json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to create key")),
+              #("error", json.string("Bad Request")),
+              #("message", json.string("Missing api_key in credentials")),
             ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
+          wisp.json_response(json.to_string_tree(error_json), 400)
         }
       }
+    }
+
+    _ -> {
+      // Other key types - just encrypt without hash
+      let error_json =
+        json.object([
+          #("error", json.string("Bad Request")),
+          #("message", json.string("Unsupported key type")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 400)
     }
   }
 }
 
 pub fn create_customer_key(req: Request, customer_id: String) -> Response {
   use <- wisp.require_method(req, http.Post)
-  use business_id <- with_auth(req)
+  use business_id_from_auth <- with_auth(req)
 
-  let customer_key = utils.create_customer_key(customer_id)
+  // For admin requests, get business_id from body
+  case business_id_from_auth {
+    "admin_override" -> {
+      // Parse body to get business_id
+      use json_data <- wisp.require_json(req)
 
-  case
-    supabase_client.store_integration_key(
-      business_id,
-      "customer_api",
-      customer_id,
-      customer_key,
-      None,
-    )
-  {
-    Ok(_) -> {
-      let success_json =
-        json.object([
-          #("status", json.string("created")),
-          #("customer_key", json.string(customer_key)),
-          #("customer_id", json.string(customer_id)),
-        ])
-      wisp.json_response(json.to_string_tree(success_json), 201)
+      case
+        decode.run(
+          json_data,
+          decode.field("business_id", decode.string, decode.success),
+        )
+      {
+        Ok(bid) -> process_customer_key_creation(bid, customer_id)
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[KeyHandler] Admin request missing business_id in body",
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Bad Request")),
+              #(
+                "message",
+                json.string("business_id required in body for admin requests"),
+              ),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 400)
+        }
+      }
     }
-    Error(_) -> {
+    _ -> process_customer_key_creation(business_id_from_auth, customer_id)
+  }
+}
+
+fn process_customer_key_creation(
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  logging.log(
+    logging.Info,
+    "[KeyHandler] Creating customer API key for: "
+      <> customer_id
+      <> " in business: "
+      <> business_id,
+  )
+
+  // Check if a key already exists for this customer
+  case supabase_client.get_integration_keys(business_id, Some("customer_api")) {
+    Ok(existing_keys) -> {
+      let has_existing =
+        list.any(existing_keys, fn(key) {
+          key.key_name == customer_id && key.is_active
+        })
+
+      case has_existing {
+        True -> {
+          logging.log(
+            logging.Warning,
+            "[KeyHandler] Customer already has an active API key: "
+              <> customer_id,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Conflict")),
+              #(
+                "message",
+                json.string("Customer already has an active API key"),
+              ),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 409)
+        }
+        False -> generate_and_store_customer_key(business_id, customer_id)
+      }
+    }
+    Error(_) -> generate_and_store_customer_key(business_id, customer_id)
+  }
+}
+
+fn generate_and_store_customer_key(
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  // Generate the new key
+  let plain_customer_key = utils.create_customer_key(customer_id)
+
+  // Hash the key for validation
+  let key_hash = crypto.hash_api_key(plain_customer_key)
+
+  logging.log(
+    logging.Info,
+    "[KeyHandler] Generated key for customer: "
+      <> customer_id
+      <> " (hash: "
+      <> string.slice(key_hash, 0, 10)
+      <> "...)",
+  )
+
+  // Encrypt the key for storage
+  case crypto.encrypt_to_json(plain_customer_key) {
+    Ok(encrypted_key) -> {
+      // Store with both encrypted key and hash
+      case
+        supabase_client.store_integration_key_with_hash(
+          business_id,
+          "customer_api",
+          customer_id,
+          encrypted_key,
+          key_hash,
+          None,
+        )
+      {
+        Ok(stored_key) -> {
+          logging.log(
+            logging.Info,
+            "[KeyHandler] ✅ Customer key created with hash: " <> stored_key.id,
+          )
+
+          // Return the PLAIN key to the user (only time they'll see it)
+          let success_json =
+            json.object([
+              #("status", json.string("created")),
+              #("api_key", json.string(plain_customer_key)),
+              #("customer_id", json.string(customer_id)),
+              #("key_id", json.string(stored_key.id)),
+              #(
+                "warning",
+                json.string(
+                  "Save this key securely. It will not be shown again.",
+                ),
+              ),
+            ])
+          wisp.json_response(json.to_string_tree(success_json), 201)
+        }
+        Error(err) -> {
+          logging.log(
+            logging.Error,
+            "[KeyHandler] Failed to store key: " <> string.inspect(err),
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Internal Server Error")),
+              #("message", json.string("Failed to store API key")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 500)
+        }
+      }
+    }
+    Error(crypto_err) -> {
+      logging.log(
+        logging.Error,
+        "[KeyHandler] Failed to encrypt key: " <> string.inspect(crypto_err),
+      )
       let error_json =
         json.object([
           #("error", json.string("Internal Server Error")),
-          #("message", json.string("Failed to create customer key")),
+          #("message", json.string("Failed to encrypt API key")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
     }

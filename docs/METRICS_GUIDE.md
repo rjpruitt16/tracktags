@@ -10,7 +10,7 @@ Track company-wide metrics like total API calls, infrastructure costs, or system
 ```bash
 # Business metric - tracks total API calls across ALL customers
 curl -X POST "http://localhost:8080/api/v1/metrics" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "total_api_calls",
@@ -21,13 +21,13 @@ curl -X POST "http://localhost:8080/api/v1/metrics" \
 
 # Update business metric
 curl -X PUT "http://localhost:8080/api/v1/metrics/total_api_calls" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{"value": 100.0}'
 
 # Get business metric
 curl "http://localhost:8080/api/v1/metrics/total_api_calls" \
-  -H "Authorization: Bearer tk_live_your_key"
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security"
 ```
 
 ### Customer Metrics
@@ -36,7 +36,7 @@ Track per-customer usage for billing, rate limiting, or customer analytics.
 ```bash
 # Customer metric - tracks usage for billing
 curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cust_123" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "api_usage",
@@ -56,13 +56,13 @@ curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cu
 
 # Update customer metric
 curl -X PUT "http://localhost:8080/api/v1/metrics/api_usage?scope=customer&customer_id=cust_123" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{"value": 50.0}'
 
 # Get customer metric
 curl "http://localhost:8080/api/v1/metrics/api_usage?scope=customer&customer_id=cust_123" \
-  -H "Authorization: Bearer tk_live_your_key"
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security"
 ```
 
 ## Metric Types
@@ -162,7 +162,7 @@ Auto-delete old metrics:
 ```bash
 # Create billing metric
 curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cust_123" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "api_calls",
@@ -186,7 +186,7 @@ curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cu
 ```bash
 # Create rate limit metric with plan limits
 curl -X POST "http://localhost:8080/api/v1/metrics?scope=customer&customer_id=cust_123" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "requests_per_minute",
@@ -227,7 +227,7 @@ Track usage against limits with automatic overage reporting:
 ```bash
 # Create metric with usage limit and overage reporting
 curl -X POST "http://localhost:8080/api/v1/metrics" \
-  -H "Authorization: Bearer tk_live_your_key" \
+  -H "Authorization: Bearer tk_live_your_key  # Hashed for security" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "api_calls",

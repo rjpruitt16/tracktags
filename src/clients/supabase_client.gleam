@@ -15,6 +15,7 @@ import gleam/string
 import logging
 import storage/metric_store
 import types/metric_types
+import utils/crypto
 import utils/utils
 
 // ============================================================================
@@ -47,8 +48,9 @@ pub type IntegrationKey {
     key_type: String,
     key_name: String,
     encrypted_key: String,
-    metadata: Option(Dict(String, json.Json)),
+    key_hash: String,
     is_active: Bool,
+    created_at: String,
   )
 }
 
@@ -256,11 +258,11 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
   use id <- decode.field("id", decode.string)
   use business_id <- decode.field("business_id", decode.string)
   use key_type <- decode.field("key_type", decode.string)
-  // Make key_name optional to handle NULLs
-  use key_name <- decode.optional_field("key_name", "", decode.string)
+  use key_name <- decode.field("key_name", decode.string)
   use encrypted_key <- decode.field("encrypted_key", decode.string)
-  use _metadata <- decode.field("metadata", decode.optional(decode.dynamic))
+  use key_hash <- decode.field("key_hash", decode.optional(decode.string))
   use is_active <- decode.field("is_active", decode.bool)
+  use created_at <- decode.field("created_at", decode.optional(decode.string))
 
   decode.success(IntegrationKey(
     id: id,
@@ -268,8 +270,9 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
     key_type: key_type,
     key_name: key_name,
     encrypted_key: encrypted_key,
-    metadata: None,
+    key_hash: key_hash |> option.unwrap(""),
     is_active: is_active,
+    created_at: created_at |> option.unwrap(""),
   ))
 }
 
@@ -277,20 +280,23 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
 // API KEY VALIDATION
 // ============================================================================
 
-/// Validate an API key and return the business_id
+// Updated validate_api_key function
 pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Enhanced validation for: "
+    "[SupabaseClient] Validating key by hash: "
       <> string.slice(api_key, 0, 10)
       <> "...",
   )
 
+  // Hash the incoming API key
+  let key_hash = crypto.hash_api_key(api_key)
+
+  // Query by hash instead of encrypted_key
   let path =
-    "/integration_keys?encrypted_key=eq." <> api_key <> "&is_active=eq.true"
+    "/integration_keys?key_hash=eq." <> key_hash <> "&is_active=eq.true"
 
   use response <- result.try(make_request(http.Get, path, None))
-
   case response.status {
     200 -> {
       case json.parse(response.body, decode.list(integration_key_decoder())) {
@@ -300,7 +306,7 @@ pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError)
         }
         Ok([integration_key, ..]) -> {
           case integration_key.key_type {
-            "api" -> {
+            "api" | "business" -> {
               logging.log(
                 logging.Info,
                 "[SupabaseClient] Business key validated",
@@ -310,7 +316,8 @@ pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError)
             "customer_api" -> {
               logging.log(
                 logging.Info,
-                "[SupabaseClient] Customer key validated",
+                "[SupabaseClient] Customer key validated for: "
+                  <> integration_key.key_name,
               )
               Ok(CustomerKey(
                 integration_key.business_id,
@@ -1240,54 +1247,43 @@ pub fn get_integration_keys(
   }
 }
 
-/// Store a new integration key
-pub fn store_integration_key(
+// New function to store with hash
+pub fn store_integration_key_with_hash(
   business_id: String,
   key_type: String,
   key_name: String,
-  // Changed from Option(String) to String  
   encrypted_key: String,
-  metadata: Option(Dict(String, json.Json)),
+  key_hash: String,
+  metadata: Option(String),
 ) -> Result(IntegrationKey, SupabaseError) {
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Storing " <> key_type <> " key for: " <> business_id,
-  )
+  let body =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("key_type", json.string(key_type)),
+      #("key_name", json.string(key_name)),
+      #("encrypted_key", json.string(encrypted_key)),
+      #("key_hash", json.string(key_hash)),
+      // Add hash
+      #("metadata", case metadata {
+        Some(data) -> json.string(data)
+        None -> json.null()
+      }),
+      #("is_active", json.bool(True)),
+    ])
+    |> json.to_string()
 
-  let base_fields = [
-    #("business_id", json.string(business_id)),
-    #("key_type", json.string(key_type)),
-    #("key_name", json.string(key_name)),
-    // Always include key_name
-    #("encrypted_key", json.string(encrypted_key)),
-    #("is_active", json.bool(True)),
-  ]
-
-  let all_fields = case metadata {
-    Some(meta) -> [
-      #("metadata", json.object(dict.to_list(meta))),
-      ..base_fields
-    ]
-    None -> base_fields
-  }
-
-  let key_data = json.object(all_fields)
-
-  use response <- result.try(make_request(
-    http.Post,
-    "/integration_keys",
-    Some(json.to_string(key_data)),
-  ))
+  let path = "/integration_keys"
+  use response <- result.try(make_request(http.Post, path, Some(body)))
 
   case response.status {
-    201 -> {
+    201 | 200 -> {
       case json.parse(response.body, decode.list(integration_key_decoder())) {
-        Ok([new_key, ..]) -> Ok(new_key)
-        Ok([]) -> Error(ParseError("No key returned from server"))
-        Error(_) -> Error(ParseError("Invalid response format"))
+        Ok([key, ..]) -> Ok(key)
+        Ok([]) -> Error(ParseError("No key returned"))
+        Error(_) -> Error(ParseError("Failed to parse created key"))
       }
     }
-    _ -> Error(DatabaseError("Failed to store integration key"))
+    _ -> Error(DatabaseError("Failed to store key"))
   }
 }
 
