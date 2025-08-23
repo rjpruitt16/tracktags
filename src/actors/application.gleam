@@ -8,7 +8,6 @@ import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
-import gleam/float
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
@@ -24,15 +23,60 @@ pub type TierLimit {
   TierLimit(
     daily_calls: Float,
     breach_action: String,
-    // "deny" or "allow_overage"
+    supabase_writes: Float,
+    daily_metrics: Float,
   )
 }
 
+// In your tier_limits function:
 fn tier_limits() -> Dict(String, TierLimit) {
   dict.from_list([
-    #("free", TierLimit(1000.0, "deny")),
-    #("pro", TierLimit(100_000.0, "allow_overage")),
-    #("enterprise", TierLimit(-1.0, "allow_overage")),
+    #(
+      "free",
+      TierLimit(
+        daily_calls: 333.0,
+        // ~10K/month
+        daily_metrics: 33.0,
+        // ~1K/month
+        supabase_writes: 0.0,
+        breach_action: "deny",
+      ),
+    ),
+    #(
+      "pro",
+      TierLimit(
+        daily_calls: 3333.0,
+        // ~100K/month
+        daily_metrics: 333.0,
+        // ~10K/month
+        supabase_writes: 33.0,
+        // ~1K/month
+        breach_action: "allow_overage",
+        // Bill for extra
+      ),
+    ),
+    #(
+      "scale",
+      TierLimit(
+        daily_calls: 33_333.0,
+        // ~1M/month
+        daily_metrics: 3333.0,
+        // ~100K/month
+        supabase_writes: 333.0,
+        // ~10K/month
+        breach_action: "allow_overage",
+      ),
+    ),
+    #(
+      "enterprise",
+      TierLimit(
+        daily_calls: -1.0,
+        // Unlimited
+        daily_metrics: -1.0,
+        supabase_writes: -1.0,
+        breach_action: "allow",
+      ),
+    ),
   ])
 }
 
@@ -354,7 +398,7 @@ fn get_business_limit(business_id: String) -> #(Float, String) {
       // It's already a String!
 
       case dict.get(limits, tier) {
-        Ok(TierLimit(daily_calls, breach_action)) -> #(
+        Ok(TierLimit(daily_calls, breach_action, _, _)) -> #(
           daily_calls,
           breach_action,
         )
@@ -442,20 +486,6 @@ fn ensure_usage_metric(
       }
     }
   }
-}
-
-fn increment_usage(usage_subject: process.Subject(metric_types.Message)) -> Nil {
-  process.send(
-    usage_subject,
-    metric_types.RecordMetric(metric_types.Metric(
-      account_id: "",
-      // Already in the metric actor
-      metric_name: "daily_api_calls",
-      value: 1.0,
-      tags: dict.new(),
-      timestamp: utils.current_timestamp(),
-    )),
-  )
 }
 
 // Add forward_to_customer

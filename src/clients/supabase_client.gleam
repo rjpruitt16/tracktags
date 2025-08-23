@@ -1247,6 +1247,93 @@ pub fn get_integration_keys(
   }
 }
 
+/// Get a specific integration key by composite key
+pub fn get_integration_key_by_composite(
+  composite_key: String,
+) -> Result(IntegrationKey, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting integration key by composite: " <> composite_key,
+  )
+
+  // Split the composite key
+  let parts = string.split(composite_key, "/")
+  case parts {
+    [business_id, key_type, key_name] -> {
+      let path =
+        "/integration_keys?business_id=eq."
+        <> business_id
+        <> "&key_type=eq."
+        <> key_type
+        <> "&key_name=eq."
+        <> key_name
+
+      use response <- result.try(make_request(http.Get, path, None))
+
+      case response.status {
+        200 -> {
+          case
+            json.parse(response.body, decode.list(integration_key_decoder()))
+          {
+            Ok([]) -> Error(NotFound("Integration key not found"))
+            Ok([key, ..]) -> Ok(key)
+            Error(_) -> Error(ParseError("Invalid integration key format"))
+          }
+        }
+        _ -> Error(DatabaseError("Failed to fetch integration key"))
+      }
+    }
+    _ -> Error(ParseError("Invalid composite key format"))
+  }
+}
+
+pub fn update_integration_key(
+  business_id: String,
+  key_type: String,
+  key_name: String,
+  encrypted_key: String,
+) -> Result(IntegrationKey, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating integration key: "
+      <> business_id
+      <> "/"
+      <> key_type
+      <> "/"
+      <> key_name,
+  )
+
+  let update_data =
+    json.object([
+      #("encrypted_key", json.string(encrypted_key)),
+    ])
+
+  let path =
+    "/integration_keys?business_id=eq."
+    <> business_id
+    <> "&key_type=eq."
+    <> key_type
+    <> "&key_name=eq."
+    <> key_name
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(integration_key_decoder())) {
+        Ok([updated_key, ..]) -> Ok(updated_key)
+        Ok([]) -> Error(NotFound("Key not found"))
+        Error(_) -> Error(ParseError("Invalid response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to update key"))
+  }
+}
+
 // New function to store with hash
 pub fn store_integration_key_with_hash(
   business_id: String,
