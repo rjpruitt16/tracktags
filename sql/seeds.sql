@@ -1,10 +1,10 @@
 -- TrackTags Sample Data v4 - Using customers table
 -- Run this after schema.sql to get demo data
 
--- Insert test businesses with NULL user_id for easy testing
+-- 1. Insert businesses FIRST (without current_plan_id initially)
 INSERT INTO businesses (
     business_id,
-    user_id,  -- NULL for test data
+    user_id,
     business_name,
     email,
     plan_type,
@@ -17,18 +17,7 @@ INSERT INTO businesses (
     ('biz_002', NULL, 'Beta Startup', 'ceo@beta.io', 'starter', 'cus_beta456', 'sub_beta789', 'active', 'price_starter_456'),
     ('biz_003', NULL, 'Scale Corp', 'enterprise@scalecorp.com', 'enterprise', 'cus_scale789', 'sub_scale012', 'active', 'price_ent_789');
 
--- Insert test customers with NULL user_id
-INSERT INTO customers (customer_id, business_id, user_id, plan_id, customer_name) VALUES
-  ('mobile_app', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Mobile Application'),
-  ('web_portal', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Web Portal'),
-  ('api_service', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'enterprise'), 'API Service'),
-  ('customer_app', 'biz_002', NULL, (SELECT id FROM plans WHERE business_id = 'biz_002' AND plan_name = 'free'), 'Main Customer App'),
-  ('enterprise_customer', 'biz_003', NULL, (SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'Enterprise Integration');
-
--- Note: When creating businesses through LiveTags dashboard, user_id will be set
--- Example of how LiveTags would insert:
--- INSERT INTO businesses (business_id, user_id, business_name, email, plan_type)
--- VALUES ('biz_xyz', 'actual-user-uuid-here', 'New Business', 'user@example.com', 'free');-- Insert test plans
+-- 2. Insert plans (now businesses exist)
 INSERT INTO plans (business_id, plan_name, stripe_price_id, plan_status) VALUES
   ('biz_001', 'free', NULL, 'active'),
   ('biz_001', 'pro', 'price_pro_123', 'active'),
@@ -40,7 +29,7 @@ INSERT INTO plans (business_id, plan_name, stripe_price_id, plan_status) VALUES
   ('biz_003', 'free', NULL, 'active'),
   ('biz_003', 'enterprise', 'price_ent_012', 'active');
 
--- Update businesses with current plan references
+-- 3. Update businesses with current plan references (now plans exist)
 UPDATE businesses SET current_plan_id = (
   SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'
 ) WHERE business_id = 'biz_001';
@@ -53,7 +42,15 @@ UPDATE businesses SET current_plan_id = (
   SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'
 ) WHERE business_id = 'biz_003';
 
--- Insert test API keys with hashes
+-- 4. Insert customers (now plans exist)
+INSERT INTO customers (customer_id, business_id, user_id, plan_id, customer_name) VALUES
+  ('mobile_app', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Mobile Application'),
+  ('web_portal', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'pro'), 'Web Portal'),
+  ('api_service', 'biz_001', NULL, (SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'enterprise'), 'API Service'),
+  ('customer_app', 'biz_002', NULL, (SELECT id FROM plans WHERE business_id = 'biz_002' AND plan_name = 'free'), 'Main Customer App'),
+  ('enterprise_customer', 'biz_003', NULL, (SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'Enterprise Integration');
+
+-- 5. Insert test API keys with hashes
 INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key, key_hash) VALUES
   -- Business API keys (these need hashes for validation)
   ('biz_001', 'api', 'production', 'ENCRYPTED_tk_live_test123', 'HASH_tk_live_test123'),
@@ -68,8 +65,9 @@ INSERT INTO integration_keys (business_id, key_type, key_name, encrypted_key, ke
   ('biz_001', 'customer_api', 'customer_001', 'ENCRYPTED_ck_live_customer_001_abc123', 'HASH_ck_live_customer_001_abc123'),
   ('biz_001', 'customer_api', 'customer_002', 'ENCRYPTED_ck_live_customer_002_def456', 'HASH_ck_live_customer_002_def456'),
   ('biz_002', 'customer_api', 'customer_123', 'ENCRYPTED_ck_live_customer_123_xyz789', 'HASH_ck_live_customer_123_xyz789'),
-  ('biz_003', 'customer_api', 'customer_ent_001', 'ENCRYPTED_ck_live_customer_ent_001_ent001', 'HASH_ck_live_customer_ent_001_ent001');-- Insert plan limits
+  ('biz_003', 'customer_api', 'customer_ent_001', 'ENCRYPTED_ck_live_customer_ent_001_ent001', 'HASH_ck_live_customer_ent_001_ent001');
 
+-- 6. Insert plan limits
 INSERT INTO plan_limits (plan_id, metric_name, limit_value, limit_period, breach_operator, breach_action, webhook_urls) VALUES
   -- Free plan limits
   ((SELECT id FROM plans WHERE business_id = 'biz_001' AND plan_name = 'free'), 'api_calls', 1000, 'monthly', 'gte', 'deny', NULL),
@@ -88,7 +86,7 @@ INSERT INTO plan_limits (plan_id, metric_name, limit_value, limit_period, breach
   ((SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'api_calls', 1000000, 'monthly', 'gte', 'webhook', 'https://scalecorp.com/api/limits'),
   ((SELECT id FROM plans WHERE business_id = 'biz_003' AND plan_name = 'enterprise'), 'data_processed_gb', 10000, 'monthly', 'gte', 'allow_overage', NULL);
 
--- Insert some sample metrics
+-- 7. Insert some sample metrics
 INSERT INTO metrics (business_id, customer_id, metric_name, value, metric_type, scope, adapters) VALUES
   -- Business-level metrics
   ('biz_001', NULL, 'total_revenue', 15420.50, 'checkpoint', 'business', '{"stripe": {"enabled": true}}'),
