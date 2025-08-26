@@ -689,9 +689,9 @@ pub fn start_link(
   )
 
   case
-    glixir.start_dynamic_supervisor_named(atom.create(
-      "client_metrics_" <> business_id <> "_" <> customer_id,
-    ))
+    glixir.start_dynamic_supervisor_named_safe(
+      "customer_metrics_" <> business_id <> "_" <> customer_id,
+    )
   {
     Ok(metrics_supervisor) -> {
       logging.log(
@@ -848,7 +848,7 @@ pub fn start(
 ) {
   glixir.child_spec(
     id: "client_" <> business_id <> "_" <> customer_id,
-    module: "Elixir.ClientActorBridge",
+    module: "Elixir.CustomerActorBridge",
     function: "start_link",
     args: #(business_id, customer_id),
     restart: glixir.permanent,

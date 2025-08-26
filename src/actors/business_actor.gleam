@@ -82,7 +82,6 @@ fn handle_message(
       State(..state, last_accessed: current_time)
     _ -> state
   }
-
   logging.log(
     logging.Debug,
     "[BusinessActor] Processing message for: " <> updated_state.account_id,
