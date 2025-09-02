@@ -4,6 +4,9 @@
 -include .env
 export
 
+# Build stamp for caching
+DOCKER_BUILD_STAMP := .docker-build-stamp
+
 # Local development
 run:
 	gleam run
@@ -18,8 +21,8 @@ unit-test:
 # Run integration tests locally with cleanup
 integration-test:
 	@echo "Running integration tests..."
-	hurl --test --retry 3 --retry-interval 5000ms \
-		--variable ADMIN_API_KEY=$${ADMIN_API_KEY:-admin_secret_key_123} \
+	hurl --test --retry 3 --retry-interval 5000 --very-verbose \
+		--variable ADMIN_API_KEY=$${ADMIN_API_KEY:-tk_admin_SUPER_SECRET_KEY_123456789} \
 		--variable TRACKTAGS_URL=http://localhost:8080 \
 		--variable PROXY_TARGET_URL=http://httpbin.org/post \
 		--variable test_id=$$(date +%s) \
@@ -31,16 +34,16 @@ integration-test:
 test: unit-test integration-test
 
 # Docker commands with .env support
-docker-build:
+docker-build: $(DOCKER_BUILD_STAMP)
+
+$(DOCKER_BUILD_STAMP): Dockerfile $(shell find src -type f -name "*.gleam") gleam.toml manifest.toml
 	docker build -t tracktags .
+	@touch $(DOCKER_BUILD_STAMP)
 
 docker-up: docker-build
 	@echo "Cleaning up old containers..."
 	@docker compose -f docker-compose.test.yml down 2>/dev/null || true
-	@if [ ! -f .env ]; then \
-		echo "ERROR: .env file not found"; \
-		exit 1; \
-	fi
+	@test -f .env || (echo "ERROR: .env file not found" && exit 1)
 	@echo "Starting services with .env file..."
 	docker compose --env-file .env -f docker-compose.test.yml up -d
 	@sleep 15
@@ -50,22 +53,16 @@ docker-up: docker-build
 test-docker: docker-up
 	@echo "Running tests against Docker environment..."
 	@sleep 5
-	@if [ -f .env ]; then \
-		export $$(grep -v '^#' .env | xargs) && \
-		hurl --test --retry 3 --retry-interval 5000ms \
-			--variable ADMIN_API_KEY=$${ADMIN_API_KEY:-admin_secret_key_123} \
-			--variable TRACKTAGS_URL=http://localhost:8080 \
-			--variable PROXY_TARGET_URL=http://webhook:9090/webhook \
-			--variable test_id=$$(date +%s) \
-			test/integration/test_proxy_forward.hurl; \
-	else \
-		hurl --test --retry 3 --retry-interval 5000ms \
-			--variable ADMIN_API_KEY=admin_secret_key_123 \
-			--variable TRACKTAGS_URL=http://localhost:8080 \
-			--variable PROXY_TARGET_URL=http://webhook:9090/webhook \
-			--variable test_id=$$(date +%s) \
-			test/integration/test_proxy_forward.hurl; \
-	fi
+	@echo "Using ADMIN_API_KEY: $${ADMIN_API_KEY:-tk_admin_SUPER_SECRET_KEY_123456789}"
+	hurl --test --retry 3 --retry-interval 5000 --very-verbose \
+		--variable ADMIN_API_KEY=$${ADMIN_API_KEY:-tk_admin_SUPER_SECRET_KEY_123456789} \
+		--variable TRACKTAGS_URL=http://localhost:8080 \
+		--variable PROXY_TARGET_URL=http://webhook:9090 \
+		--variable test_id=$$(date +%s) \
+		test/integration/test_proxy_forward.hurl || \
+		(echo "Test failed, showing container logs:"; \
+		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
+		 exit 1)
 	@bash test/integration/cleanup_test_data.sh
 	@make docker-down
 
@@ -78,14 +75,10 @@ test-ci: docker-build test-docker
 
 # Clean build artifacts and test data
 clean:
-	rm -rf build _build
+	rm -rf build _build $(DOCKER_BUILD_STAMP)
 	docker compose -f docker-compose.test.yml down -v
 	@bash test/integration/cleanup_test_data.sh
 
 # Interactive Docker shell for debugging
 docker-shell:
-	@if [ -f .env ]; then \
-		docker run --rm -it --env-file .env tracktags /bin/sh; \
-	else \
-		docker run --rm -it tracktags /bin/sh; \
-	fi
+	docker run --rm -it --env-file .env tracktags /bin/sh
