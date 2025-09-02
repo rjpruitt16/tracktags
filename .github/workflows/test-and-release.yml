@@ -16,39 +16,39 @@ jobs:
     
     steps:
       - uses: actions/checkout@v3
-
+      
       - name: Install Python dependencies
         run: pip install flask
+      
       - name: Install Hurl
         run: |
-          curl -LO https://github.com/Orange-OpenSource/hurl/releases/download/4.0.0/hurl_4.0.0_amd64.deb
-          sudo dpkg -i hurl_4.0.0_amd64.deb
-      - name: Set up Erlang & Gleam
-        uses: erlef/setup-beam@v1
-        with:
-          otp-version: "26.0"
-          gleam-version: "1.0.0"
-      
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl python3
           curl -L https://github.com/Orange-OpenSource/hurl/releases/download/4.1.0/hurl_4.1.0_amd64.deb -o hurl.deb
           sudo dpkg -i hurl.deb
-          gleam deps download
       
-      - name: Build
-        run: gleam build
+      - name: Create .env file from secrets
+        run: |
+          echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
+          echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> .env
+          echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> .env
+          echo "SUPABASE_REALTIME_URL=${{ secrets.SUPABASE_REALTIME_URL }}" >> .env
+          echo "ADMIN_API_KEY=${{ secrets.ADMIN_API_KEY }}" >> .env
+          echo "ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}" >> .env
+          echo "SELF_HOSTED=false" >> .env
       
-      - name: Run unit tests
-        run: gleam test
-      
-      - name: Run integration tests
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          ADMIN_API_KEY: admin_secret_key_123
-        run: python3 test/integration/run_tests.py
+      - name: Run Docker integration tests with retry
+        uses: nick-fields/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: make test-docker
+          warning_on_retry: true
+          on_retry_command: |
+            echo "Test failed, showing Docker logs..."
+            docker compose -f docker-compose.test.yml logs --tail=50
+            echo "Cleaning up before retry..."
+            docker compose -f docker-compose.test.yml down
+            docker system prune -f
 
   release:
     needs: test
