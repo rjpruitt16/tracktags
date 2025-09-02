@@ -22,9 +22,9 @@ jobs:
       
       - name: Install Hurl
         run: |
-          curl -L https://github.com/Orange-OpenSource/hurl/releases/download/4.1.0/hurl_4.1.0_amd64.deb -o hurl.deb
-          sudo dpkg -i hurl.deb
-      
+           curl -L https://github.com/Orange-OpenSource/hurl/releases/download/7.0.0/hurl_7.0.0_amd64.deb -o hurl.deb
+           sudo dpkg -i hurl.deb      
+     
       - name: Create .env file from secrets
         run: |
           echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" > .env
