@@ -93,8 +93,6 @@ pub fn generate_request_id() -> String {
 fn to_string(int: Int) -> String
 
 pub fn generate_random() -> String {
-  // Generate 8 random characters
-  let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
   string.slice(int.to_string(system_time()), -8, 8)
 }
 

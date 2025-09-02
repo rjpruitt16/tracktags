@@ -491,3 +491,85 @@ pub fn delete_client_key(
 
   wisp.json_response(json.to_string_tree(success_json), 200)
 }
+
+// In user_handler.gleam (formerly customer_handler)
+pub fn create_business(req: Request) -> Response {
+  use <- wisp.require_method(req, http.Post)
+
+  // Check for admin auth
+  case extract_api_key(req) {
+    Ok(api_key) -> {
+      let admin_key = utils.require_env("ADMIN_API_KEY")
+      case api_key == admin_key {
+        True -> {
+          use json_data <- wisp.require_json(req)
+
+          let decoder = {
+            use business_name <- decode.field("business_name", decode.string)
+            use email <- decode.field("email", decode.string)
+            decode.success(#(business_name, email))
+          }
+
+          case decode.run(json_data, decoder) {
+            Ok(#(name, email)) -> {
+              let business_id = "biz_" <> utils.generate_random()
+
+              case supabase_client.create_business(business_id, name, email) {
+                Ok(business) -> {
+                  wisp.json_response(
+                    json.to_string_tree(
+                      json.object([
+                        #("business_id", json.string(business.business_id)),
+                        #("business_name", json.string(business.business_name)),
+                        #("email", json.string(business.email)),
+                      ]),
+                    ),
+                    201,
+                  )
+                }
+                Error(err) -> {
+                  logging.log(
+                    logging.Error,
+                    "[UserHandler] Failed to create business: "
+                      <> string.inspect(err),
+                  )
+                  wisp.json_response(
+                    json.to_string_tree(
+                      json.object([
+                        #("error", json.string("Failed to create business")),
+                      ]),
+                    ),
+                    500,
+                  )
+                }
+              }
+            }
+            Error(_) ->
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([#("error", json.string("Invalid request data"))]),
+                ),
+                400,
+              )
+          }
+        }
+        False ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Admin authentication required")),
+              ]),
+            ),
+            401,
+          )
+      }
+    }
+    Error(_) ->
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Admin authentication required"))]),
+        ),
+        401,
+      )
+  }
+}

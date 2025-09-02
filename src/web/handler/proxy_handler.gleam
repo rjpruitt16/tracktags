@@ -175,6 +175,7 @@ fn process_proxy_request(
             }
           }
         }
+
         Error(error_msg) -> {
           logging.log(
             logging.Error,
@@ -216,7 +217,7 @@ fn check_metric_breach_status(
         logging.Info,
         "[ProxyHandler] 📡 Metric not found, requiring manual creation",
       )
-      spawn_metric_for_checking(lookup_key, metric_name, scope, business_id)
+      lookup_existing_metric_actor(lookup_key, metric_name, scope, business_id)
       |> result.try(get_metric_status)
     }
   }
@@ -257,27 +258,76 @@ fn get_metric_status(
   }
 }
 
-fn spawn_metric_for_checking(
-  _lookup_key: String,
+// WARNING: DO NOT ATTEMPT TO CREATE METRICS DYNAMICALLY IN PROXY_HANDLER
+// 
+// We spent significant time trying to auto-create metrics when they don't exist,
+// and every approach led to catastrophic race conditions in the Gleam/OTP system:
+//
+// FAILED ATTEMPT #1: Direct actor spawning with sleep delays
+//   - Created metrics but actor wasn't registered in time
+//   - Adding sleeps just moved the race condition
+//   - HTTP request would timeout waiting for actor initialization
+//
+// FAILED ATTEMPT #2: Using metric_handler.create_client_metric_internal
+//   - Circular dependency issues between handlers
+//   - Plan loading from database was async and non-deterministic
+//   - Metric would be "created" but actor initialization would race with proxy request
+//
+// FAILED ATTEMPT #3: Checking ClientActor plan loading state
+//   - Plans can change during runtime
+//   - Required complex state synchronization between actors
+//   - Added fragile coupling between proxy_handler and internal actor states
+//
+// ROOT CAUSE: The proxy request path cannot wait for:
+//   1. Database writes to complete
+//   2. Actor spawn and registration  
+//   3. Plan data to load from database
+//   4. Metric actor to initialize with plan limits
+//   All while maintaining reasonable HTTP timeout constraints.
+//
+// SOLUTION: Metrics MUST exist before proxy usage. This is actually better because:
+//   - Clear separation of concerns
+//   - Predictable behavior
+//   - No race conditions
+//   - SDK/client can handle metric creation separately
+//   - Follows the pattern of "configure then use"
+//
+// DO NOT CHANGE THIS FUNCTION TO CREATE METRICS. It will break in production.
+fn lookup_existing_metric_actor(
+  lookup_key: String,
   metric_name: String,
   scope: metric_types.MetricScope,
   _business_id: String,
 ) -> Result(process.Subject(metric_types.Message), String) {
-  // NOTE: We tried several approaches to auto-spawn metrics:
-  // 1. Direct actor messaging with sleeps - caused race conditions
-  // 2. Using metric_handler.create_client_metric_internal - still had timing issues with plan loading
-  // 3. Checking ClientActor plan loading state - complex and plans can change
-  // 
-  // DECISION: Require metrics to exist before using proxy. This is cleaner and avoids
-  // all race conditions. Future SDK can handle auto-creation.
-
-  Error(
-    "Metric '"
-    <> metric_name
-    <> "' not found. Create it first using POST /api/v1/metrics with scope="
-    <> metric_types.scope_to_string(scope)
-    <> " before using the proxy.",
-  )
+  // Actually look up the metric actor
+  case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
+    Ok(subject) -> {
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] ✅ Found metric actor for "
+          <> lookup_key
+          <> "/"
+          <> metric_name,
+      )
+      Ok(subject)
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] ❌ Metric actor not found for "
+          <> lookup_key
+          <> "/"
+          <> metric_name,
+      )
+      Error(
+        "Metric '"
+        <> metric_name
+        <> "' not found. Create it first using POST /api/v1/metrics with scope="
+        <> metric_types.scope_to_string(scope)
+        <> " before using the proxy.",
+      )
+    }
+  }
 }
 
 // ============================================================================
@@ -602,11 +652,34 @@ fn handle_customer_request(
   business_id: String,
   customer_id: String,
 ) -> Response {
-  let success_json =
-    json.object([
-      #("status", json.string("customer_request_processed")),
-      #("business_id", json.string(business_id)),
-      #("customer_id", json.string(customer_id)),
-    ])
-  wisp.json_response(json.to_string_tree(success_json), 200)
+  use json_data <- wisp.require_json(req)
+
+  // Parse the proxy request
+  case decode.run(json_data, proxy_request_decoder()) {
+    Ok(proxy_req) -> {
+      // Override the scope to customer and set the customer_id
+      let customer_proxy_req =
+        ProxyRequest(
+          ..proxy_req,
+          scope: "customer",
+          customer_id: Some(customer_id),
+        )
+
+      // Process the proxy request
+      process_proxy_request(
+        business_id,
+        customer_proxy_req,
+        utils.generate_request_id(),
+      )
+    }
+    Error(_) -> {
+      // Return error if request is malformed
+      let error_json =
+        json.object([
+          #("error", json.string("Bad Request")),
+          #("message", json.string("Invalid proxy request")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 400)
+    }
+  }
 }

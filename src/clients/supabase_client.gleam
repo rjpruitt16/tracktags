@@ -1,6 +1,7 @@
 // src/customers/supabase_client.gleam
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/float
 import gleam/http
 import gleam/http/request
@@ -12,6 +13,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 import logging
 import storage/metric_store
 import types/metric_types
@@ -280,21 +282,30 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
 // API KEY VALIDATION
 // ============================================================================
 
-// Updated validate_api_key function
 pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError) {
+  validate_api_key_with_retry(api_key, 3)
+}
+
+// Updated validate_api_key function
+pub fn validate_api_key_with_retry(
+  api_key: String,
+  retries: Int,
+) -> Result(KeyValidation, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Validating key by hash: "
       <> string.slice(api_key, 0, 10)
       <> "...",
   )
-
   // Hash the incoming API key
   let key_hash = crypto.hash_api_key(api_key)
 
+  // URL-encode the hash for use in query parameter
+  let encoded_hash = uri.percent_encode(key_hash)
+
   // Query by hash instead of encrypted_key
   let path =
-    "/integration_keys?key_hash=eq." <> key_hash <> "&is_active=eq.true"
+    "/integration_keys?key_hash=eq." <> encoded_hash <> "&is_active=eq.true"
 
   use response <- result.try(make_request(http.Get, path, None))
   case response.status {
@@ -324,14 +335,50 @@ pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError)
                 integration_key.key_name,
               ))
             }
-            _ -> Error(NotFound("Invalid key type"))
+            _ -> {
+              case retries > 0 {
+                True -> {
+                  // Sleep for 1 second (you'll need to add a sleep function)
+                  process.sleep(1000)
+                  validate_api_key_with_retry(api_key, retries - 1)
+                }
+                False -> Error(NotFound("Invalid key type"))
+              }
+            }
           }
         }
-        Error(_) -> Error(ParseError("Invalid response format"))
+        Error(_) -> {
+          case retries > 0 {
+            True -> {
+              // Sleep for 1 second (you'll need to add a sleep function)
+              process.sleep(1000)
+              validate_api_key_with_retry(api_key, retries - 1)
+            }
+            False -> Error(ParseError("Invalid response format"))
+          }
+        }
       }
     }
-    401 -> Error(Unauthorized)
-    _ -> Error(DatabaseError("Key validation failed"))
+    401 -> {
+      case retries > 0 {
+        True -> {
+          // Sleep for 1 second (you'll need to add a sleep function)
+          process.sleep(1000)
+          validate_api_key_with_retry(api_key, retries - 1)
+        }
+        False -> Error(Unauthorized)
+      }
+    }
+    _ -> {
+      case retries > 0 {
+        True -> {
+          // Sleep for 1 second (you'll need to add a sleep function)
+          process.sleep(1000)
+          validate_api_key_with_retry(api_key, retries - 1)
+        }
+        False -> Error(DatabaseError("Key validation failed"))
+      }
+    }
   }
 }
 
@@ -534,6 +581,51 @@ pub fn set_stripe_customer_id(
     }
     404 -> Error(NotFound("Business not found: " <> business_id))
     _ -> Error(DatabaseError("Failed to set stripe_customer_id"))
+  }
+}
+
+// In supabase_client.gleam
+pub fn create_business(
+  business_id: String,
+  business_name: String,
+  email: String,
+) -> Result(Business, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Creating business: " <> business_id,
+  )
+
+  let business_data =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("business_name", json.string(business_name)),
+      #("email", json.string(email)),
+      #("plan_type", json.string("free")),
+      #("subscription_status", json.string("free")),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/businesses",
+    Some(json.to_string(business_data)),
+  ))
+
+  case response.status {
+    201 | 200 -> {
+      case json.parse(response.body, decode.list(business_decoder())) {
+        Ok([new_business, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Business created: " <> new_business.business_id,
+          )
+          Ok(new_business)
+        }
+        Ok([]) -> Error(ParseError("No business returned"))
+        Error(_) -> Error(ParseError("Invalid response format"))
+      }
+    }
+    409 -> Error(DatabaseError("Business already exists"))
+    _ -> Error(DatabaseError("Failed to create business"))
   }
 }
 
@@ -1902,7 +1994,10 @@ pub fn create_customer(
     json.object([
       #("customer_id", json.string(customer_id)),
       #("business_id", json.string(business_id)),
-      #("plan_id", json.string(plan_id)),
+      #("plan_id", case plan_id {
+        "" -> json.null()
+        pid -> json.string(pid)
+      }),
       #("customer_name", json.string(customer_name)),
     ])
 
@@ -1928,7 +2023,19 @@ pub fn create_customer(
       }
     }
     409 -> Error(DatabaseError("Client already exists"))
-    _ -> Error(DatabaseError("Failed to create client"))
+    status -> {
+      // Log the actual status and response body
+      logging.log(
+        logging.Error,
+        "[SupabaseClient] Customer creation failed with status: "
+          <> int.to_string(status)
+          <> " body: "
+          <> response.body,
+      )
+      Error(DatabaseError(
+        "Failed to create client - status: " <> int.to_string(status),
+      ))
+    }
   }
 }
 

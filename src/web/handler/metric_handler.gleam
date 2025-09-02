@@ -95,70 +95,6 @@ fn interval_to_tick_type(interval: String) -> String {
 // AUTHENTICATION
 // ============================================================================
 
-fn validate_api_key(api_key: String) -> Result(String, String) {
-  logging.log(
-    logging.Info,
-    "[MetricHandler] Validating API key via Supabase: "
-      <> string.slice(api_key, 0, 10)
-      <> "...",
-  )
-
-  case supabase_client.validate_api_key(api_key) {
-    Ok(supabase_client.BusinessKey(business_id)) -> {
-      logging.log(
-        logging.Info,
-        "[MetricHandler] ✅ API key validated for business: " <> business_id,
-      )
-      Ok(business_id)
-    }
-    Ok(supabase_client.CustomerKey(business_id, customer_id)) -> {
-      logging.log(
-        logging.Info,
-        "[MetricHandler] ✅ Customer key validated: "
-          <> business_id
-          <> "/"
-          <> customer_id,
-      )
-      // For metrics, we can allow customers to create their own metrics
-      // Return the customer scope as the "business_id" for scoping
-      Ok(business_id <> ":" <> customer_id)
-    }
-    Error(supabase_client.NotFound(_)) -> {
-      logging.log(
-        logging.Warning,
-        "[MetricHandler] ❌ API key not found in database",
-      )
-      Error("Invalid API key")
-    }
-    Error(supabase_client.Unauthorized) -> {
-      logging.log(
-        logging.Warning,
-        "[MetricHandler] ❌ Unauthorized access to Supabase",
-      )
-      Error("Database access denied")
-    }
-    Error(supabase_client.HttpError(_)) -> {
-      logging.log(
-        logging.Error,
-        "[MetricHandler] ❌ Network error connecting to Supabase",
-      )
-      Error("Service temporarily unavailable")
-    }
-    Error(supabase_client.DatabaseError(msg)) -> {
-      logging.log(logging.Error, "[MetricHandler] ❌ Database error: " <> msg)
-      Error("Database error")
-    }
-    Error(supabase_client.ParseError(msg)) -> {
-      logging.log(logging.Error, "[MetricHandler] ❌ Parse error: " <> msg)
-      Error("Invalid response format")
-    }
-    Error(supabase_client.NetworkError(msg)) -> {
-      logging.log(logging.Error, "[MetricHandler] ❌ Network error: " <> msg)
-      Error("Network error")
-    }
-  }
-}
-
 fn extract_api_key(req: Request) -> Result(String, String) {
   case list.key_find(req.headers, "authorization") {
     Ok(auth_header) -> {
@@ -183,22 +119,100 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
       wisp.json_response(json.to_string_tree(error_json), 401)
     }
     Ok(api_key) -> {
-      case validate_api_key(api_key) {
-        Error(error) -> {
+      case supabase_client.validate_api_key(api_key) {
+        Ok(supabase_client.BusinessKey(business_id)) -> {
           logging.log(
-            logging.Warning,
-            "[MetricHandler] Invalid API key: "
-              <> string.slice(api_key, 0, 10)
-              <> "...",
+            logging.Info,
+            "[MetricHandler] ✅ Business key validated: " <> business_id,
           )
-          let error_json =
-            json.object([
-              #("error", json.string("Unauthorized")),
-              #("message", json.string(error)),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 401)
+          handler(business_id)
         }
-        Ok(business_id) -> handler(business_id)
+        Ok(supabase_client.CustomerKey(business_id, customer_id)) -> {
+          logging.log(
+            logging.Info,
+            "[MetricHandler] ✅ Customer key validated: "
+              <> business_id
+              <> "/"
+              <> customer_id,
+          )
+          // ✅ return the raw business_id; scope comes from query params, not auth
+          handler(business_id)
+        }
+        Error(supabase_client.NotFound(_)) ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Unauthorized")),
+                #("message", json.string("Invalid API key")),
+              ]),
+            ),
+            401,
+          )
+        Error(err) -> {
+          logging.log(
+            logging.Error,
+            "[MetricHandler] Auth error: " <> string.inspect(err),
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Service error")),
+                #("message", json.string("API key validation failed")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
+    }
+  }
+}
+
+fn with_auth_typed(
+  req: Request,
+  handler: fn(supabase_client.KeyValidation) -> Response,
+) -> Response {
+  case extract_api_key(req) {
+    Error(error) -> {
+      logging.log(logging.Warning, "[MetricHandler] Auth failed: " <> error)
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Unauthorized")),
+            #("message", json.string(error)),
+          ]),
+        ),
+        401,
+      )
+    }
+    Ok(api_key) -> {
+      case supabase_client.validate_api_key(api_key) {
+        Ok(key_validation) -> handler(key_validation)
+        Error(supabase_client.NotFound(_)) ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Unauthorized")),
+                #("message", json.string("Invalid API key")),
+              ]),
+            ),
+            401,
+          )
+        Error(err) -> {
+          logging.log(
+            logging.Error,
+            "[MetricHandler] Auth error: " <> string.inspect(err),
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Service error")),
+                #("message", json.string("API key validation failed")),
+              ]),
+            ),
+            500,
+          )
+        }
       }
     }
   }
@@ -570,71 +584,125 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[MetricHandler] 🔍 GET REQUEST START - ID: "
+    "[MetricHandler] 🔍 GET START - ID: "
       <> request_id
       <> " metric: "
       <> metric_name,
   )
 
   use <- wisp.require_method(req, http.Get)
-  use business_id <- with_auth(req)
-  // Parse query parameters  
-  let scope = case wisp.get_query(req) |> list.key_find("scope") {
+  use key_validation <- with_auth_typed(req)
+
+  let scope_str = case wisp.get_query(req) |> list.key_find("scope") {
     Ok(s) -> s
     Error(_) -> "business"
   }
 
-  let lookup_key = case scope {
-    "customer" -> {
-      case wisp.get_query(req) |> list.key_find("customer_id") {
-        Ok(cid) -> business_id <> ":" <> cid
-        Error(_) -> business_id
-      }
-    }
-    _ -> business_id
+  let customer_id_opt = case
+    wisp.get_query(req) |> list.key_find("customer_id")
+  {
+    Ok(cid) -> Some(cid)
+    Error(_) -> None
   }
 
-  case metric_store.get_value(lookup_key, metric_name) {
-    Ok(value) -> {
-      let success_json =
-        json.object([
-          #("metric_name", json.string(metric_name)),
-          #("business_id", json.string(business_id)),
-          #("current_value", json.float(value)),
-          #("timestamp", json.int(utils.current_timestamp())),
-        ])
-
-      logging.log(
-        logging.Info,
-        "[MetricHandler] ✅ Retrieved metric: "
-          <> metric_name
-          <> " = "
-          <> float.to_string(value),
-      )
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🔍 GET REQUEST END - ID: " <> request_id,
-      )
-
-      wisp.json_response(json.to_string_tree(success_json), 200)
+  case key_validation {
+    supabase_client.CustomerKey(business_id, customer_id) -> {
+      // Customers can only read their own customer-scoped metrics
+      case scope_str, customer_id_opt {
+        "customer", Some(cid) if cid == customer_id -> {
+          let lookup_key = business_id <> ":" <> customer_id
+          case metric_store.get_value(lookup_key, metric_name) {
+            Ok(value) ->
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("metric_name", json.string(metric_name)),
+                    #("business_id", json.string(business_id)),
+                    #("customer_id", json.string(customer_id)),
+                    #("current_value", json.float(value)),
+                    #("timestamp", json.int(utils.current_timestamp())),
+                  ]),
+                ),
+                200,
+              )
+            Error(_) ->
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("error", json.string("Not Found")),
+                    #(
+                      "message",
+                      json.string("Metric not found: " <> metric_name),
+                    ),
+                  ]),
+                ),
+                404,
+              )
+          }
+        }
+        _, _ -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Forbidden")),
+                #(
+                  "message",
+                  json.string("Customers can only read their own metrics"),
+                ),
+              ]),
+            ),
+            403,
+          )
+        }
+      }
     }
-    Error(_) -> {
-      let error_json =
-        json.object([
-          #("error", json.string("Not Found")),
-          #("message", json.string("Metric not found: " <> metric_name)),
-        ])
 
-      logging.log(
-        logging.Warning,
-        "[MetricHandler] Metric not found: " <> metric_name,
-      )
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🔍 GET REQUEST END - ID: " <> request_id,
-      )
-
-      wisp.json_response(json.to_string_tree(error_json), 404)
+    supabase_client.BusinessKey(business_id) -> {
+      // Businesses can read any metric in their scope
+      case
+        metric_types.string_to_scope(scope_str, business_id, customer_id_opt)
+      {
+        Ok(scope) -> {
+          let lookup_key = metric_types.scope_to_lookup_key(scope)
+          case metric_store.get_value(lookup_key, metric_name) {
+            Ok(value) ->
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("metric_name", json.string(metric_name)),
+                    #("business_id", json.string(business_id)),
+                    #("current_value", json.float(value)),
+                    #("timestamp", json.int(utils.current_timestamp())),
+                  ]),
+                ),
+                200,
+              )
+            Error(_) ->
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("error", json.string("Not Found")),
+                    #(
+                      "message",
+                      json.string("Metric not found: " <> metric_name),
+                    ),
+                  ]),
+                ),
+                404,
+              )
+          }
+        }
+        Error(error) ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Invalid Scope")),
+                #("message", json.string(error)),
+              ]),
+            ),
+            400,
+          )
+      }
     }
   }
 }
@@ -643,68 +711,90 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[MetricHandler] 🔍 UPDATE REQUEST START - ID: "
+    "[MetricHandler] 🔄 UPDATE START - ID: "
       <> request_id
       <> " metric: "
       <> metric_name,
   )
 
   use <- wisp.require_method(req, http.Put)
-  use business_id <- with_auth(req)
+  use key_validation <- with_auth_typed(req)
 
-  // Parse query parameters  
-  let scope = case wisp.get_query(req) |> list.key_find("scope") {
-    Ok(s) -> s
-    Error(_) -> "business"
-  }
-
-  let lookup_key = case scope {
-    "customer" -> {
-      case wisp.get_query(req) |> list.key_find("customer_id") {
-        Ok(cid) -> business_id <> ":" <> cid
-        // "biz_001:mobile_app"
-        Error(_) -> business_id
-        // fallback to business
-      }
-    }
-    _ -> business_id
-    // business scope
-  }
-
-  use json_data <- wisp.require_json(req)
-
-  let result = {
-    use update_req <- result.try(decode.run(
-      json_data,
-      update_metric_request_decoder(),
-    ))
-    // ✅ FIXED: Pass lookup_key to process_update_metric
-    Ok(process_update_metric(
-      lookup_key,
-      business_id,
-      metric_name,
-      update_req.value,
-    ))
-  }
-
-  logging.log(
-    logging.Info,
-    "[MetricHandler] 🔍 UPDATE REQUEST END - ID: " <> request_id,
-  )
-
-  case result {
-    Ok(response) -> response
-    Error(decode_errors) -> {
+  case key_validation {
+    supabase_client.CustomerKey(_, _) -> {
       logging.log(
         logging.Warning,
-        "[MetricHandler] Bad update request: " <> string.inspect(decode_errors),
+        "[MetricHandler] Customer attempted direct metric update - denied",
       )
-      let error_json =
-        json.object([
-          #("error", json.string("Bad Request")),
-          #("message", json.string("Invalid update data")),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 400)
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Forbidden")),
+            #(
+              "message",
+              json.string(
+                "Customers cannot update metrics directly. Use the proxy endpoint.",
+              ),
+            ),
+          ]),
+        ),
+        403,
+      )
+    }
+
+    supabase_client.BusinessKey(business_id) -> {
+      let scope_str = case wisp.get_query(req) |> list.key_find("scope") {
+        Ok(s) -> s
+        Error(_) -> "business"
+      }
+
+      let customer_id_opt = case
+        wisp.get_query(req) |> list.key_find("customer_id")
+      {
+        Ok(cid) -> Some(cid)
+        Error(_) -> None
+      }
+
+      let lookup_key = case
+        metric_types.string_to_scope(scope_str, business_id, customer_id_opt)
+      {
+        Ok(scope) -> metric_types.scope_to_lookup_key(scope)
+        Error(_) -> business_id
+      }
+
+      use json_data <- wisp.require_json(req)
+
+      let result = {
+        use update_req <- result.try(decode.run(
+          json_data,
+          update_metric_request_decoder(),
+        ))
+        Ok(process_update_metric(
+          lookup_key,
+          business_id,
+          metric_name,
+          update_req.value,
+        ))
+      }
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] 🔄 UPDATE END - ID: " <> request_id,
+      )
+
+      case result {
+        Ok(response) -> response
+        Error(_) ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Bad Request")),
+                #("message", json.string("Invalid update data")),
+              ]),
+            ),
+            400,
+          )
+      }
     }
   }
 }
@@ -720,47 +810,56 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
   )
 
   use <- wisp.require_method(req, http.Delete)
-  use business_id <- with_auth(req)
+  use key_validation <- with_auth_typed(req)
 
-  case metric_actor.lookup_metric_subject(business_id, metric_name) {
-    Ok(metric_subject) -> {
-      process.send(metric_subject, metric_types.Shutdown)
-
-      let success_json =
-        json.object([
-          #("message", json.string("Metric deleted successfully")),
-          #("metric_name", json.string(metric_name)),
-          #("business_id", json.string(business_id)),
-        ])
-
-      logging.log(
-        logging.Info,
-        "[MetricHandler] ✅ Deleted metric: " <> metric_name,
+  case key_validation {
+    supabase_client.CustomerKey(_, _) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Forbidden")),
+            #("message", json.string("Customers cannot delete metrics")),
+          ]),
+        ),
+        403,
       )
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🔍 DELETE REQUEST END - ID: " <> request_id,
-      )
-
-      wisp.json_response(json.to_string_tree(success_json), 200)
     }
-    Error(_) -> {
-      let error_json =
-        json.object([
-          #("error", json.string("Not Found")),
-          #("message", json.string("Metric not found: " <> metric_name)),
-        ])
 
-      logging.log(
-        logging.Warning,
-        "[MetricHandler] Delete failed - metric not found: " <> metric_name,
-      )
-      logging.log(
-        logging.Info,
-        "[MetricHandler] 🔍 DELETE REQUEST END - ID: " <> request_id,
-      )
-
-      wisp.json_response(json.to_string_tree(error_json), 404)
+    supabase_client.BusinessKey(business_id) -> {
+      case metric_actor.lookup_metric_subject(business_id, metric_name) {
+        Ok(metric_subject) -> {
+          process.send(metric_subject, metric_types.Shutdown)
+          logging.log(
+            logging.Info,
+            "[MetricHandler] ✅ Deleted metric: " <> metric_name,
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("message", json.string("Metric deleted successfully")),
+                #("metric_name", json.string(metric_name)),
+                #("business_id", json.string(business_id)),
+              ]),
+            ),
+            200,
+          )
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Warning,
+            "[MetricHandler] Delete failed - metric not found: " <> metric_name,
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Not Found")),
+                #("message", json.string("Metric not found: " <> metric_name)),
+              ]),
+            ),
+            404,
+          )
+        }
+      }
     }
   }
 }

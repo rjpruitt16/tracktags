@@ -1,12 +1,12 @@
 // src/web/router.gleam
 import gleam/http.{Delete, Get, Post, Put}
 import web/handler/admin_handler
-import web/handler/customer_handler
 import web/handler/key_handler
 import web/handler/metric_handler
 import web/handler/plan_limit_handler
 import web/handler/proxy_handler
 import web/handler/stripe_handler
+import web/handler/user_handler
 import wisp.{type Request, type Response}
 
 pub fn handle_request(req: Request) -> Response {
@@ -54,16 +54,16 @@ pub fn handle_request(req: Request) -> Response {
     // Client CRUD API
     ["api", "v1", "customers"] ->
       case req.method {
-        Post -> customer_handler.create_customer(req)
-        Get -> customer_handler.list_customers(req)
+        Post -> user_handler.create_customer(req)
+        Get -> user_handler.list_customers(req)
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
     // Individual client operations
     ["api", "v1", "customers", customer_id] ->
       case req.method {
-        Get -> customer_handler.get_customer(req, customer_id)
-        Delete -> customer_handler.delete_customer(req, customer_id)
+        Get -> user_handler.get_customer(req, customer_id)
+        Delete -> user_handler.delete_customer(req, customer_id)
         _ -> wisp.method_not_allowed([Get, Delete])
       }
 
@@ -74,11 +74,11 @@ pub fn handle_request(req: Request) -> Response {
         Get -> key_handler.list_customer_keys(req, customer_id)
         _ -> wisp.method_not_allowed([Post, Get])
       }
-    // Individual client key operations
-    ["api", "v1", "customers", customer_id, "keys", key_id] ->
+    // Add business endpoint
+    ["api", "v1", "businesses"] ->
       case req.method {
-        Delete -> customer_handler.delete_client_key(req, customer_id, key_id)
-        _ -> wisp.method_not_allowed([Delete])
+        Post -> user_handler.create_business(req)
+        _ -> wisp.method_not_allowed([Post])
       }
 
     // Metrics CRUD API

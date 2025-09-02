@@ -1,0 +1,77 @@
+name: Test and Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Python dependencies
+        run: pip install flask
+      - name: Install Hurl
+        run: |
+          curl -LO https://github.com/Orange-OpenSource/hurl/releases/download/4.0.0/hurl_4.0.0_amd64.deb
+          sudo dpkg -i hurl_4.0.0_amd64.deb
+      - name: Set up Erlang & Gleam
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: "26.0"
+          gleam-version: "1.0.0"
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl python3
+          curl -L https://github.com/Orange-OpenSource/hurl/releases/download/4.1.0/hurl_4.1.0_amd64.deb -o hurl.deb
+          sudo dpkg -i hurl.deb
+          gleam deps download
+      
+      - name: Build
+        run: gleam build
+      
+      - name: Run unit tests
+        run: gleam test
+      
+      - name: Run integration tests
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          ADMIN_API_KEY: admin_secret_key_123
+        run: python3 test/integration/run_tests.py
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      
+      - name: Build and push
+        run: |
+          IMAGE=ghcr.io/${{ github.repository_owner }}/tracktags
+          docker build -t $IMAGE:${{ github.sha }} .
+          docker push $IMAGE:${{ github.sha }}
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            docker tag $IMAGE:${{ github.sha }} $IMAGE:${{ github.ref_name }}
+            docker push $IMAGE:${{ github.ref_name }}
+            docker tag $IMAGE:${{ github.sha }} $IMAGE:latest
+            docker push $IMAGE:latest
+          fi

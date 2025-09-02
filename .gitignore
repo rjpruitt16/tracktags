@@ -2,3 +2,9 @@
 *.ez
 /build
 erl_crash.dump
+
+
+# .gitignore (root) — add these if not already
+.env
+.env.*
+!.env.example
