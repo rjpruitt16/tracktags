@@ -62,10 +62,12 @@ HTTP 201
 [Captures]
 customer_key: jsonpath "$.api_key"
 
+
 # Step 6: Verify customer key with retries
 GET {{TRACKTAGS_URL}}/api/v1/metrics
 Authorization: Bearer {{customer_key}}
 [Options]
+delay: 3000
 retry: 15
 retry-interval: 2000ms
 HTTP 200

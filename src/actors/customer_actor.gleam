@@ -4,7 +4,6 @@ import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic
 import gleam/dynamic/decode
-import gleam/erlang/atom
 import gleam/erlang/process
 import gleam/float
 import gleam/int

@@ -1139,6 +1139,248 @@ pub fn delete_plan_limit(
 }
 
 // ============================================================================
+// STRIPE EVENT DEDUPLICATION
+// ============================================================================
+
+/// Record a Stripe event to prevent duplicate processing
+pub fn insert_stripe_event(
+  event_id: String,
+  event_type: String,
+  business_id: Option(String),
+  customer_id: Option(String),
+  raw_payload: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Recording Stripe event: "
+      <> event_id
+      <> " ("
+      <> event_type
+      <> ")",
+  )
+
+  let base_fields = [
+    #("event_id", json.string(event_id)),
+    #("event_type", json.string(event_type)),
+    #("status", json.string("processing")),
+    #("raw_payload", json.string(raw_payload)),
+  ]
+
+  let with_business = case business_id {
+    Some(bid) -> [#("business_id", json.string(bid)), ..base_fields]
+    None -> base_fields
+  }
+
+  let all_fields = case customer_id {
+    Some(cid) -> [#("customer_id", json.string(cid)), ..with_business]
+    None -> with_business
+  }
+
+  let event_data = json.object(all_fields)
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/stripe_events",
+    Some(json.to_string(event_data)),
+  ))
+
+  case response.status {
+    201 | 200 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Stripe event recorded: " <> event_id,
+      )
+      Ok(Nil)
+    }
+    409 -> {
+      // Event already exists (duplicate)
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] Event already processed (duplicate): " <> event_id,
+      )
+      Error(DatabaseError("Event already exists"))
+    }
+    _ -> Error(DatabaseError("Failed to record Stripe event"))
+  }
+}
+
+/// Mark a Stripe event as completed
+pub fn update_stripe_event_status(
+  event_id: String,
+  status: String,
+  error_message: Option(String),
+) -> Result(Nil, SupabaseError) {
+  let base_fields = [
+    #("status", json.string(status)),
+    #("processed_at", json.string("now()")),
+  ]
+
+  let all_fields = case error_message {
+    Some(msg) -> [#("error_message", json.string(msg)), ..base_fields]
+    None -> base_fields
+  }
+
+  let update_data = json.object(all_fields)
+
+  use response <- result.try(make_request(
+    http.Patch,
+    "/stripe_events?event_id=eq." <> event_id,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to update event status"))
+  }
+}
+
+// ============================================================================
+// PROVISIONING QUEUE
+// ============================================================================
+
+/// Add a machine provisioning task to the queue
+pub fn insert_provisioning_queue(
+  business_id: String,
+  customer_id: String,
+  action: String,
+  // "provision", "suspend", "resume", "terminate"
+  provider: String,
+  // "fly"
+  payload: Dict(String, String),
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Queuing " <> action <> " for customer: " <> customer_id,
+  )
+
+  // Create idempotency key to prevent duplicate provisions
+  let idempotency_key =
+    action
+    <> "_"
+    <> customer_id
+    <> "_"
+    <> int.to_string(utils.current_timestamp())
+
+  let payload_json =
+    payload
+    |> dict.to_list()
+    |> list.map(fn(pair) { #(pair.0, json.string(pair.1)) })
+    |> json.object()
+
+  let queue_data =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("customer_id", json.string(customer_id)),
+      #("action", json.string(action)),
+      #("provider", json.string(provider)),
+      #("status", json.string("pending")),
+      #("payload", payload_json),
+      #("idempotency_key", json.string(idempotency_key)),
+      #("next_retry_at", json.string("now()")),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/provisioning_queue",
+    Some(json.to_string(queue_data)),
+  ))
+
+  case response.status {
+    201 | 200 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Queued " <> action <> " for: " <> customer_id,
+      )
+      Ok(Nil)
+    }
+    409 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] Action already queued (duplicate): "
+          <> idempotency_key,
+      )
+      Ok(Nil)
+      // Not an error - idempotent
+    }
+    _ -> Error(DatabaseError("Failed to queue provisioning action"))
+  }
+}
+
+/// Get pending provisioning tasks
+pub fn get_pending_provisioning_tasks(
+  limit: Int,
+) -> Result(List(ProvisioningTask), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting pending provisioning tasks",
+  )
+
+  let path =
+    "/provisioning_queue?status=eq.pending&next_retry_at=lte.now()&order=created_at.asc&limit="
+    <> int.to_string(limit)
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(provisioning_task_decoder())) {
+        Ok(tasks) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] Found "
+              <> int.to_string(list.length(tasks))
+              <> " pending tasks",
+          )
+          Ok(tasks)
+        }
+        Error(_) -> Error(ParseError("Invalid provisioning tasks format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch provisioning tasks"))
+  }
+}
+
+// Also add this type near the top with other types (around line 100):
+pub type ProvisioningTask {
+  ProvisioningTask(
+    id: String,
+    customer_id: String,
+    business_id: String,
+    action: String,
+    provider: String,
+    status: String,
+    attempt_count: Int,
+    payload: Dict(String, String),
+  )
+}
+
+// And add this decoder (around line 300 with other decoders):
+fn provisioning_task_decoder() -> decode.Decoder(ProvisioningTask) {
+  use id <- decode.field("id", decode.string)
+  use customer_id <- decode.field("customer_id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use action <- decode.field("action", decode.string)
+  use provider <- decode.field("provider", decode.string)
+  use status <- decode.field("status", decode.string)
+  use attempt_count <- decode.field("attempt_count", decode.int)
+  use payload <- decode.field(
+    "payload",
+    decode.dict(decode.string, decode.string),
+  )
+
+  decode.success(ProvisioningTask(
+    id: id,
+    customer_id: customer_id,
+    business_id: business_id,
+    action: action,
+    provider: provider,
+    status: status,
+    attempt_count: attempt_count,
+    payload: payload,
+  ))
+}
+
+// ============================================================================
 // CLIENT PLAN LIMITS MANAGEMENT  
 // ============================================================================
 

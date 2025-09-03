@@ -65,9 +65,109 @@ pub type StripeCredentials {
 
 /// Main webhook endpoint handler
 pub fn handle_stripe_webhook(req: Request) -> Response {
-  case req.method {
-    http.Post -> process_webhook(req)
-    _ -> wisp.method_not_allowed([http.Post])
+  use <- wisp.require_method(req, http.Post)
+
+  // Get signature from headers
+  case get_stripe_signature(req) {
+    Error(_) -> {
+      logging.log(logging.Warning, "[StripeWebhook] Missing Stripe signature")
+      wisp.bad_request()
+    }
+    Ok(signature) -> {
+      // Read request body
+      case wisp.read_body_to_bitstring(req) {
+        Error(_) -> {
+          logging.log(logging.Error, "[StripeWebhook] Failed to read body")
+          wisp.bad_request()
+        }
+        Ok(body_bits) -> {
+          case bit_array.to_string(body_bits) {
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[StripeWebhook] Invalid UTF-8 in body",
+              )
+              wisp.bad_request()
+            }
+            Ok(body) -> {
+              // Now process with signature verification
+              process_webhook_with_dedup(body, signature)
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Add this new function for deduplication
+fn process_webhook_with_dedup(body: String, signature: String) -> Response {
+  // First parse the event to get the ID
+  case parse_stripe_event(body) {
+    Error(err) -> {
+      logging.log(logging.Error, "[StripeWebhook] Parse error: " <> err)
+      wisp.bad_request()
+    }
+    Ok(event) -> {
+      // Check if already processed
+      case check_and_record_event(event.id, event.event_type, body) {
+        Error(supabase_client.DatabaseError(msg)) -> {
+          case string.contains(msg, "already exists") {
+            True -> {
+              // Already processed - return success to stop Stripe retries
+              logging.log(
+                logging.Info,
+                "[StripeWebhook] Event already processed: " <> event.id,
+              )
+              wisp.ok()
+              |> wisp.string_body("{\"received\": true}")
+            }
+            False -> {
+              logging.log(
+                logging.Error,
+                "[StripeWebhook] Database error: " <> msg,
+              )
+              wisp.internal_server_error()
+            }
+          }
+        }
+        Error(err) -> {
+          logging.log(
+            logging.Error,
+            "[StripeWebhook] Error: " <> string.inspect(err),
+          )
+          wisp.internal_server_error()
+        }
+        Ok(_) -> {
+          // Now verify signature and process
+          case verify_and_process(body, signature) {
+            Success(message) -> {
+              logging.log(logging.Info, "[StripeWebhook] Success: " <> message)
+              wisp.ok()
+              |> wisp.string_body("{\"received\": true}")
+            }
+            InvalidSignature -> {
+              logging.log(logging.Error, "[StripeWebhook] Invalid signature")
+              wisp.bad_request()
+            }
+            InvalidPayload(err) -> {
+              logging.log(
+                logging.Error,
+                "[StripeWebhook] Invalid payload: " <> err,
+              )
+              wisp.bad_request()
+            }
+            ProcessingError(err) -> {
+              logging.log(
+                logging.Error,
+                "[StripeWebhook] Processing error: " <> err,
+              )
+              wisp.internal_server_error()
+            }
+          }
+        }
+      }
+    }
   }
 }
 
@@ -121,85 +221,6 @@ fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
       }
     }
     Error(error) -> ProcessingError("Failed to extract customer: " <> error)
-  }
-}
-
-/// Process incoming Stripe webhook
-fn process_webhook(req: Request) -> Response {
-  // Get Stripe signature from headers
-  case get_stripe_signature(req) {
-    Error(_) -> {
-      logging.log(
-        logging.Error,
-        "[StripeHandler] Missing Stripe signature header",
-      )
-      wisp.bad_request()
-      |> wisp.string_body("Missing Stripe-Signature header")
-    }
-    Ok(signature) -> {
-      // Read request body
-      case wisp.read_body_to_bitstring(req) {
-        Error(_) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] Failed to read webhook body",
-          )
-          wisp.bad_request()
-          |> wisp.string_body("Invalid request body")
-        }
-        Ok(body_bits) -> {
-          // Convert to string for processing
-          case bit_array.to_string(body_bits) {
-            Error(_) -> {
-              logging.log(
-                logging.Error,
-                "[StripeHandler] Invalid UTF-8 in webhook body",
-              )
-              wisp.bad_request()
-              |> wisp.string_body("Invalid body encoding")
-            }
-            Ok(body) -> {
-              // Verify signature and process
-              case verify_and_process(body, signature) {
-                Success(message) -> {
-                  logging.log(
-                    logging.Info,
-                    "[StripeHandler] Webhook processed successfully: "
-                      <> message,
-                  )
-                  wisp.ok()
-                  |> wisp.string_body("{\"received\": true}")
-                }
-                InvalidSignature -> {
-                  logging.log(
-                    logging.Error,
-                    "[StripeHandler] Invalid Stripe signature",
-                  )
-                  wisp.bad_request()
-                  |> wisp.string_body("Invalid signature")
-                }
-                InvalidPayload(error) -> {
-                  logging.log(
-                    logging.Error,
-                    "[StripeHandler] Invalid webhook payload: " <> error,
-                  )
-                  wisp.bad_request()
-                  |> wisp.string_body("Invalid payload: " <> error)
-                }
-                ProcessingError(error) -> {
-                  logging.log(
-                    logging.Error,
-                    "[StripeHandler] Webhook processing error: " <> error,
-                  )
-                  wisp.internal_server_error()
-                  |> wisp.string_body("Processing error")
-                }
-              }
-            }
-          }
-        }
-      }
-    }
   }
 }
 
@@ -320,7 +341,7 @@ fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
 
 // UPDATE the stripe_data_decoder (around line 275)
 fn stripe_data_decoder() -> decode.Decoder(StripeData) {
-  use customer <- decode.field("customer", decode.string)
+  use customer <- decode.optional_field("customer", "", decode.string)
   use subscription_id <- decode.optional_field(
     "id",
     None,
@@ -336,12 +357,13 @@ fn stripe_data_decoder() -> decode.Decoder(StripeData) {
     None,
     decode.optional(decode.string),
   )
-  // ADD metadata extraction
+  // ADD extraction
   use metadata <- decode.optional_field(
     "metadata",
     None,
     decode.optional(decode.dict(decode.string, decode.string)),
   )
+
   decode.success(StripeData(
     customer,
     subscription_id,
@@ -742,15 +764,15 @@ fn get_webhook_secret() -> Result(String, String) {
 }
 
 /// Handle customer webhook using their stored Stripe secret
-pub fn handle_customer_webhook(req: Request, business_id: String) -> Response {
+pub fn handle_business_webhook(req: Request, business_id: String) -> Response {
   case req.method {
-    http.Post -> process_customer_webhook(req, business_id)
+    http.Post -> process_business_webhook(req, business_id)
     _ -> wisp.method_not_allowed([http.Post])
   }
 }
 
 /// Process customer webhook - reuses existing logic but with customer secret
-fn process_customer_webhook(req: Request, business_id: String) -> Response {
+fn process_business_webhook(req: Request, business_id: String) -> Response {
   case get_stripe_signature(req) {
     Error(_) -> {
       logging.log(
@@ -782,7 +804,13 @@ fn process_customer_webhook(req: Request, business_id: String) -> Response {
             }
             Ok(body) -> {
               // REUSE existing logic but with customer secret
-              case verify_and_process_customer(body, signature, business_id) {
+              case
+                process_webhook_with_dedup_for_business(
+                  body,
+                  signature,
+                  business_id,
+                )
+              {
                 Success(message) -> {
                   logging.log(
                     logging.Info,
@@ -978,4 +1006,62 @@ fn fetch_stripe_event_from_api(
   // TODO: Implement Stripe API call
   // For now, return error - you can implement this when needed
   Error("Stripe API fetch not yet implemented - use dashboard replay for now")
+}
+
+// Record event to prevent duplicates
+fn check_and_record_event(
+  event_id: String,
+  event_type: StripeEventType,
+  raw_payload: String,
+) -> Result(Nil, supabase_client.SupabaseError) {
+  let event_type_string = case event_type {
+    InvoicePaymentSucceeded -> "invoice.payment_succeeded"
+    CustomerSubscriptionCreated -> "customer.subscription.created"
+    CustomerSubscriptionUpdated -> "customer.subscription.updated"
+    CustomerSubscriptionDeleted -> "customer.subscription.deleted"
+    InvoicePaymentFailed -> "invoice.payment_failed"
+    InvoiceFinalized -> "invoice.finalized"
+    UnknownEvent(t) -> t
+  }
+
+  supabase_client.insert_stripe_event(
+    event_id,
+    event_type_string,
+    None,
+    // business_id - will be extracted from event
+    None,
+    // customer_id - will be extracted from event
+    raw_payload,
+  )
+}
+
+// Add deduplication for business webhooks
+fn process_webhook_with_dedup_for_business(
+  body: String,
+  signature: String,
+  business_id: String,
+) -> WebhookResult {
+  // First parse to get event ID
+  case parse_stripe_event(body) {
+    Error(err) -> InvalidPayload(err)
+    Ok(event) -> {
+      // Check if already processed (with business prefix to avoid collisions)
+      let prefixed_event_id = "biz_" <> business_id <> "_" <> event.id
+
+      case check_and_record_event(prefixed_event_id, event.event_type, body) {
+        Error(supabase_client.DatabaseError(msg)) -> {
+          case string.contains(msg, "already exists") {
+            True -> Success("Event already processed")
+            False -> ProcessingError("Database error: " <> msg)
+          }
+        }
+        Ok(_) -> {
+          // Now verify and process with business webhook secret
+          verify_and_process_customer(body, signature, business_id)
+        }
+        Error(err) ->
+          ProcessingError("Failed to record event: " <> string.inspect(err))
+      }
+    }
+  }
 }
