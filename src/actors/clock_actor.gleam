@@ -45,6 +45,8 @@ fn get_tick_intervals() -> Dict(String, Int) {
     #("tick_1h", 3600),
     #("tick_6h", 21_600),
     #("tick_1d", 86_400),
+    #("tick_1w", 604_800),
+    #("tick_1mo", 2_592_000),
   ])
 }
 

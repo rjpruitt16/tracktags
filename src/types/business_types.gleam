@@ -3,6 +3,7 @@ import gleam/dict.{type Dict}
 import gleam/erlang/process
 import gleam/option.{type Option}
 import glixir
+import types/customer_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
@@ -45,6 +46,11 @@ pub type Message {
     new_limit_value: Float,
     limit_operator: String,
     breach_action: String,
+  )
+  EnsureCustomerExists(
+    customer_id: String,
+    context: customer_types.CustomerContext,
+    reply: process.Subject(process.Subject(customer_types.Message)),
   )
 }
 

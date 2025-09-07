@@ -16,6 +16,7 @@ import gleam/string
 import gleam/uri
 import logging
 import storage/metric_store
+import types/customer_types.{type CustomerContext}
 import types/metric_types
 import utils/crypto
 import utils/utils
@@ -33,6 +34,7 @@ pub type SupabaseError {
   HttpError(httpc.HttpError)
 }
 
+// Update Business type
 pub type Business {
   Business(
     business_id: String,
@@ -40,6 +42,9 @@ pub type Business {
     business_name: String,
     email: String,
     plan_type: String,
+    default_docker_image: Option(String),
+    default_machine_size: Option(String),
+    default_region: Option(String),
   )
 }
 
@@ -70,38 +75,73 @@ pub type MetricRecord {
   )
 }
 
-pub type PlanLimit {
-  PlanLimit(
-    id: String,
-    business_id: Option(String),
-    plan_id: Option(String),
-    metric_name: String,
-    limit_value: Float,
-    limit_period: String,
-    breach_operator: String,
-    breach_action: String,
-    webhook_urls: Option(String),
-    created_at: String,
-    metric_type: String,
-  )
-}
-
-pub type Customer {
-  // Changed from Client
-  Customer(
-    customer_id: String,
-    business_id: String,
-    plan_id: Option(String),
-    customer_name: String,
-    stripe_customer_id: Option(String),
-    stripe_subscription_id: Option(String),
-    created_at: String,
-  )
-}
-
 pub type KeyValidation {
   BusinessKey(business_id: String)
   CustomerKey(business_id: String, customer_id: String)
+}
+
+pub type ProvisioningTask {
+  ProvisioningTask(
+    id: String,
+    customer_id: String,
+    business_id: String,
+    action: String,
+    provider: String,
+    status: String,
+    attempt_count: Int,
+    max_attempts: Int,
+    payload: Dict(String, String),
+  )
+}
+
+// Add type and decoder
+pub type PlanMachine {
+  PlanMachine(
+    id: String,
+    plan_id: String,
+    machine_count: Int,
+    machine_size: String,
+    docker_image: Option(String),
+    grace_period_days: Int,
+  )
+}
+
+// Add new combined validation function
+pub type ValidationResult {
+  BusinessValidation(business_id: String)
+  CustomerValidation(
+    business_id: String,
+    customer_id: String,
+    context: CustomerContext,
+  )
+  InvalidKey
+}
+
+pub fn validate_key_with_context(
+  api_key: String,
+) -> Result(ValidationResult, SupabaseError) {
+  let key_hash = crypto.hash_api_key(api_key)
+  let encoded_hash = uri.percent_encode(key_hash)
+
+  let body =
+    json.object([#("p_api_key_hash", json.string(encoded_hash))])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/validate_key_and_get_context",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, validation_result_decoder()) {
+        Ok(result) -> Ok(result)
+        Error(_) -> Error(ParseError("Invalid validation response"))
+      }
+    }
+    _ -> Error(Unauthorized)
+  }
 }
 
 // ============================================================================
@@ -210,7 +250,7 @@ fn make_request_with_params(
 // JSON DECODERS
 // ============================================================================
 
-fn customer_decoder() -> decode.Decoder(Customer) {
+fn customer_decoder() -> decode.Decoder(customer_types.Customer) {
   use customer_id <- decode.field("customer_id", decode.string)
   use business_id <- decode.field("business_id", decode.string)
   use plan_id <- decode.field("plan_id", decode.optional(decode.string))
@@ -225,16 +265,156 @@ fn customer_decoder() -> decode.Decoder(Customer) {
     None,
     decode.optional(decode.string),
   )
+  use stripe_price_id <- decode.optional_field(
+    "stripe_price_id",
+    None,
+    decode.optional(decode.string),
+  )
   use created_at <- decode.field("created_at", decode.string)
 
-  decode.success(Customer(
+  decode.success(customer_types.Customer(
     customer_id: customer_id,
     business_id: business_id,
     plan_id: plan_id,
     customer_name: customer_name,
     stripe_customer_id: stripe_customer_id,
     stripe_subscription_id: stripe_subscription_id,
+    stripe_price_id: stripe_price_id,
     created_at: created_at,
+  ))
+}
+
+fn customer_context_decoder() -> decode.Decoder(customer_types.CustomerContext) {
+  use customer <- decode.field("customer", customer_decoder())
+  use machines <- decode.field(
+    "machines",
+    decode.list(customer_machine_decoder()),
+  )
+  use limits <- decode.field("plan_limits", decode.list(plan_limit_decoder()))
+
+  decode.success(customer_types.CustomerContext(
+    customer: customer,
+    machines: machines,
+    plan_limits: limits,
+  ))
+}
+
+fn plan_machine_decoder() -> decode.Decoder(PlanMachine) {
+  use id <- decode.field("id", decode.string)
+  use plan_id <- decode.field("plan_id", decode.string)
+  use machine_count <- decode.field("machine_count", decode.int)
+  use machine_size <- decode.field("machine_size", decode.string)
+  use docker_image <- decode.optional_field(
+    "docker_image",
+    None,
+    decode.optional(decode.string),
+  )
+  use grace_period_days <- decode.field("grace_period_days", decode.int)
+
+  decode.success(PlanMachine(
+    id,
+    plan_id,
+    machine_count,
+    machine_size,
+    docker_image,
+    grace_period_days,
+  ))
+}
+
+fn provisioning_task_decoder() -> decode.Decoder(ProvisioningTask) {
+  use id <- decode.field("id", decode.string)
+  use customer_id <- decode.field("customer_id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use action <- decode.field("action", decode.string)
+  use provider <- decode.field("provider", decode.string)
+  use status <- decode.field("status", decode.string)
+  use attempt_count <- decode.field("attempt_count", decode.int)
+  use max_attempts <- decode.optional_field("max_attempts", 3, decode.int)
+  // Default to 3
+  use payload <- decode.field(
+    "payload",
+    decode.dict(decode.string, decode.string),
+  )
+
+  decode.success(ProvisioningTask(
+    id: id,
+    customer_id: customer_id,
+    business_id: business_id,
+    action: action,
+    provider: provider,
+    status: status,
+    attempt_count: attempt_count,
+    max_attempts: max_attempts,
+    payload: payload,
+  ))
+}
+
+fn validation_result_decoder() -> decode.Decoder(ValidationResult) {
+  use key_type <- decode.field("key_type", decode.string)
+
+  case key_type {
+    "business" -> {
+      use business_id <- decode.field("business_id", decode.string)
+      decode.success(BusinessValidation(business_id))
+    }
+    "customer" -> {
+      use business_id <- decode.field("business_id", decode.string)
+      use customer_id <- decode.field("customer_id", decode.string)
+      use context <- decode.field("context", customer_context_decoder())
+      decode.success(CustomerValidation(business_id, customer_id, context))
+    }
+    _ -> {
+      decode.success(InvalidKey)
+    }
+  }
+}
+
+// Add decoder (around line 350)
+fn customer_machine_decoder() -> decode.Decoder(customer_types.CustomerMachine) {
+  use id <- decode.field("id", decode.string)
+  use customer_id <- decode.field("customer_id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use machine_id <- decode.field("machine_id", decode.string)
+  use fly_app_name <- decode.optional_field(
+    "fly_app_name",
+    None,
+    decode.optional(decode.string),
+  )
+  use machine_url <- decode.optional_field(
+    "machine_url",
+    None,
+    decode.optional(decode.string),
+  )
+  use ip_address <- decode.optional_field(
+    "ip_address",
+    None,
+    decode.optional(decode.string),
+  )
+  use status <- decode.field("status", decode.string)
+  use expires_at <- decode.field("expires_at", decode.int)
+  use docker_image <- decode.optional_field(
+    "docker_image",
+    None,
+    decode.optional(decode.string),
+  )
+  use fly_state <- decode.optional_field(
+    "fly_state",
+    None,
+    decode.optional(decode.string),
+  )
+
+  decode.success(customer_types.CustomerMachine(
+    id: id,
+    customer_id: customer_id,
+    business_id: business_id,
+    machine_id: machine_id,
+    fly_app_name: fly_app_name,
+    machine_url: machine_url,
+    ip_address: ip_address,
+    status: status,
+    expires_at: expires_at,
+    docker_image: docker_image,
+    fly_state: fly_state,
   ))
 }
 
@@ -247,12 +427,31 @@ fn business_decoder() -> decode.Decoder(Business) {
   use business_name <- decode.field("business_name", decode.string)
   use email <- decode.field("email", decode.string)
   use plan_type <- decode.field("plan_type", decode.string)
+  use default_docker_image <- decode.optional_field(
+    "default_docker_image",
+    None,
+    decode.optional(decode.string),
+  )
+  use default_machine_size <- decode.optional_field(
+    "default_machine_size",
+    Some("shared-cpu-1x"),
+    decode.optional(decode.string),
+  )
+  use default_region <- decode.optional_field(
+    "default_region",
+    Some("iad"),
+    decode.optional(decode.string),
+  )
+
   decode.success(Business(
     business_id: business_id,
     stripe_customer_id: stripe_customer_id,
     business_name: business_name,
     email: email,
     plan_type: plan_type,
+    default_docker_image: default_docker_image,
+    default_machine_size: default_machine_size,
+    default_region: default_region,
   ))
 }
 
@@ -629,57 +828,6 @@ pub fn create_business(
   }
 }
 
-/// Create business for new Stripe customer (webhook auto-creation)
-pub fn create_business_for_stripe_customer(
-  stripe_customer_id: String,
-  business_name: String,
-  email: String,
-  plan_type: String,
-  // ✅ Now configurable
-) -> Result(Business, SupabaseError) {
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Creating business for Stripe customer: "
-      <> stripe_customer_id,
-  )
-
-  let business_id = "biz_" <> string.slice(stripe_customer_id, 4, 8)
-  // Extract part of customer ID
-
-  let business_data =
-    json.object([
-      #("business_id", json.string(business_id)),
-      #("business_name", json.string(business_name)),
-      #("email", json.string(email)),
-      #("plan_type", json.string(plan_type)),
-      #("stripe_customer_id", json.string(stripe_customer_id)),
-      #("subscription_status", json.string("active")),
-    ])
-
-  use response <- result.try(make_request(
-    http.Post,
-    "/businesses",
-    Some(json.to_string(business_data)),
-  ))
-
-  case response.status {
-    201 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] ✅ Created business: " <> business_id,
-      )
-      Ok(Business(
-        business_id: business_id,
-        stripe_customer_id: Some(stripe_customer_id),
-        business_name: business_name,
-        email: email,
-        plan_type: "pro",
-      ))
-    }
-    _ -> Error(DatabaseError("Failed to create business"))
-  }
-}
-
 // For TrackTags platform webhooks
 pub fn update_business_subscription(
   stripe_customer_id: String,
@@ -829,13 +977,57 @@ pub fn create_plan_limit(
 }
 
 // ============================================================================
-// PLAN INHERITANCE FOR CLIENT ACTORS
+// PLAN
 // ============================================================================
+
+pub fn get_plan_machines_by_price_id(
+  price_id: String,
+) -> Result(PlanMachine, SupabaseError) {
+  // First get plan by price_id
+  let path = "/plans?stripe_price_id=eq." <> price_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(decode.field("id", decode.string, decode.success)),
+        )
+      {
+        Ok([plan_id]) -> {
+          // Now get machine config for this plan
+          let machine_path = "/plan_machines?plan_id=eq." <> plan_id
+          use machine_response <- result.try(make_request(
+            http.Get,
+            machine_path,
+            None,
+          ))
+
+          case
+            json.parse(
+              machine_response.body,
+              decode.list(plan_machine_decoder()),
+            )
+          {
+            Ok([machine]) -> Ok(machine)
+            Ok([]) -> Error(NotFound("No machine config for plan"))
+            _ -> Error(ParseError("Invalid machine config"))
+          }
+        }
+        Ok([]) -> Error(NotFound("Plan not found for price_id"))
+        _ -> Error(ParseError("Multiple plans with same price_id"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch plan"))
+  }
+}
 
 /// Get plan limits for a specific plan_id (used by customer_actor)
 pub fn get_plan_limits_by_plan_id(
   plan_id: String,
-) -> Result(List(PlanLimit), SupabaseError) {
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting plan limits for plan: " <> plan_id,
@@ -869,7 +1061,7 @@ pub fn get_plan_limits_by_plan_id(
 // PLAN LIMITS JSON DECODERS (Add to decoders section)
 // ============================================================================
 
-fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
+fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
   use id <- decode.field("id", decode.string)
   use business_id <- decode.field("business_id", decode.optional(decode.string))
   use plan_id <- decode.field("plan_id", decode.optional(decode.string))
@@ -893,7 +1085,9 @@ fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
     decode.string,
   )
 
-  decode.success(PlanLimit(
+  use customer_id <- decode.field("customer_id", decode.optional(decode.string))
+
+  decode.success(customer_types.PlanLimit(
     id: id,
     business_id: business_id,
     plan_id: plan_id,
@@ -905,6 +1099,7 @@ fn plan_limit_decoder() -> decode.Decoder(PlanLimit) {
     webhook_urls: webhook_urls,
     created_at: created_at,
     metric_type: metric_type,
+    customer_id: customer_id,
   ))
 }
 
@@ -921,7 +1116,7 @@ pub fn create_business_plan_limit(
   breach_operator: String,
   breach_action: String,
   webhook_urls: Option(String),
-) -> Result(PlanLimit, SupabaseError) {
+) -> Result(customer_types.PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Creating business plan limit: "
@@ -978,7 +1173,7 @@ pub fn create_business_plan_limit(
 /// Get all business-level plan limits
 pub fn get_business_plan_limits(
   business_id: String,
-) -> Result(List(PlanLimit), SupabaseError) {
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting business plan limits for: " <> business_id,
@@ -1011,7 +1206,7 @@ pub fn get_business_plan_limits(
 pub fn get_plan_limit_by_id(
   business_id: String,
   limit_id: String,
-) -> Result(PlanLimit, SupabaseError) {
+) -> Result(customer_types.PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting plan limit: "
@@ -1054,7 +1249,7 @@ pub fn update_business_plan_limit(
   breach_action: String,
   webhook_urls: Option(String),
   customer_id: Option(String),
-) -> Result(PlanLimit, SupabaseError) {
+) -> Result(customer_types.PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Updating plan limit: " <> limit_id,
@@ -1238,14 +1433,187 @@ pub fn update_stripe_event_status(
 // PROVISIONING QUEUE
 // ============================================================================
 
+// Add missing functions
+pub fn get_expired_machines() -> Result(
+  List(customer_types.CustomerMachine),
+  SupabaseError,
+) {
+  let path = "/customer_machines?status=eq.running&expires_at=lt.now()"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(customer_machine_decoder())) {
+        Ok(machines) -> Ok(machines)
+        Error(_) -> Error(ParseError("Invalid machines format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch expired machines"))
+  }
+}
+
+pub fn get_customer_machines(
+  customer_id: String,
+) -> Result(List(customer_types.CustomerMachine), SupabaseError) {
+  let path =
+    "/customer_machines?customer_id=eq." <> customer_id <> "&status=eq.running"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(customer_machine_decoder())) {
+        Ok(machines) -> Ok(machines)
+        Error(_) -> Error(ParseError("Invalid machines format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch customer machines"))
+  }
+}
+
+pub fn update_machine_status(
+  machine_id: String,
+  status: String,
+) -> Result(Nil, SupabaseError) {
+  let update_data =
+    json.object([
+      #("status", json.string(status)),
+      #("updated_at", json.string("now()")),
+    ])
+
+  let path = "/customer_machines?id=eq." <> machine_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to update machine status"))
+  }
+}
+
+pub fn insert_customer_machine(
+  customer_id: String,
+  business_id: String,
+  machine_id: String,
+  fly_app_name: String,
+  ip_address: String,
+  status: String,
+  expires_at: Int,
+  machine_size: String,
+  region: String,
+) -> Result(Nil, SupabaseError) {
+  let expires_at_iso = utils.unix_to_iso8601(expires_at)
+
+  let data =
+    json.object([
+      #("customer_id", json.string(customer_id)),
+      #("business_id", json.string(business_id)),
+      #("machine_id", json.string(machine_id)),
+      #("app_name", json.string(fly_app_name)),
+      #("machine_size", json.string(machine_size)),
+      #("region", json.string(region)),
+      #("ip_address", json.string(ip_address)),
+      #("status", json.string(status)),
+      #("expires_at", json.string(expires_at_iso)),
+      #("provider", json.string("fly")),
+    ])
+
+  case
+    make_request(http.Post, "/customer_machines", Some(json.to_string(data)))
+  {
+    Ok(_) -> Ok(Nil)
+    Error(e) -> Error(DatabaseError("Failed to insert customer machine"))
+  }
+}
+
+pub fn update_provisioning_task_status(
+  task_id: String,
+  status: String,
+) -> Result(Nil, SupabaseError) {
+  let update_data =
+    json.object([
+      #("status", json.string(status)),
+      #("completed_at", json.string("now()")),
+    ])
+
+  let path = "/provisioning_queue?id=eq." <> task_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to update task status"))
+  }
+}
+
+pub fn update_provisioning_task_dead_letter(
+  task_id: String,
+  error_message: String,
+) -> Result(Nil, SupabaseError) {
+  let update_data =
+    json.object([
+      #("status", json.string("dead_letter")),
+      #("error_message", json.string(error_message)),
+      #("dead_letter_at", json.string("now()")),
+    ])
+
+  let path = "/provisioning_queue?id=eq." <> task_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to move task to dead letter"))
+  }
+}
+
+pub fn update_provisioning_task_retry(
+  task_id: String,
+  attempt_count: Int,
+  next_retry_at: Int,
+  error_message: String,
+) -> Result(Nil, SupabaseError) {
+  let update_data =
+    json.object([
+      #("attempt_count", json.int(attempt_count)),
+      #("next_retry_at", json.int(next_retry_at)),
+      #("last_attempt_at", json.string("now()")),
+      #("error_message", json.string(error_message)),
+    ])
+
+  let path = "/provisioning_queue?id=eq." <> task_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to update retry info"))
+  }
+}
+
 /// Add a machine provisioning task to the queue
 pub fn insert_provisioning_queue(
   business_id: String,
   customer_id: String,
   action: String,
-  // "provision", "suspend", "resume", "terminate"
   provider: String,
-  // "fly"
   payload: Dict(String, String),
 ) -> Result(Nil, SupabaseError) {
   logging.log(
@@ -1253,13 +1621,24 @@ pub fn insert_provisioning_queue(
     "[SupabaseClient] Queuing " <> action <> " for customer: " <> customer_id,
   )
 
-  // Create idempotency key to prevent duplicate provisions
-  let idempotency_key =
-    action
-    <> "_"
-    <> customer_id
-    <> "_"
-    <> int.to_string(utils.current_timestamp())
+  // For test customers, always use unique idempotency key
+  let idempotency_key = case string.starts_with(customer_id, "test_") {
+    True ->
+      action
+      <> "_"
+      <> customer_id
+      <> "_"
+      <> int.to_string(utils.current_timestamp())
+      <> "_"
+      <> utils.generate_random()
+    // Add random component for tests
+    False ->
+      action
+      <> "_"
+      <> customer_id
+      <> "_"
+      <> int.to_string(utils.current_timestamp())
+  }
 
   let payload_json =
     payload
@@ -1276,7 +1655,9 @@ pub fn insert_provisioning_queue(
       #("status", json.string("pending")),
       #("payload", payload_json),
       #("idempotency_key", json.string(idempotency_key)),
-      #("next_retry_at", json.string("now()")),
+      #("next_retry_at", json.null()),
+      #("attempt_count", json.int(0)),
+      #("max_attempts", json.int(3)),
     ])
 
   use response <- result.try(make_request(
@@ -1294,15 +1675,67 @@ pub fn insert_provisioning_queue(
       Ok(Nil)
     }
     409 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] Action already queued (duplicate): "
-          <> idempotency_key,
-      )
-      Ok(Nil)
-      // Not an error - idempotent
+      // For test data, this is an error - we want unique entries
+      case string.starts_with(customer_id, "test_") {
+        True -> {
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] Test provisioning failed - duplicate: "
+              <> idempotency_key,
+          )
+          Error(DatabaseError("Test provisioning duplicate - check cleanup"))
+        }
+        False -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] Action already queued (duplicate): "
+              <> idempotency_key,
+          )
+          Ok(Nil)
+          // Not an error for production - idempotent
+        }
+      }
     }
-    _ -> Error(DatabaseError("Failed to queue provisioning action"))
+    _ -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseClient] Failed to queue provisioning: Status "
+          <> int.to_string(response.status)
+          <> " Body: "
+          <> response.body,
+      )
+      Error(DatabaseError("Failed to queue provisioning action"))
+    }
+  }
+}
+
+// ADD around line 1650
+pub fn get_customer_full_context(
+  business_id: String,
+  customer_id: String,
+) -> Result(customer_types.CustomerContext, SupabaseError) {
+  let body =
+    json.object([
+      #("p_business_id", json.string(business_id)),
+      #("p_customer_id", json.string(customer_id)),
+    ])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/get_customer_context",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, customer_context_decoder()) {
+        Ok(context) -> Ok(context)
+        Error(_) -> Error(ParseError("Failed to parse customer context"))
+      }
+    }
+    404 -> Error(NotFound("Customer not found"))
+    _ -> Error(DatabaseError("Failed to fetch customer context"))
   }
 }
 
@@ -1315,11 +1748,11 @@ pub fn get_pending_provisioning_tasks(
     "[SupabaseClient] Getting pending provisioning tasks",
   )
 
-  let path =
-    "/provisioning_queue?status=eq.pending&next_retry_at=lte.now()&order=created_at.asc&limit="
+  let query =
+    "/provisioning_queue?status=eq.pending&or=(next_retry_at.is.null,next_retry_at.lte.now())&order=created_at.asc&limit="
     <> int.to_string(limit)
 
-  use response <- result.try(make_request(http.Get, path, None))
+  use response <- result.try(make_request(http.Get, query, None))
 
   case response.status {
     200 -> {
@@ -1340,46 +1773,6 @@ pub fn get_pending_provisioning_tasks(
   }
 }
 
-// Also add this type near the top with other types (around line 100):
-pub type ProvisioningTask {
-  ProvisioningTask(
-    id: String,
-    customer_id: String,
-    business_id: String,
-    action: String,
-    provider: String,
-    status: String,
-    attempt_count: Int,
-    payload: Dict(String, String),
-  )
-}
-
-// And add this decoder (around line 300 with other decoders):
-fn provisioning_task_decoder() -> decode.Decoder(ProvisioningTask) {
-  use id <- decode.field("id", decode.string)
-  use customer_id <- decode.field("customer_id", decode.string)
-  use business_id <- decode.field("business_id", decode.string)
-  use action <- decode.field("action", decode.string)
-  use provider <- decode.field("provider", decode.string)
-  use status <- decode.field("status", decode.string)
-  use attempt_count <- decode.field("attempt_count", decode.int)
-  use payload <- decode.field(
-    "payload",
-    decode.dict(decode.string, decode.string),
-  )
-
-  decode.success(ProvisioningTask(
-    id: id,
-    customer_id: customer_id,
-    business_id: business_id,
-    action: action,
-    provider: provider,
-    status: status,
-    attempt_count: attempt_count,
-    payload: payload,
-  ))
-}
-
 // ============================================================================
 // CLIENT PLAN LIMITS MANAGEMENT  
 // ============================================================================
@@ -1394,7 +1787,7 @@ pub fn create_customer_plan_limit(
   breach_operator: String,
   breach_action: String,
   webhook_urls: Option(String),
-) -> Result(PlanLimit, SupabaseError) {
+) -> Result(customer_types.PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Creating client plan limit: "
@@ -1409,7 +1802,6 @@ pub fn create_customer_plan_limit(
 
   let base_fields = [
     #("business_id", json.null()),
-    // Client limits don't have business_id
     #("plan_id", json.null()),
     #("customer_id", json.string(customer_id)),
     #("metric_name", json.string(metric_name)),
@@ -1456,7 +1848,7 @@ pub fn create_customer_plan_limit(
 pub fn get_customer_plan_limits(
   business_id: String,
   customer_id: String,
-) -> Result(List(PlanLimit), SupabaseError) {
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting client plan limits for: "
@@ -1492,7 +1884,7 @@ pub fn get_customer_plan_limits(
 pub fn get_effective_customer_limits(
   business_id: String,
   customer_id: String,
-) -> Result(List(PlanLimit), SupabaseError) {
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting effective limits for client: "
@@ -1950,7 +2342,7 @@ pub fn get_latest_metric_value(
 /// Get all customers for a business
 pub fn get_business_customers(
   business_id: String,
-) -> Result(List(Customer), SupabaseError) {
+) -> Result(List(customer_types.Customer), SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting customers for business: " <> business_id,
@@ -1983,7 +2375,7 @@ pub fn get_business_customers(
 pub fn get_customer_by_id(
   business_id: String,
   customer_id: String,
-) -> Result(Customer, SupabaseError) {
+) -> Result(customer_types.Customer, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting customer: "
@@ -2024,7 +2416,7 @@ pub fn update_customer(
   customer_id: String,
   customer_name: String,
   plan_id: String,
-) -> Result(Customer, SupabaseError) {
+) -> Result(customer_types.Customer, SupabaseError) {
   logging.log(logging.Info, "[SupabaseClient] Updating client: " <> customer_id)
 
   let update_data =
@@ -2103,7 +2495,7 @@ pub fn delete_customer(
 /// Get customer by Stripe customer ID (for webhook processing)
 pub fn get_customer_by_stripe_customer(
   stripe_customer_id: String,
-) -> Result(Customer, SupabaseError) {
+) -> Result(customer_types.Customer, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting customer by Stripe ID: " <> stripe_customer_id,
@@ -2221,7 +2613,7 @@ pub fn create_customer(
   customer_id: String,
   customer_name: String,
   plan_id: String,
-) -> Result(Customer, SupabaseError) {
+) -> Result(customer_types.Customer, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Creating customer: "

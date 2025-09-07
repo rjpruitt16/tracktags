@@ -1,5 +1,6 @@
 // src/web/handler/proxy_handler.gleam
 
+import actors/application
 import actors/metric_actor
 import clients/supabase_client
 import gleam/dict
@@ -13,7 +14,9 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import glixir
 import logging
+import types/customer_types
 import types/metric_types
 import utils/utils
 import wisp.{type Request, type Response}
@@ -630,11 +633,18 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
       wisp.json_response(json.to_string_tree(error_json), 401)
     }
     Ok(api_key) -> {
-      case supabase_client.validate_api_key(api_key) {
-        Ok(supabase_client.BusinessKey(business_id)) -> handler(business_id)
-        Ok(supabase_client.CustomerKey(business_id, customer_id)) ->
-          handle_customer_request(req, business_id, customer_id)
-        Error(_) -> {
+      // Use new combined validation
+      case supabase_client.validate_key_with_context(api_key) {
+        Ok(supabase_client.BusinessValidation(business_id)) ->
+          handler(business_id)
+        Ok(supabase_client.CustomerValidation(business_id, customer_id, context)) ->
+          handle_customer_request_with_context(
+            req,
+            business_id,
+            customer_id,
+            context,
+          )
+        Ok(supabase_client.InvalidKey) | Error(_) -> {
           let error_json =
             json.object([
               #("error", json.string("Unauthorized")),
@@ -647,33 +657,41 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
   }
 }
 
-fn handle_customer_request(
+fn handle_customer_request_with_context(
   req: Request,
   business_id: String,
   customer_id: String,
+  context: customer_types.CustomerContext,
 ) -> Response {
   use json_data <- wisp.require_json(req)
 
-  // Parse the proxy request
   case decode.run(json_data, proxy_request_decoder()) {
     Ok(proxy_req) -> {
-      // Override the scope to customer and set the customer_id
-      let customer_proxy_req =
-        ProxyRequest(
-          ..proxy_req,
-          scope: "customer",
-          customer_id: Some(customer_id),
-        )
+      // Ensure customer actor exists with context
+      case ensure_and_update_customer_actor(business_id, customer_id, context) {
+        Ok(_) -> {
+          // Override scope to customer
+          let customer_proxy_req =
+            ProxyRequest(
+              ..proxy_req,
+              scope: "customer",
+              customer_id: Some(customer_id),
+            )
 
-      // Process the proxy request
-      process_proxy_request(
-        business_id,
-        customer_proxy_req,
-        utils.generate_request_id(),
-      )
+          // Process normally - just checks metrics, doesn't route to machines
+          process_proxy_request(
+            business_id,
+            customer_proxy_req,
+            utils.generate_request_id(),
+          )
+        }
+        Error(e) -> {
+          wisp.internal_server_error()
+          |> wisp.string_body("Failed to initialize customer: " <> e)
+        }
+      }
     }
     Error(_) -> {
-      // Return error if request is malformed
       let error_json =
         json.object([
           #("error", json.string("Bad Request")),
@@ -681,5 +699,51 @@ fn handle_customer_request(
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
+  }
+}
+
+fn ensure_and_update_customer_actor(
+  business_id: String,
+  customer_id: String,
+  context: customer_types.CustomerContext,
+) -> Result(Nil, String) {
+  // Get application actor
+  case get_application_actor() {
+    Ok(app_actor) -> {
+      let reply = process.new_subject()
+      process.send(
+        app_actor,
+        application.EnsureCustomerActor(
+          business_id,
+          customer_id,
+          context,
+          reply,
+        ),
+      )
+
+      case process.receive(reply, 1000) {
+        Ok(Ok(_customer_actor)) -> Ok(Nil)
+        Ok(Error(e)) -> Error(e)
+        Error(_) -> Error("Timeout ensuring customer actor")
+      }
+    }
+    Error(_) -> Error("Application actor not found")
+  }
+}
+
+// Add this function near the bottom of proxy_handler.gleam (around line 700)
+fn get_application_actor() -> Result(
+  process.Subject(application.ApplicationMessage),
+  String,
+) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.application_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Application actor not found")
   }
 }

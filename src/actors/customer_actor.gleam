@@ -9,7 +9,7 @@ import gleam/float
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
@@ -43,8 +43,12 @@ pub type State {
       process.Subject(metric_types.Message),
     ),
     last_accessed: Int,
-    client_cleanup_threshold: Int,
+    cleanup_threshold: Int,
     stripe_billing_metrics: List(String),
+    machine_ids: List(String),
+    machines_expire_at: Int,
+    plan_id: Option(String),
+    stripe_price_id: Option(String),
   )
 }
 
@@ -78,7 +82,6 @@ fn load_client_plan_limits(
       String,
     ),
     process.Subject(metric_types.Message),
-    // ← Missing second type parameter
   ),
 ) -> Result(Nil, String) {
   logging.log(
@@ -153,7 +156,7 @@ fn load_client_plan_limits(
 fn create_limit_checking_metric(
   business_id: String,
   customer_id: String,
-  limit: supabase_client.PlanLimit,
+  limit: customer_types.PlanLimit,
   metrics_supervisor: glixir.DynamicSupervisor(
     #(
       String,
@@ -352,7 +355,7 @@ fn handle_message(
     customer_types.CleanupTick(_timestamp, _tick_type) -> {
       let inactive_duration = current_time - updated_state.last_accessed
 
-      case inactive_duration > updated_state.client_cleanup_threshold {
+      case inactive_duration > updated_state.cleanup_threshold {
         True -> {
           logging.log(
             logging.Info,
@@ -417,6 +420,36 @@ fn handle_message(
           actor.continue(updated_state)
         }
       }
+    }
+
+    customer_types.UpdateContext(context) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerActor] Updating context for " <> state.customer_id,
+      )
+
+      // Extract machine info
+      let machine_ids = list.map(context.machines, fn(m) { m.machine_id })
+      let expires_at =
+        list.first(context.machines)
+        |> result.map(fn(m) { m.expires_at })
+        |> result.unwrap(0)
+
+      // Extract customer info
+      let plan_id = context.customer.plan_id
+      let stripe_price_id = context.customer.stripe_price_id
+
+      // TODO: Could also cache the limits here for quick access
+
+      actor.continue(
+        State(
+          ..state,
+          machine_ids: machine_ids,
+          machines_expire_at: expires_at,
+          plan_id: plan_id,
+          stripe_price_id: stripe_price_id,
+        ),
+      )
     }
 
     customer_types.RecordMetric(
@@ -670,6 +703,41 @@ fn handle_message(
       }
       actor.continue(updated_state)
     }
+
+    // In handle_message, add cases:
+    customer_types.UpdateMachines(machine_ids, expires_at) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerActor] Updating machines for "
+          <> state.customer_id
+          <> " - "
+          <> int.to_string(list.length(machine_ids))
+          <> " machines",
+      )
+      actor.continue(
+        State(..state, machine_ids: machine_ids, machines_expire_at: expires_at),
+      )
+    }
+
+    customer_types.UpdatePlan(plan_id, stripe_price_id) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerActor] Updating plan for " <> state.customer_id,
+      )
+      actor.continue(
+        State(..state, plan_id: plan_id, stripe_price_id: stripe_price_id),
+      )
+    }
+
+    customer_types.GetMachines(reply) -> {
+      process.send(reply, state.machine_ids)
+      actor.continue(state)
+    }
+
+    customer_types.GetPlan(reply) -> {
+      process.send(reply, #(state.plan_id, state.stripe_price_id))
+      actor.continue(state)
+    }
   }
 }
 
@@ -708,8 +776,12 @@ pub fn start_link(
           customer_id: customer_id,
           metrics_supervisor: metrics_supervisor,
           last_accessed: current_time,
-          client_cleanup_threshold: 1800,
+          cleanup_threshold: 2_592_000,
           stripe_billing_metrics: [],
+          machine_ids: [],
+          machines_expire_at: 0,
+          plan_id: None,
+          stripe_price_id: None,
         )
 
       case actor.new(state) |> actor.on_message(handle_message) |> actor.start {

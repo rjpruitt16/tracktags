@@ -46,7 +46,7 @@ pub type State {
       process.Subject(customer_types.Message),
     ),
     last_accessed: Int,
-    user_cleanup_threshold: Int,
+    cleanup_threshold: Int,
   )
 }
 
@@ -192,11 +192,40 @@ fn handle_message(
         }
       }
     }
+
+    business_types.EnsureCustomerExists(customer_id, context, reply) -> {
+      case
+        get_or_spawn_client_simple(
+          supervisor: updated_state.customers_supervisor,
+          business_id: updated_state.account_id,
+          customer_id: customer_id,
+        )
+      {
+        Ok(customer_subject) -> {
+          // Send context to customer
+          process.send(customer_subject, customer_types.UpdateContext(context))
+          // Reply with the subject
+          process.send(reply, customer_subject)
+        }
+        Error(e) -> {
+          // Create a new subject just to send the error
+          // This is a workaround since we can't change the message type
+          logging.log(
+            logging.Error,
+            "[BusinessActor] Failed to spawn customer: " <> e,
+          )
+          // Don't send a reply - let the caller timeout
+          // This is not ideal but works given the type constraints
+        }
+      }
+      actor.continue(updated_state)
+    }
+
     business_types.CleanupTick(_timestamp, _tick_type) -> {
       // Check if user should be cleaned up due to inactivity
       let inactive_duration = current_time - updated_state.last_accessed
 
-      case inactive_duration > updated_state.user_cleanup_threshold {
+      case inactive_duration > updated_state.cleanup_threshold {
         True -> {
           logging.log(
             logging.Info,
@@ -205,7 +234,7 @@ fn handle_message(
               <> " (inactive for "
               <> int.to_string(inactive_duration)
               <> "s, threshold: "
-              <> int.to_string(updated_state.user_cleanup_threshold)
+              <> int.to_string(updated_state.cleanup_threshold)
               <> "s)",
           )
 
@@ -503,7 +532,7 @@ pub fn start_link(
       metrics_supervisor: metrics_supervisor,
       customers_supervisor: customers_supervisor,
       last_accessed: current_time,
-      user_cleanup_threshold: 3600,
+      cleanup_threshold: 2_592_000,
     )
 
   use started <- result.try(

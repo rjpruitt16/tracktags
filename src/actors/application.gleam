@@ -1,6 +1,7 @@
 // src/actors/application.gleam
 import actors/business_actor
 import actors/clock_actor
+import actors/machine_actor
 import actors/metric_actor
 import actors/supabase_actor
 import clients/supabase_client
@@ -16,6 +17,7 @@ import glixir
 import glixir/supervisor
 import logging
 import types/business_types
+import types/customer_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
@@ -109,6 +111,15 @@ pub type ApplicationMessage {
     limit_value: Float,
     limit_operator: String,
     breach_action: String,
+  )
+
+  EnsureCustomerActor(
+    business_id: String,
+    customer_id: String,
+    context: customer_types.CustomerContext,
+    reply_to: process.Subject(
+      Result(process.Subject(customer_types.Message), String),
+    ),
   )
   Shutdown
 }
@@ -276,6 +287,18 @@ fn handle_application_message(
       actor.continue(state)
     }
 
+    EnsureCustomerActor(business_id, customer_id, context, reply_to) -> {
+      let result =
+        ensure_customer_with_context(
+          state.business_supervisor,
+          business_id,
+          customer_id,
+          context,
+        )
+      process.send(reply_to, result)
+      actor.continue(state)
+    }
+
     Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
       process.send(state.clock_actor, clock_actor.Shutdown)
@@ -285,14 +308,14 @@ fn handle_application_message(
   }
 }
 
-// Decoder function for user actor replies
-fn decode_user_reply(
+// Decoder function for business actor replies
+fn decode_business_reply(
   _reply: dynamic.Dynamic,
 ) -> Result(process.Subject(business_types.Message), String) {
   Ok(process.new_subject())
 }
 
-// Simple helper to get or spawn a user - NO BLOCKING!
+// Simple helper to get or spawn a business - NO BLOCKING!
 fn get_or_spawn_business_simple(
   supervisor: glixir.DynamicSupervisor(
     String,
@@ -300,66 +323,66 @@ fn get_or_spawn_business_simple(
   ),
   account_id: String,
 ) -> Result(process.Subject(business_types.Message), String) {
-  // First try to find existing user
+  // First try to find existing business
   case business_actor.lookup_business_subject(account_id) {
-    Ok(user_subject) -> {
+    Ok(business_subject) -> {
       logging.log(
         logging.Debug,
-        "[Application] ✅ Found existing user: " <> account_id,
+        "[Application] ✅ Found existing business: " <> account_id,
       )
-      Ok(user_subject)
+      Ok(business_subject)
     }
     Error(_) -> {
-      // Spawn new user WITHOUT blocking
+      // Spawn new business WITHOUT blocking
       logging.log(
         logging.Debug,
-        "[Application] Spawning new user: " <> account_id,
+        "[Application] Spawning new business: " <> account_id,
       )
 
-      let user_spec = business_actor.start(account_id)
+      let business_spec = business_actor.start(account_id)
       case
         glixir.start_dynamic_child(
           supervisor,
-          user_spec,
+          business_spec,
           business_actor.encode_business_args,
-          decode_user_reply,
+          decode_business_reply,
         )
       {
         supervisor.ChildStarted(child_pid, _reply) -> {
           logging.log(
             logging.Info,
-            "[Application] ✅ User spawned: "
+            "[Application] ✅ business spawned: "
               <> account_id
               <> " PID: "
               <> string.inspect(child_pid),
           )
 
           // Instead of blocking, just try lookup immediately
-          // The UserActor will handle the "first metric send" internally
+          // The businessActor will handle the "first metric send" internally
           case business_actor.lookup_business_subject(account_id) {
-            Ok(user_subject) -> {
+            Ok(business_subject) -> {
               logging.log(
                 logging.Info,
-                "[Application] ✅ Found newly spawned user: " <> account_id,
+                "[Application] ✅ Found newly spawned business: " <> account_id,
               )
-              Ok(user_subject)
+              Ok(business_subject)
             }
             Error(_) -> {
-              // If not ready yet, that's OK - the UserActor will handle first metric
+              // If not ready yet, that's OK - the businessActor will handle first metric
               logging.log(
                 logging.Info,
-                "[Application] User spawning, will receive metric via UserActor",
+                "[Application] business spawning, will receive metric via BusinessActor",
               )
-              Error("User still registering")
+              Error("business still registering")
             }
           }
         }
         supervisor.StartChildError(error) -> {
           logging.log(
             logging.Error,
-            "[Application] ❌ Failed to spawn user: " <> error,
+            "[Application] ❌ Failed to spawn business: " <> error,
           )
-          Error("Failed to spawn user " <> account_id <> ": " <> error)
+          Error("Failed to spawn business " <> account_id <> ": " <> error)
         }
       }
     }
@@ -556,6 +579,44 @@ fn forward_to_customer(
   }
 }
 
+fn ensure_customer_with_context(
+  business_supervisor: glixir.DynamicSupervisor(
+    String,
+    process.Subject(business_types.Message),
+  ),
+  business_id: String,
+  customer_id: String,
+  context: customer_types.CustomerContext,
+) -> Result(process.Subject(customer_types.Message), String) {
+  // Check if customer actor already exists
+  case customer_types.lookup_client_subject(business_id, customer_id) {
+    Ok(customer_subject) -> {
+      // Update with fresh context
+      process.send(customer_subject, customer_types.UpdateContext(context))
+      Ok(customer_subject)
+    }
+    Error(_) -> {
+      // Need to spawn via business actor first
+      case get_or_spawn_business_simple(business_supervisor, business_id) {
+        Ok(business_subject) -> {
+          // Have business spawn the customer
+          let reply = process.new_subject()
+          process.send(
+            business_subject,
+            business_types.EnsureCustomerExists(customer_id, context, reply),
+          )
+
+          case process.receive(reply, 1000) {
+            Ok(customer_subject) -> Ok(customer_subject)
+            Error(_) -> Error("Failed to spawn customer actor")
+          }
+        }
+        Error(e) -> Error("Failed to get business actor: " <> e)
+      }
+    }
+  }
+}
+
 fn forward_to_business(
   state: ApplicationState,
   business_id: String,
@@ -736,7 +797,14 @@ pub fn start_app(
     }),
   )
   logging.log(logging.Info, "[Application] ✅ SupabaseActor started")
-
+  // Start MachineActor for provisioning
+  use _machine_subject <- result.try(
+    machine_actor.start()
+    |> result.map_error(fn(e) {
+      "MachineActor start failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ MachineActor started")
   use metrics_supervisor <- result.try(
     glixir.start_dynamic_supervisor_named(atom.create("metrics_supervisor"))
     |> result.map_error(fn(e) {

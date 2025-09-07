@@ -1,4 +1,5 @@
 // src/actors/supabase_actor.gleam - FIXED VERSION
+
 import birl
 import clients/supabase_client
 import clients/supabase_realtime_client

@@ -9,6 +9,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
+import types/customer_types
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -652,7 +653,7 @@ fn process_update_plan_limit(
 // HELPER FUNCTIONS
 // ============================================================================
 
-fn limit_to_json(limit: supabase_client.PlanLimit) -> json.Json {
+fn limit_to_json(limit: customer_types.PlanLimit) -> json.Json {
   json.object([
     #("id", json.string(limit.id)),
     #("metric_name", json.string(limit.metric_name)),

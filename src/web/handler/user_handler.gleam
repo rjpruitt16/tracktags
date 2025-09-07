@@ -8,6 +8,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
+import types/customer_types
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -158,6 +159,51 @@ fn validate_customer_request(
 // ============================================================================
 // CRUD ENDPOINTS
 // ============================================================================
+
+pub fn get_customer_machines(req: Request, customer_id: String) -> Response {
+  use <- wisp.require_method(req, http.Get)
+
+  logging.log(
+    logging.Info,
+    "[CustomerHandler] Getting machines for customer: " <> customer_id,
+  )
+
+  case supabase_client.get_customer_machines(customer_id) {
+    Ok(machines) -> {
+      let machines_json = list.map(machines, machine_to_json)
+      let response =
+        json.object([
+          #("customer_id", json.string(customer_id)),
+          #("machines", json.array(machines_json, fn(x) { x })),
+        ])
+      wisp.json_response(json.to_string_tree(response), 200)
+    }
+    Error(_) -> {
+      let error_json =
+        json.object([
+          #("error", json.string("Not Found")),
+          #("message", json.string("No machines found for customer")),
+        ])
+      wisp.json_response(json.to_string_tree(error_json), 404)
+    }
+  }
+}
+
+fn machine_to_json(machine: customer_types.CustomerMachine) -> json.Json {
+  json.object([
+    #("machine_id", json.string(machine.machine_id)),
+    #("status", json.string(machine.status)),
+    #("fly_app_name", case machine.fly_app_name {
+      option.Some(name) -> json.string(name)
+      option.None -> json.null()
+    }),
+    #("ip_address", case machine.ip_address {
+      option.Some(ip) -> json.string(ip)
+      option.None -> json.null()
+    }),
+    #("expires_at", json.int(machine.expires_at)),
+  ])
+}
 
 pub fn create_customer(req: Request) -> Response {
   let request_id = string.inspect(utils.system_time())

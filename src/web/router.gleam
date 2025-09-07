@@ -39,6 +39,13 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
+    ["admin", "provision", "test"] -> admin_handler.provision_test(req)
+    ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
+
+    ["admin", "force-provision"] -> admin_handler.force_provision(req)
+    ["api", "v1", "customers", customer_id, "machines"] ->
+      user_handler.get_customer_machines(req, customer_id)
+
     ["api", "v1", "webhooks", "stripe"] ->
       case req.method {
         Post -> stripe_handler.handle_stripe_webhook(req)

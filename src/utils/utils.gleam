@@ -35,6 +35,10 @@ pub fn application_actor_key() -> atom.Atom {
   atom.create("application_actor")
 }
 
+pub fn machine_actor_key() -> atom.Atom {
+  atom.create("machine_actor")
+}
+
 // ============================================================================
 // ENVIRONMENT HELPERS
 // ============================================================================
@@ -102,4 +106,12 @@ pub fn create_business_key() -> String {
 
 pub fn create_customer_key(customer_id: String) -> String {
   "ck_live_" <> customer_id <> "_" <> generate_random()
+}
+
+// In utils.gleam, add this function:
+pub fn unix_to_iso8601(unix_timestamp: Int) -> String {
+  // Convert Unix timestamp to ISO 8601 format
+  // This is a simplified version - you might need to use birl properly
+  let dt = birl.from_unix(unix_timestamp)
+  birl.to_iso8601(dt)
 }

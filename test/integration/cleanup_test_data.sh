@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Clean up test data using Supabase REST API directly
 # Expects SUPABASE_URL and SUPABASE_KEY environment variables
 
@@ -10,25 +9,43 @@ fi
 
 echo "Cleaning up test data from Supabase..."
 
-# Delete test businesses (those created by tests usually have email test*@example.com)
+# Delete test businesses
 echo "Deleting test businesses..."
 curl -X DELETE \
-  "${SUPABASE_URL}/rest/v1/businesses?email=like.test*@example.com" \
+  "${SUPABASE_URL}/rest/v1/businesses?business_id=like.test_biz*" \
   -H "apikey: ${SUPABASE_KEY}" \
   -H "Authorization: Bearer ${SUPABASE_KEY}" \
   -H "Prefer: return=minimal" \
   -s
 
-# Delete test customers (those with customer_id starting with cust_ followed by timestamp)
+# Delete test customers  
 echo "Deleting test customers..."
 curl -X DELETE \
-  "${SUPABASE_URL}/rest/v1/customers?customer_id=like.cust_*" \
+  "${SUPABASE_URL}/rest/v1/customers?customer_id=like.test_customer*" \
   -H "apikey: ${SUPABASE_KEY}" \
   -H "Authorization: Bearer ${SUPABASE_KEY}" \
   -H "Prefer: return=minimal" \
   -s
 
-# Delete test integration keys using key_hash or key_name
+# Delete test customer machines
+echo "Deleting test customer machines..."
+curl -X DELETE \
+  "${SUPABASE_URL}/rest/v1/customer_machines?customer_id=like.test_customer*" \
+  -H "apikey: ${SUPABASE_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "Prefer: return=minimal" \
+  -s
+
+# Delete test provisioning tasks
+echo "Deleting test provisioning tasks..."
+curl -X DELETE \
+  "${SUPABASE_URL}/rest/v1/provisioning_queue?customer_id=like.test_customer*" \
+  -H "apikey: ${SUPABASE_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "Prefer: return=minimal" \
+  -s
+
+# Delete test integration keys
 echo "Deleting test integration keys..."
 curl -X DELETE \
   "${SUPABASE_URL}/rest/v1/integration_keys?key_name=like.%test%" \

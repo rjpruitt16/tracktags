@@ -1,8 +1,12 @@
 // src/web/handler/admin_handler.gleam
+import actors/machine_actor
 import clients/supabase_client
+import gleam/dict
 import gleam/dynamic.{type Dynamic}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/http
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -234,6 +238,143 @@ pub fn get_business_admin(req: Request, business_id: String) -> Response {
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
+  }
+}
+
+pub fn provision_test(req: Request) -> Response {
+  use <- wisp.require_method(req, http.Post)
+
+  let timestamp = utils.current_timestamp()
+  let test_business_id = "test_biz_" <> int.to_string(timestamp)
+  let test_customer_id = "test_cust_" <> int.to_string(timestamp)
+
+  // Create test business first
+  let _ =
+    supabase_client.create_business(
+      test_business_id,
+      "Test Business",
+      "test@business.com",
+    )
+
+  // Create test customer using the existing function (it handles plan_id correctly)
+  let _ =
+    supabase_client.create_customer(
+      test_business_id,
+      test_customer_id,
+      "Test Customer",
+      "",
+      // The create_customer function will handle empty string -> null conversion
+    )
+
+  // Now create the provisioning task
+  let _result =
+    supabase_client.insert_provisioning_queue(
+      test_business_id,
+      test_customer_id,
+      "provision",
+      "fly",
+      dict.from_list([
+        #("expires_at", int.to_string(timestamp + 86_400)),
+        #("mock_mode", "true"),
+      ]),
+    )
+
+  // Trigger processing
+  case machine_actor.lookup_machine_actor() {
+    Ok(actor) -> {
+      process.send(actor, machine_actor.PollProvisioningQueue)
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("status", json.string("queued")),
+            #("customer_id", json.string(test_customer_id)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(e) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Machine actor not found")),
+            #("details", json.string(e)),
+          ]),
+        ),
+        500,
+      )
+    }
+  }
+}
+
+pub fn terminate_test(req: Request) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use json_data <- wisp.require_json(req)
+
+  let decoder = decode.field("customer_id", decode.string, decode.success)
+
+  case decode.run(json_data, decoder) {
+    Ok(customer_id) -> {
+      // Queue terminate task with mock_mode
+      let _ =
+        supabase_client.insert_provisioning_queue(
+          "test_business",
+          customer_id,
+          "terminate",
+          "fly",
+          dict.from_list([
+            #("mock_mode", "true"),
+          ]),
+        )
+
+      // Trigger processing
+      case machine_actor.lookup_machine_actor() {
+        Ok(actor) -> {
+          process.send(actor, machine_actor.PollProvisioningQueue)
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("status", json.string("queued")),
+                #("customer_id", json.string(customer_id)),
+              ]),
+            ),
+            200,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Machine actor not found")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Invalid request")),
+          ]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+pub fn force_provision(req: Request) -> Response {
+  use <- wisp.require_method(req, http.Post)
+
+  case machine_actor.lookup_machine_actor() {
+    Ok(actor) -> {
+      process.send(actor, machine_actor.PollProvisioningQueue)
+      wisp.ok() |> wisp.string_body("Polling triggered")
+    }
+    Error(_) -> wisp.internal_server_error()
   }
 }
 

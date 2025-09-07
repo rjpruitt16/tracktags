@@ -50,6 +50,51 @@ const valid_key_types = [
 // VALIDATION & CONVERSION
 // ============================================================================
 
+// Add to the validation section (around line 100)
+fn validate_fly_credentials(
+  credentials: Dict(String, String),
+) -> Result(Nil, String) {
+  case dict.get(credentials, "api_token") {
+    Ok("fo1_" <> _) -> Ok(Nil)
+    Ok("fo0_" <> _) -> Ok(Nil)
+    // Some tokens start with fo0
+    Ok(_) -> Error("Invalid Fly.io API token format")
+    Error(_) -> Error("Missing api_token for Fly key")
+  }
+  |> result.try(fn(_) {
+    case dict.get(credentials, "org_slug") {
+      Ok("") -> Error("Organization slug cannot be empty")
+      Ok(_) -> Ok(Nil)
+      Error(_) -> Error("Missing org_slug for Fly key")
+    }
+  })
+  |> result.try(fn(_) {
+    // Default region is optional, will use business default if not provided
+    case dict.get(credentials, "default_region") {
+      Ok("") -> Error("Region cannot be empty if provided")
+      Ok(_) -> Ok(Nil)
+      Error(_) -> Ok(Nil)
+      // Optional field
+    }
+  })
+}
+
+// Update validate_credentials function to include fly
+fn validate_credentials(
+  key_type: String,
+  credentials: Dict(String, String),
+) -> Result(Nil, String) {
+  case key_type {
+    "stripe" -> validate_stripe_credentials(credentials)
+    "supabase" -> validate_supabase_credentials(credentials)
+    "fly" -> validate_fly_credentials(credentials)
+    // Add this line
+    "business" -> validate_business_credentials(credentials)
+    "stripe_frontend" -> Ok(Nil)
+    _ -> Error("Unknown key type")
+  }
+}
+
 fn validate_business_credentials(
   credentials: Dict(String, String),
 ) -> Result(Nil, String) {
@@ -106,54 +151,6 @@ fn validate_supabase_credentials(
       Error(_) -> Error("Missing service_role_key for Supabase key")
     }
   })
-}
-
-fn validate_fly_credentials(
-  credentials: Dict(String, String),
-) -> Result(Nil, String) {
-  case dict.get(credentials, "api_token") {
-    Ok("fo1_" <> _) -> Ok(Nil)
-    // Fly.io token format
-    Ok(_) -> Error("Invalid Fly.io API token format")
-    Error(_) -> Error("Missing api_token for Fly key")
-  }
-  |> result.try(fn(_) {
-    case dict.get(credentials, "app_name") {
-      Ok("") -> Error("App name cannot be empty")
-      Ok(_) -> Ok(Nil)
-      Error(_) -> Error("Missing app_name for Fly key")
-    }
-  })
-  |> result.try(fn(_) {
-    let valid_regions = ["iad", "lax", "fra", "nrt", "syd"]
-    // Common Fly regions
-    case dict.get(credentials, "region") {
-      Ok(region) ->
-        case list.contains(valid_regions, region) {
-          True -> Ok(Nil)
-          False ->
-            Error(
-              "Invalid Fly.io region. Must be one of: "
-              <> string.join(valid_regions, ", "),
-            )
-        }
-      Error(_) -> Error("Missing region for Fly key")
-    }
-  })
-}
-
-fn validate_credentials(
-  key_type: String,
-  credentials: Dict(String, String),
-) -> Result(Nil, String) {
-  case key_type {
-    "stripe" -> validate_stripe_credentials(credentials)
-    "supabase" -> validate_supabase_credentials(credentials)
-    "fly" -> validate_fly_credentials(credentials)
-    "business" -> validate_business_credentials(credentials)
-    "stripe_frontend" -> Ok(Nil)
-    _ -> Error("Unknown key type")
-  }
 }
 
 // UPDATED: Now encrypts credentials instead of plain JSON

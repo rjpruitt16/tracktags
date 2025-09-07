@@ -1,13 +1,64 @@
 // src/types/customer_types.gleam
 import gleam/dict.{type Dict}
-import gleam/erlang/process
+import gleam/erlang/process.{type Subject}
 import gleam/option.{type Option}
 import glixir
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
 pub type Customer {
-  Customer(customer_id: String, business_id: String, customer_name: String)
+  Customer(
+    customer_id: String,
+    business_id: String,
+    customer_name: String,
+    plan_id: Option(String),
+    stripe_customer_id: Option(String),
+    stripe_subscription_id: Option(String),
+    stripe_price_id: Option(String),
+    created_at: String,
+  )
+}
+
+pub type CustomerMachine {
+  CustomerMachine(
+    id: String,
+    customer_id: String,
+    business_id: String,
+    machine_id: String,
+    fly_app_name: Option(String),
+    machine_url: Option(String),
+    ip_address: Option(String),
+    status: String,
+    expires_at: Int,
+    docker_image: Option(String),
+    fly_state: Option(String),
+  )
+}
+
+pub type CustomerContext {
+  CustomerContext(
+    customer: Customer,
+    machines: List(CustomerMachine),
+    plan_limits: List(PlanLimit),
+  )
+}
+
+// Keep PlanLimit here too to avoid circular deps
+pub type PlanLimit {
+  PlanLimit(
+    id: String,
+    business_id: Option(String),
+    plan_id: Option(String),
+    customer_id: Option(String),
+    metric_name: String,
+    limit_value: Float,
+    limit_period: String,
+    breach_operator: String,
+    breach_action: String,
+    webhook_urls: Option(String),
+    created_at: String,
+    metric_type: String,
+  )
 }
 
 pub type CustomerApiKey {
@@ -48,6 +99,12 @@ pub type Message {
     breach_action: String,
   )
   ResetStripeMetrics
+  UpdateMachines(machine_ids: List(String), expires_at: Int)
+  UpdatePlan(plan_id: Option(String), stripe_price_id: Option(String))
+  GetMachines(reply: Subject(List(String)))
+  GetPlan(reply: Subject(#(Option(String), Option(String))))
+
+  UpdateContext(context: CustomerContext)
 }
 
 pub fn lookup_client_subject(

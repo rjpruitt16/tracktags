@@ -5,6 +5,7 @@ import gleam/crypto as gleam_crypto
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/http
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
@@ -61,6 +62,23 @@ pub type WebhookResult {
 
 pub type StripeCredentials {
   StripeCredentials(secret_key: String, webhook_secret: String)
+}
+
+// Add near top with other types
+pub type StripeInvoice {
+  StripeInvoice(id: String, customer: String, lines: StripeLineItems)
+}
+
+pub type StripeLineItems {
+  StripeLineItems(data: List(StripeLineItem))
+}
+
+pub type StripeLineItem {
+  StripeLineItem(period: StripePeriod)
+}
+
+pub type StripePeriod {
+  StripePeriod(start: Int, end: Int)
 }
 
 /// Main webhook endpoint handler
@@ -422,23 +440,104 @@ fn process_stripe_event(event: StripeEvent) -> WebhookResult {
 fn handle_payment_succeeded(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
-    Ok(customer_id) -> {
+    Ok(stripe_customer_id) -> {
       logging.log(
         logging.Info,
-        "[StripeHandler] Payment succeeded for customer: " <> customer_id,
+        "[StripeHandler] Payment succeeded for customer: " <> stripe_customer_id,
       )
 
       // Update business plan and limits
-      case update_business_plan_after_payment(customer_id, event.data) {
+      case update_business_plan_after_payment(stripe_customer_id, event.data) {
         Error(error) ->
           ProcessingError("Failed to update business plan: " <> error)
         Ok(_) -> {
+          // Queue machine provisioning if this is a machine-enabled plan
+          case queue_machine_provisioning(stripe_customer_id, event.data) {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] Queued machine provisioning for: "
+                  <> stripe_customer_id,
+              )
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[StripeHandler] No machines to provision or error: " <> e,
+              )
+            }
+          }
+
           // Send success metrics to business actor
-          case send_payment_success_metric(customer_id) {
+          case send_payment_success_metric(stripe_customer_id) {
             Error(error) -> ProcessingError("Failed to send metric: " <> error)
-            Ok(_) -> Success("Payment processed for customer: " <> customer_id)
+            Ok(_) ->
+              Success("Payment processed for customer: " <> stripe_customer_id)
           }
         }
+      }
+    }
+  }
+}
+
+// Add new function to queue machine provisioning
+fn queue_machine_provisioning(
+  stripe_customer_id: String,
+  data: StripeData,
+) -> Result(Nil, String) {
+  // Only handle customer subscriptions that need machines
+  case supabase_client.get_customer_by_stripe_customer(stripe_customer_id) {
+    Ok(customer) -> {
+      // This is a customer subscription under a business
+      case get_plan_machine_count(data.price_id) {
+        Ok(0) -> Error("No machines in plan")
+        Ok(machine_count) -> {
+          let expires_at = utils.current_timestamp() + 2_851_200
+          // 33 days
+
+          list.range(1, machine_count)
+          |> list.map(fn(index) {
+            let payload =
+              dict.from_list([
+                #("machine_index", int.to_string(index)),
+                #("expires_at", int.to_string(expires_at)),
+                #("price_id", option.unwrap(data.price_id, "unknown")),
+              ])
+
+            supabase_client.insert_provisioning_queue(
+              customer.business_id,
+              // The business that owns this customer
+              customer.customer_id,
+              // The actual customer getting machines
+              "provision",
+              "fly",
+              payload,
+            )
+          })
+          |> result.all
+          |> result.map(fn(_) { Nil })
+          |> result.map_error(fn(_) { "Failed to queue provisioning" })
+        }
+        Error(_) -> Error("Could not determine machine count")
+      }
+    }
+    Error(_) -> {
+      // Not a customer subscription - this is fine, not all invoices need machines
+      Error("Not a customer subscription")
+    }
+  }
+}
+
+// Add helper to determine machine count from price_id
+fn get_plan_machine_count(price_id: Option(String)) -> Result(Int, String) {
+  case price_id {
+    None -> Ok(0)
+    Some(pid) -> {
+      // Look up the plan by price_id to get machine count
+      case supabase_client.get_plan_machines_by_price_id(pid) {
+        Ok(plan_machine) -> Ok(plan_machine.machine_count)
+        Error(_) -> Ok(0)
+        // No machines for this plan
       }
     }
   }
