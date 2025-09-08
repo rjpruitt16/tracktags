@@ -41,6 +41,14 @@ pub fn start() -> Result(process.Subject(Message), actor.StartError) {
         started.data,
         glixir.atom_key_encoder,
       )
+
+    // Send Connect message to self to start connection
+    process.send(started.data, Connect)
+
+    logging.log(
+      logging.Info,
+      "[RealtimeActor] Started and sent Connect message",
+    )
     started.data
   })
 }

@@ -181,48 +181,28 @@ defmodule SupabaseRealtime do
   end
 
   defp handle_postgres_change(payload) do
-    case payload do
-      %{
-        "data" => %{
-          "type" => event_type,
-          "table" => table,
-          "record" => record,
-          "old_record" => old_record
-        }
-      } ->
-        # Try to call Gleam realtime actor
-        try do
-          :actors@realtime_actor.publish_table_change(
-            table,
-            String.downcase(event_type),
-            Jason.encode!(record),
-            Jason.encode!(old_record || %{})
-          )
-        rescue
-          _ -> Logger.debug("[SupabaseRealtime] Realtime actor not available")
-        end
+    Logger.info("[SupabaseRealtime] Received postgres change: #{inspect(payload)}")
 
-      %{
-        "data" => %{
-          "type" => event_type,
-          "table" => table,
-          "record" => record
-        }
-      } ->
-        # No old_record for INSERT
+    case payload do
+      %{"data" => %{"type" => event_type, "table" => table, "record" => record}} ->
+        Logger.info("[SupabaseRealtime] Attempting to publish: #{table} #{event_type}")
+
         try do
           :actors@realtime_actor.publish_table_change(
             table,
             String.downcase(event_type),
             Jason.encode!(record),
-            "{}"
+            Jason.encode!(Map.get(payload["data"], "old_record", %{}))
           )
+
+          Logger.info("[SupabaseRealtime] Successfully published to realtime actor")
         rescue
-          _ -> Logger.debug("[SupabaseRealtime] Realtime actor not available")
+          e ->
+            Logger.error("[SupabaseRealtime] Failed to publish: #{inspect(e)}")
         end
 
       _ ->
-        Logger.debug("[SupabaseRealtime] Unhandled postgres change format")
+        Logger.debug("[SupabaseRealtime] Unhandled format")
     end
   end
 

@@ -3,6 +3,7 @@ import actors/business_actor
 import actors/clock_actor
 import actors/machine_actor
 import actors/metric_actor
+import actors/realtime_actor
 import actors/supabase_actor
 import clients/supabase_client
 import gleam/dict.{type Dict}
@@ -812,6 +813,15 @@ pub fn start_app(
     }),
   )
   logging.log(logging.Info, "[Application] ✅ SupabaseActor started")
+
+  // Start RealtimeActor for database change notifications
+  use _realtime_subject <- result.try(
+    realtime_actor.start()
+    |> result.map_error(fn(e) {
+      "RealtimeActor start failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ RealtimeActor started")
   // Start MachineActor for provisioning
   use _machine_subject <- result.try(
     machine_actor.start()

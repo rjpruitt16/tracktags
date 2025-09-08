@@ -17,7 +17,7 @@ pub type RealtimeEventResult {
 
 // FFI to our Elixir wrapper
 @external(erlang, "Elixir.SupabaseRealtime", "start_realtime_connection")
-pub fn start_realtime_connection_ffi(
+fn start_realtime_connection_ffi(
   realtime_url: String,
   anon_key: String,
   retry_count: Int,
@@ -26,17 +26,10 @@ pub fn start_realtime_connection_ffi(
 @external(erlang, "Elixir.SupabaseRealtime", "parse_realtime_event")
 pub fn parse_realtime_event(event_data: String) -> RealtimeEventResult
 
-// Helper function for easy connection setup
 pub fn start_realtime_connection(retry_count: Int) -> RealtimeStartResult {
-  let #(realtime_url, anon_key) = get_supabase_realtime_config()
-  start_realtime_connection_ffi(realtime_url, anon_key, retry_count)
-}
-
-fn get_supabase_realtime_config() -> #(String, String) {
-  // Much cleaner - will panic on startup if missing
   let url = get_supabase_realtime_url()
   let key = utils.require_env("SUPABASE_ANON_KEY")
-  #(url, key)
+  start_realtime_connection_ffi(url, key, retry_count)
 }
 
 pub fn get_supabase_realtime_url() -> String {
