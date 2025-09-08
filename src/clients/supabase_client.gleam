@@ -16,6 +16,7 @@ import gleam/string
 import gleam/uri
 import logging
 import storage/metric_store
+import types/business_types
 import types/customer_types.{type CustomerContext}
 import types/metric_types
 import utils/crypto
@@ -32,20 +33,6 @@ pub type SupabaseError {
   NotFound(String)
   Unauthorized
   HttpError(httpc.HttpError)
-}
-
-// Update Business type
-pub type Business {
-  Business(
-    business_id: String,
-    stripe_customer_id: Option(String),
-    business_name: String,
-    email: String,
-    plan_type: String,
-    default_docker_image: Option(String),
-    default_machine_size: Option(String),
-    default_region: Option(String),
-  )
 }
 
 pub type IntegrationKey {
@@ -250,45 +237,11 @@ fn make_request_with_params(
 // JSON DECODERS
 // ============================================================================
 
-fn customer_decoder() -> decode.Decoder(customer_types.Customer) {
-  use customer_id <- decode.field("customer_id", decode.string)
-  use business_id <- decode.field("business_id", decode.string)
-  use plan_id <- decode.field("plan_id", decode.optional(decode.string))
-  use customer_name <- decode.field("customer_name", decode.string)
-  use stripe_customer_id <- decode.optional_field(
-    "stripe_customer_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use stripe_subscription_id <- decode.optional_field(
-    "stripe_subscription_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use stripe_price_id <- decode.optional_field(
-    "stripe_price_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use created_at <- decode.field("created_at", decode.string)
-
-  decode.success(customer_types.Customer(
-    customer_id: customer_id,
-    business_id: business_id,
-    plan_id: plan_id,
-    customer_name: customer_name,
-    stripe_customer_id: stripe_customer_id,
-    stripe_subscription_id: stripe_subscription_id,
-    stripe_price_id: stripe_price_id,
-    created_at: created_at,
-  ))
-}
-
 fn customer_context_decoder() -> decode.Decoder(customer_types.CustomerContext) {
-  use customer <- decode.field("customer", customer_decoder())
+  use customer <- decode.field("customer", customer_types.customer_decoder())
   use machines <- decode.field(
     "machines",
-    decode.list(customer_machine_decoder()),
+    decode.list(customer_types.customer_machine_decoder()),
   )
   use limits <- decode.field("plan_limits", decode.list(plan_limit_decoder()))
 
@@ -369,92 +322,6 @@ fn validation_result_decoder() -> decode.Decoder(ValidationResult) {
   }
 }
 
-// Add decoder (around line 350)
-fn customer_machine_decoder() -> decode.Decoder(customer_types.CustomerMachine) {
-  use id <- decode.field("id", decode.string)
-  use customer_id <- decode.field("customer_id", decode.string)
-  use business_id <- decode.field("business_id", decode.string)
-  use machine_id <- decode.field("machine_id", decode.string)
-  use fly_app_name <- decode.optional_field(
-    "fly_app_name",
-    None,
-    decode.optional(decode.string),
-  )
-  use machine_url <- decode.optional_field(
-    "machine_url",
-    None,
-    decode.optional(decode.string),
-  )
-  use ip_address <- decode.optional_field(
-    "ip_address",
-    None,
-    decode.optional(decode.string),
-  )
-  use status <- decode.field("status", decode.string)
-  use expires_at <- decode.field("expires_at", decode.int)
-  use docker_image <- decode.optional_field(
-    "docker_image",
-    None,
-    decode.optional(decode.string),
-  )
-  use fly_state <- decode.optional_field(
-    "fly_state",
-    None,
-    decode.optional(decode.string),
-  )
-
-  decode.success(customer_types.CustomerMachine(
-    id: id,
-    customer_id: customer_id,
-    business_id: business_id,
-    machine_id: machine_id,
-    fly_app_name: fly_app_name,
-    machine_url: machine_url,
-    ip_address: ip_address,
-    status: status,
-    expires_at: expires_at,
-    docker_image: docker_image,
-    fly_state: fly_state,
-  ))
-}
-
-fn business_decoder() -> decode.Decoder(Business) {
-  use business_id <- decode.field("business_id", decode.string)
-  use stripe_customer_id <- decode.field(
-    "stripe_customer_id",
-    decode.optional(decode.string),
-  )
-  use business_name <- decode.field("business_name", decode.string)
-  use email <- decode.field("email", decode.string)
-  use plan_type <- decode.field("plan_type", decode.string)
-  use default_docker_image <- decode.optional_field(
-    "default_docker_image",
-    None,
-    decode.optional(decode.string),
-  )
-  use default_machine_size <- decode.optional_field(
-    "default_machine_size",
-    Some("shared-cpu-1x"),
-    decode.optional(decode.string),
-  )
-  use default_region <- decode.optional_field(
-    "default_region",
-    Some("iad"),
-    decode.optional(decode.string),
-  )
-
-  decode.success(Business(
-    business_id: business_id,
-    stripe_customer_id: stripe_customer_id,
-    business_name: business_name,
-    email: email,
-    plan_type: plan_type,
-    default_docker_image: default_docker_image,
-    default_machine_size: default_machine_size,
-    default_region: default_region,
-  ))
-}
-
 fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
   use id <- decode.field("id", decode.string)
   use business_id <- decode.field("business_id", decode.string)
@@ -485,7 +352,6 @@ pub fn validate_api_key(api_key: String) -> Result(KeyValidation, SupabaseError)
   validate_api_key_with_retry(api_key, 3)
 }
 
-// Updated validate_api_key function
 pub fn validate_api_key_with_retry(
   api_key: String,
   retries: Int,
@@ -496,17 +362,20 @@ pub fn validate_api_key_with_retry(
       <> string.slice(api_key, 0, 10)
       <> "...",
   )
-  // Hash the incoming API key
+
   let key_hash = crypto.hash_api_key(api_key)
 
-  // URL-encode the hash for use in query parameter
-  let encoded_hash = uri.percent_encode(key_hash)
+  // Manual encoding because uri.percent_encode doesn't handle + correctly
+  let encoded_hash =
+    key_hash
+    |> string.replace("+", "%2B")
+    |> string.replace("/", "%2F")
+    |> string.replace("=", "%3D")
 
-  // Query by hash instead of encrypted_key
   let path =
     "/integration_keys?key_hash=eq." <> encoded_hash <> "&is_active=eq.true"
-
   use response <- result.try(make_request(http.Get, path, None))
+
   case response.status {
     200 -> {
       case json.parse(response.body, decode.list(integration_key_decoder())) {
@@ -537,7 +406,6 @@ pub fn validate_api_key_with_retry(
             _ -> {
               case retries > 0 {
                 True -> {
-                  // Sleep for 1 second (you'll need to add a sleep function)
                   process.sleep(1000)
                   validate_api_key_with_retry(api_key, retries - 1)
                 }
@@ -549,7 +417,6 @@ pub fn validate_api_key_with_retry(
         Error(_) -> {
           case retries > 0 {
             True -> {
-              // Sleep for 1 second (you'll need to add a sleep function)
               process.sleep(1000)
               validate_api_key_with_retry(api_key, retries - 1)
             }
@@ -561,7 +428,6 @@ pub fn validate_api_key_with_retry(
     401 -> {
       case retries > 0 {
         True -> {
-          // Sleep for 1 second (you'll need to add a sleep function)
           process.sleep(1000)
           validate_api_key_with_retry(api_key, retries - 1)
         }
@@ -571,7 +437,6 @@ pub fn validate_api_key_with_retry(
     _ -> {
       case retries > 0 {
         True -> {
-          // Sleep for 1 second (you'll need to add a sleep function)
           process.sleep(1000)
           validate_api_key_with_retry(api_key, retries - 1)
         }
@@ -788,7 +653,7 @@ pub fn create_business(
   business_id: String,
   business_name: String,
   email: String,
-) -> Result(Business, SupabaseError) {
+) -> Result(business_types.Business, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Creating business: " <> business_id,
@@ -811,7 +676,12 @@ pub fn create_business(
 
   case response.status {
     201 | 200 -> {
-      case json.parse(response.body, decode.list(business_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(business_types.business_decoder()),
+        )
+      {
         Ok([new_business, ..]) -> {
           logging.log(
             logging.Info,
@@ -871,7 +741,7 @@ pub fn update_customer_subscription(
 /// Get business by Stripe customer ID (for webhook processing)
 pub fn get_business_by_stripe_customer(
   stripe_customer_id: String,
-) -> Result(Business, SupabaseError) {
+) -> Result(business_types.Business, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting business by Stripe customer: "
@@ -884,7 +754,12 @@ pub fn get_business_by_stripe_customer(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(business_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(business_types.business_decoder()),
+        )
+      {
         Ok([]) -> Error(NotFound("Business not found for Stripe customer"))
         Ok([business, ..]) -> {
           logging.log(
@@ -901,7 +776,9 @@ pub fn get_business_by_stripe_customer(
 }
 
 /// Get business details by business_id
-pub fn get_business(business_id: String) -> Result(Business, SupabaseError) {
+pub fn get_business(
+  business_id: String,
+) -> Result(business_types.Business, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Getting business: " <> business_id,
@@ -913,7 +790,12 @@ pub fn get_business(business_id: String) -> Result(Business, SupabaseError) {
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(business_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(business_types.business_decoder()),
+        )
+      {
         Ok([]) -> Error(NotFound("Business not found"))
         Ok([business, ..]) -> Ok(business)
         Error(_) -> Error(ParseError("Invalid business format"))
@@ -1444,7 +1326,12 @@ pub fn get_expired_machines() -> Result(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_machine_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_machine_decoder()),
+        )
+      {
         Ok(machines) -> Ok(machines)
         Error(_) -> Error(ParseError("Invalid machines format"))
       }
@@ -1463,7 +1350,12 @@ pub fn get_customer_machines(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_machine_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_machine_decoder()),
+        )
+      {
         Ok(machines) -> Ok(machines)
         Error(_) -> Error(ParseError("Invalid machines format"))
       }
@@ -1527,7 +1419,7 @@ pub fn insert_customer_machine(
     make_request(http.Post, "/customer_machines", Some(json.to_string(data)))
   {
     Ok(_) -> Ok(Nil)
-    Error(e) -> Error(DatabaseError("Failed to insert customer machine"))
+    Error(_) -> Error(DatabaseError("Failed to insert customer machine"))
   }
 }
 
@@ -1709,7 +1601,6 @@ pub fn insert_provisioning_queue(
   }
 }
 
-// ADD around line 1650
 pub fn get_customer_full_context(
   business_id: String,
   customer_id: String,
@@ -1731,11 +1622,11 @@ pub fn get_customer_full_context(
     200 -> {
       case json.parse(response.body, customer_context_decoder()) {
         Ok(context) -> Ok(context)
-        Error(_) -> Error(ParseError("Failed to parse customer context"))
+        Error(_) -> Error(ParseError("Invalid context format"))
       }
     }
     404 -> Error(NotFound("Customer not found"))
-    _ -> Error(DatabaseError("Failed to fetch customer context"))
+    _ -> Error(DatabaseError("Failed to get customer context"))
   }
 }
 
@@ -2354,7 +2245,12 @@ pub fn get_business_customers(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
         Ok(customers) -> {
           logging.log(
             logging.Info,
@@ -2394,7 +2290,12 @@ pub fn get_customer_by_id(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
         Ok([]) -> Error(NotFound("Client not found"))
         Ok([customer, ..]) -> {
           logging.log(
@@ -2439,7 +2340,12 @@ pub fn update_customer(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
         Ok([]) -> Error(NotFound("Client not found or not owned by business"))
         Ok([updated_customer, ..]) -> {
           logging.log(
@@ -2507,7 +2413,12 @@ pub fn get_customer_by_stripe_customer(
 
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.list(customer_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
         Ok([]) -> Error(NotFound("Customer not found for Stripe ID"))
         Ok([customer, ..]) -> {
           logging.log(
@@ -2643,7 +2554,12 @@ pub fn create_customer(
 
   case response.status {
     201 -> {
-      case json.parse(response.body, decode.list(customer_decoder())) {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
         Ok([new_customer, ..]) -> {
           logging.log(
             logging.Info,

@@ -1,7 +1,8 @@
 // src/types/business_types.gleam
 import gleam/dict.{type Dict}
+import gleam/dynamic/decode
 import gleam/erlang/process
-import gleam/option.{type Option}
+import gleam/option.{type Option, None, Some}
 import glixir
 import types/customer_types
 import types/metric_types.{type MetricMetadata, type MetricType}
@@ -52,6 +53,8 @@ pub type Message {
     context: customer_types.CustomerContext,
     reply: process.Subject(process.Subject(customer_types.Message)),
   )
+  RegisterApiKey(api_key: String)
+  RealtimeBusinessUpdate(business: Business)
 }
 
 pub fn lookup_business_subject(
@@ -73,7 +76,66 @@ pub type Business {
     plan_type: String,
     subscription_status: String,
     current_plan_id: Option(String),
+    default_docker_image: Option(String),
+    default_machine_size: Option(String),
+    default_region: Option(String),
   )
+}
+
+pub fn business_decoder() -> decode.Decoder(Business) {
+  use business_id <- decode.field("business_id", decode.string)
+  use stripe_customer_id <- decode.optional_field(
+    "stripe_customer_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use stripe_subscription_id <- decode.optional_field(
+    "stripe_subscription_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use business_name <- decode.field("business_name", decode.string)
+  use email <- decode.field("email", decode.string)
+  use plan_type <- decode.field("plan_type", decode.string)
+  use subscription_status <- decode.optional_field(
+    "subscription_status",
+    "active",
+    decode.string,
+  )
+  use current_plan_id <- decode.optional_field(
+    "current_plan_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use default_docker_image <- decode.optional_field(
+    "default_docker_image",
+    None,
+    decode.optional(decode.string),
+  )
+  use default_machine_size <- decode.optional_field(
+    "default_machine_size",
+    Some("shared-cpu-1x"),
+    decode.optional(decode.string),
+  )
+  use default_region <- decode.optional_field(
+    "default_region",
+    Some("iad"),
+    decode.optional(decode.string),
+  )
+
+  decode.success(Business(
+    business_id: business_id,
+    stripe_customer_id: stripe_customer_id,
+    stripe_subscription_id: stripe_subscription_id,
+    business_name: business_name,
+    email: email,
+    plan_type: plan_type,
+    subscription_status: subscription_status,
+    current_plan_id: current_plan_id,
+    default_docker_image: default_docker_image,
+    default_machine_size: default_machine_size,
+    default_region: default_region,
+  ))
 }
 
 pub type Plan {

@@ -8,10 +8,10 @@ import gleam/erlang/process
 import gleam/http
 import gleam/int
 import gleam/json
-import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import logging
+import utils/auth
 import utils/utils
 import web/handler/stripe_handler
 import wisp.{type Request, type Response}
@@ -20,36 +20,21 @@ import wisp.{type Request, type Response}
 // ADMIN AUTHENTICATION
 // ============================================================================
 
-/// Simple admin token check (expand later if needed)
-fn check_admin_auth(req: Request) -> Result(Nil, Response) {
-  case list.key_find(req.headers, "x-admin-token") {
-    Ok(token) -> {
-      let admin_secret = utils.require_env("ADMIN_SECRET_TOKEN")
-      case token == admin_secret {
-        True -> Ok(Nil)
-        False -> unauthorized_response()
+fn with_admin_auth(req: Request, handler: fn() -> Response) -> Response {
+  auth.with_auth(req, fn(_auth_result, _api_key, is_admin) {
+    case is_admin {
+      True -> handler()
+      // Admin authenticated
+      False -> {
+        let error_json =
+          json.object([
+            #("error", json.string("Unauthorized")),
+            #("message", json.string("Admin authentication required")),
+          ])
+        wisp.json_response(json.to_string_tree(error_json), 401)
       }
     }
-    Error(_) -> unauthorized_response()
-  }
-}
-
-fn unauthorized_response() -> Result(Nil, Response) {
-  logging.log(logging.Warning, "[AdminHandler] Unauthorized admin access")
-  let error_json =
-    json.object([
-      #("error", json.string("Unauthorized")),
-      #("message", json.string("Invalid admin token")),
-    ])
-  Error(wisp.json_response(json.to_string_tree(error_json), 401))
-}
-
-/// Auth wrapper for admin endpoints
-fn with_admin_auth(req: Request, handler: fn() -> Response) -> Response {
-  case check_admin_auth(req) {
-    Ok(_) -> handler()
-    Error(response) -> response
-  }
+  })
 }
 
 // ============================================================================

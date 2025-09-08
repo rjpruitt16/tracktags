@@ -39,6 +39,14 @@ pub fn machine_actor_key() -> atom.Atom {
   atom.create("machine_actor")
 }
 
+pub fn realtime_actor_key() -> atom.Atom {
+  atom.create("realtime_actor")
+}
+
+pub fn realtime_events_bus() -> atom.Atom {
+  atom.create("realtime_events")
+}
+
 // ============================================================================
 // ENVIRONMENT HELPERS
 // ============================================================================

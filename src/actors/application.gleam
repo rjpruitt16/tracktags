@@ -16,11 +16,14 @@ import gleam/string
 import glixir
 import glixir/supervisor
 import logging
+import types/application_types.{type ApplicationMessage}
 import types/business_types
 import types/customer_types
 import types/metric_types.{type MetricMetadata, type MetricType}
+import utils/auth
 import utils/utils
 
+// Now we can import auth!
 pub type TierLimit {
   TierLimit(
     daily_calls: Float,
@@ -82,48 +85,6 @@ fn tier_limits() -> Dict(String, TierLimit) {
   ])
 }
 
-pub type ApplicationMessage {
-  SendMetricToBusiness(
-    business_id: String,
-    metric_name: String,
-    tick_type: String,
-    operation: String,
-    cleanup_after_seconds: Int,
-    metric_type: MetricType,
-    initial_value: Float,
-    tags: Dict(String, String),
-    metadata: Option(MetricMetadata),
-    limit_value: Float,
-    limit_operator: String,
-    breach_action: String,
-  )
-  SendMetricToCustomer(
-    business_id: String,
-    customer_id: String,
-    metric_name: String,
-    tick_type: String,
-    operation: String,
-    cleanup_after_seconds: Int,
-    metric_type: MetricType,
-    initial_value: Float,
-    tags: Dict(String, String),
-    metadata: Option(MetricMetadata),
-    limit_value: Float,
-    limit_operator: String,
-    breach_action: String,
-  )
-
-  EnsureCustomerActor(
-    business_id: String,
-    customer_id: String,
-    context: customer_types.CustomerContext,
-    reply_to: process.Subject(
-      Result(process.Subject(customer_types.Message), String),
-    ),
-  )
-  Shutdown
-}
-
 // Updated state to include SupabaseActor reference
 pub type ApplicationState {
   ApplicationState(
@@ -160,7 +121,7 @@ fn handle_application_message(
   message: ApplicationMessage,
 ) -> actor.Next(ApplicationState, ApplicationMessage) {
   case message {
-    SendMetricToBusiness(
+    application_types.SendMetricToBusiness(
       business_id,
       metric_name,
       tick_type,
@@ -222,7 +183,7 @@ fn handle_application_message(
       actor.continue(state)
     }
 
-    SendMetricToCustomer(
+    application_types.SendMetricToCustomer(
       business_id,
       customer_id,
       metric_name,
@@ -287,7 +248,29 @@ fn handle_application_message(
       actor.continue(state)
     }
 
-    EnsureCustomerActor(business_id, customer_id, context, reply_to) -> {
+    application_types.EnsureBusinessActor(business_id, api_key, reply_to) -> {
+      let result =
+        get_or_spawn_business_simple(state.business_supervisor, business_id)
+
+      // Send API key to business actor for registration
+      case result {
+        Ok(business_subject) -> {
+          process.send(business_subject, business_types.RegisterApiKey(api_key))
+        }
+        Error(_) -> Nil
+      }
+
+      process.send(reply_to, result)
+      actor.continue(state)
+    }
+
+    application_types.EnsureCustomerActor(
+      business_id,
+      customer_id,
+      context,
+      api_key,
+      reply_to,
+    ) -> {
       let result =
         ensure_customer_with_context(
           state.business_supervisor,
@@ -295,11 +278,19 @@ fn handle_application_message(
           customer_id,
           context,
         )
+
+      // Send API key to customer actor for registration
+      case result {
+        Ok(customer_subject) -> {
+          process.send(customer_subject, customer_types.RegisterApiKey(api_key))
+        }
+        Error(_) -> Nil
+      }
+
       process.send(reply_to, result)
       actor.continue(state)
     }
-
-    Shutdown -> {
+    application_types.Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
       process.send(state.clock_actor, clock_actor.Shutdown)
       process.send(state.supabase_actor, supabase_actor.Shutdown)
@@ -592,7 +583,10 @@ fn ensure_customer_with_context(
   case customer_types.lookup_client_subject(business_id, customer_id) {
     Ok(customer_subject) -> {
       // Update with fresh context
-      process.send(customer_subject, customer_types.UpdateContext(context))
+      process.send(
+        customer_subject,
+        customer_types.SetContextFromDatabase(context),
+      )
       Ok(customer_subject)
     }
     Error(_) -> {
@@ -780,6 +774,27 @@ pub fn start_app(
   )
   logging.log(logging.Info, "[Application] ✅ Dynamic supervisor started")
 
+  // Initialize auth registries FIRST
+  case auth.init_auth_registries() {
+    Ok(_) -> logging.log(logging.Info, "[Main] Auth registries initialized")
+    Error(e) -> {
+      logging.log(logging.Error, "[Main] Failed to init auth registries: " <> e)
+      panic as "Failed to initialize auth registries"
+    }
+  }
+
+  // Initialize realtime events bus
+  case glixir.pubsub_start(utils.realtime_events_bus()) {
+    Ok(_) -> logging.log(logging.Info, "[Main] Realtime events bus started")
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[Main] Failed to start realtime bus: " <> string.inspect(e),
+      )
+      panic as "Failed to start realtime events bus"
+    }
+  }
+
   // Start ClockActor
   use clock_subject <- result.try(
     clock_actor.start()
@@ -824,8 +839,6 @@ pub fn start_app(
       "ApplicationActor start failed: " <> string.inspect(e)
     }),
   )
-
-  process.send(supabase_subject, supabase_actor.StartRealtimeConnection)
 
   logging.log(
     logging.Info,

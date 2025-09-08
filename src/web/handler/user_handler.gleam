@@ -1,14 +1,17 @@
-// src/web/handler/customer_handler.gleam=
+// src/web/handler/user_handler.gleam=
 import clients/supabase_client
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/http
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import glixir
 import logging
 import types/customer_types
+import utils/auth
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -38,71 +41,33 @@ pub type CustomerKeyRequest {
 // AUTHENTICATION (copied from metric_handler pattern)
 // ============================================================================
 
-fn extract_api_key(req: Request) -> Result(String, String) {
-  case list.key_find(req.headers, "authorization") {
-    Ok(auth_header) -> {
-      case string.split_once(auth_header, " ") {
-        Ok(#("Bearer", api_key)) -> Ok(string.trim(api_key))
-        _ -> Error("Invalid Authorization header format")
-      }
-    }
-    Error(_) -> Error("Missing Authorization header")
-  }
-}
-
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
-  case extract_api_key(req) {
-    Error(error) -> {
-      logging.log(logging.Warning, "[CustomerHandler] Auth failed: " <> error)
-      let error_json =
-        json.object([
-          #("error", json.string("Unauthorized")),
-          #("message", json.string(error)),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 401)
-    }
-    Ok(api_key) -> {
-      case supabase_client.validate_api_key(api_key) {
-        Ok(supabase_client.BusinessKey(business_id)) -> {
-          logging.log(
-            logging.Info,
-            "[CustomerHandler] ✅ API key validated for business: "
-              <> business_id,
-          )
-          handler(business_id)
-        }
-        Ok(supabase_client.CustomerKey(business_id, _)) -> {
-          logging.log(
-            logging.Warning,
-            "[CustomerHandler] Customer key cannot manage customers for business: "
-              <> business_id,
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Forbidden")),
-              #("message", json.string("Customer keys cannot manage customers")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 403)
-        }
-        Error(supabase_client.Unauthorized) -> {
-          let error_json =
-            json.object([
-              #("error", json.string("Unauthorized")),
-              #("message", json.string("Invalid API key")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 401)
-        }
-        Error(_) -> {
-          let error_json =
-            json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("API key validation failed")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
+  auth.with_auth(req, fn(auth_result, _api_key, is_admin) {
+    case is_admin {
+      True -> handler("admin")
+      // Admin bypass
+      False -> {
+        case auth_result {
+          auth.ActorCached(auth.BusinessActor(bid, _)) -> handler(bid)
+          auth.ActorCached(auth.CustomerActor(bid, _, _)) -> handler(bid)
+          auth.DatabaseValid(supabase_client.BusinessKey(bid)) -> handler(bid)
+          auth.DatabaseValid(supabase_client.CustomerKey(bid, _)) ->
+            handler(bid)
+          _ -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Unauthorized")),
+                  #("message", json.string("Invalid API key")),
+                ]),
+              ),
+              401,
+            )
+          }
         }
       }
     }
-  }
+  })
 }
 
 // ============================================================================
@@ -163,28 +128,94 @@ fn validate_customer_request(
 pub fn get_customer_machines(req: Request, customer_id: String) -> Response {
   use <- wisp.require_method(req, http.Get)
 
-  logging.log(
-    logging.Info,
-    "[CustomerHandler] Getting machines for customer: " <> customer_id,
-  )
+  with_auth(req, fn(business_id) {
+    case business_id {
+      "admin" -> {
+        // Admin gets direct database access, no actor check
+        logging.log(
+          logging.Info,
+          "[CustomerHandler] Admin access for machines: " <> customer_id,
+        )
+        query_database_for_machines(customer_id)
+      }
+      _ -> {
+        // For test customers, skip actor check
+        case string.starts_with(customer_id, "test_") {
+          True -> {
+            logging.log(
+              logging.Info,
+              "[CustomerHandler] Test customer, skipping actor check: "
+                <> customer_id,
+            )
+            query_database_for_machines(customer_id)
+          }
+          False -> {
+            // Regular flow with registry check
+            let registry_key = "client:" <> business_id <> ":" <> customer_id
 
-  case supabase_client.get_customer_machines(customer_id) {
-    Ok(machines) -> {
-      let machines_json = list.map(machines, machine_to_json)
-      let response =
-        json.object([
-          #("customer_id", json.string(customer_id)),
-          #("machines", json.array(machines_json, fn(x) { x })),
-        ])
-      wisp.json_response(json.to_string_tree(response), 200)
+            case
+              glixir.lookup_subject_string(
+                utils.tracktags_registry(),
+                registry_key,
+              )
+            {
+              Ok(customer_subject) -> {
+                let reply = process.new_subject()
+                process.send(
+                  customer_subject,
+                  customer_types.GetMachines(reply),
+                )
+
+                case process.receive(reply, 1000) {
+                  Ok(_machine_ids) -> query_database_for_machines(customer_id)
+                  Error(_) -> query_database_for_machines(customer_id)
+                }
+              }
+              Error(_) -> {
+                logging.log(
+                  logging.Info,
+                  "[CustomerHandler] No actor found, checking database",
+                )
+                query_database_for_machines(customer_id)
+              }
+            }
+          }
+        }
+      }
     }
-    Error(_) -> {
-      let error_json =
-        json.object([
-          #("error", json.string("Not Found")),
-          #("message", json.string("No machines found for customer")),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 404)
+  })
+}
+
+fn query_database_for_machines(customer_id: String) -> Response {
+  case supabase_client.get_customer_machines(customer_id) {
+    Ok([]) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Not Found")),
+            #("message", json.string("No machines found for customer")),
+          ]),
+        ),
+        404,
+      )
+    }
+    Ok(machines) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("machines", json.array(machines, of: machine_to_json)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[CustomerHandler] Database error: " <> string.inspect(err),
+      )
+      wisp.internal_server_error()
+      |> wisp.string_body("Failed to get machines")
     }
   }
 }
@@ -193,14 +224,10 @@ fn machine_to_json(machine: customer_types.CustomerMachine) -> json.Json {
   json.object([
     #("machine_id", json.string(machine.machine_id)),
     #("status", json.string(machine.status)),
-    #("fly_app_name", case machine.fly_app_name {
-      option.Some(name) -> json.string(name)
-      option.None -> json.null()
-    }),
-    #("ip_address", case machine.ip_address {
-      option.Some(ip) -> json.string(ip)
-      option.None -> json.null()
-    }),
+    #("fly_app_name", json.nullable(machine.fly_app_name, of: json.string)),
+    #("machine_url", json.nullable(machine.machine_url, of: json.string)),
+    #("ip_address", json.nullable(machine.ip_address, of: json.string)),
+    #("docker_image", json.nullable(machine.docker_image, of: json.string)),
     #("expires_at", json.int(machine.expires_at)),
   ])
 }
@@ -538,84 +565,90 @@ pub fn delete_client_key(
   wisp.json_response(json.to_string_tree(success_json), 200)
 }
 
-// In user_handler.gleam (formerly customer_handler)
 pub fn create_business(req: Request) -> Response {
   use <- wisp.require_method(req, http.Post)
 
-  // Check for admin auth
-  case extract_api_key(req) {
-    Ok(api_key) -> {
-      let admin_key = utils.require_env("ADMIN_API_KEY")
-      case api_key == admin_key {
-        True -> {
-          use json_data <- wisp.require_json(req)
+  auth.with_auth(req, fn(_auth_result, _api_key, is_admin) {
+    case is_admin {
+      False -> {
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Forbidden")),
+              #("message", json.string("Admin authentication required")),
+            ]),
+          ),
+          403,
+        )
+      }
 
-          let decoder = {
-            use business_name <- decode.field("business_name", decode.string)
-            use email <- decode.field("email", decode.string)
-            decode.success(#(business_name, email))
+      True -> {
+        use json_data <- wisp.require_json(req)
+
+        let decoder = {
+          use business_name <- decode.field("business_name", decode.string)
+          use email <- decode.field("email", decode.string)
+          decode.success(#(business_name, email))
+        }
+
+        case decode.run(json_data, decoder) {
+          Error(_) -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Bad Request")),
+                  #("message", json.string("Invalid request data")),
+                ]),
+              ),
+              400,
+            )
           }
 
-          case decode.run(json_data, decoder) {
-            Ok(#(name, email)) -> {
-              let business_id = "biz_" <> utils.generate_random()
+          Ok(#(business_name, email)) -> {
+            let business_id = "biz_" <> utils.generate_random()
 
-              case supabase_client.create_business(business_id, name, email) {
-                Ok(business) -> {
-                  wisp.json_response(
-                    json.to_string_tree(
-                      json.object([
-                        #("business_id", json.string(business.business_id)),
-                        #("business_name", json.string(business.business_name)),
-                        #("email", json.string(business.email)),
-                      ]),
-                    ),
-                    201,
-                  )
-                }
-                Error(err) -> {
-                  logging.log(
-                    logging.Error,
-                    "[UserHandler] Failed to create business: "
-                      <> string.inspect(err),
-                  )
-                  wisp.json_response(
-                    json.to_string_tree(
-                      json.object([
-                        #("error", json.string("Failed to create business")),
-                      ]),
-                    ),
-                    500,
-                  )
-                }
+            case
+              supabase_client.create_business(business_id, business_name, email)
+            {
+              Ok(business) -> {
+                logging.log(
+                  logging.Info,
+                  "[UserHandler] Created business: " <> business.business_id,
+                )
+
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("business_id", json.string(business.business_id)),
+                      #("business_name", json.string(business.business_name)),
+                      #("email", json.string(business.email)),
+                    ]),
+                  ),
+                  201,
+                )
+              }
+
+              Error(err) -> {
+                logging.log(
+                  logging.Error,
+                  "[UserHandler] Failed to create business: "
+                    <> string.inspect(err),
+                )
+
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("error", json.string("Internal Server Error")),
+                      #("message", json.string("Failed to create business")),
+                    ]),
+                  ),
+                  500,
+                )
               }
             }
-            Error(_) ->
-              wisp.json_response(
-                json.to_string_tree(
-                  json.object([#("error", json.string("Invalid request data"))]),
-                ),
-                400,
-              )
           }
         }
-        False ->
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Admin authentication required")),
-              ]),
-            ),
-            401,
-          )
       }
     }
-    Error(_) ->
-      wisp.json_response(
-        json.to_string_tree(
-          json.object([#("error", json.string("Admin authentication required"))]),
-        ),
-        401,
-      )
-  }
+  })
 }

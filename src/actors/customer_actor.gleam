@@ -19,6 +19,8 @@ import logging
 import storage/metric_store
 import types/customer_types
 import types/metric_types
+import utils/auth
+import utils/crypto
 import utils/utils
 
 pub type State {
@@ -352,6 +354,35 @@ fn handle_message(
       let updated_state = State(..state, stripe_billing_metrics: alive_metrics)
       actor.continue(updated_state)
     }
+
+    customer_types.RegisterApiKey(api_key) -> {
+      let key_hash = crypto.hash_api_key(api_key)
+      let registry_key =
+        "client:" <> state.business_id <> ":" <> state.customer_id
+
+      case
+        glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
+      {
+        Ok(self_subject) -> {
+          case auth.register_customer_api_key(key_hash, self_subject) {
+            Ok(_) ->
+              logging.log(logging.Info, "[CustomerActor] Registered API key")
+            Error(e) ->
+              logging.log(
+                logging.Error,
+                "[CustomerActor] Failed to register API key: " <> e,
+              )
+          }
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[CustomerActor] Could not find self in registry to register API key",
+          )
+        }
+      }
+      actor.continue(state)
+    }
     customer_types.CleanupTick(_timestamp, _tick_type) -> {
       let inactive_duration = current_time - updated_state.last_accessed
 
@@ -420,36 +451,6 @@ fn handle_message(
           actor.continue(updated_state)
         }
       }
-    }
-
-    customer_types.UpdateContext(context) -> {
-      logging.log(
-        logging.Info,
-        "[CustomerActor] Updating context for " <> state.customer_id,
-      )
-
-      // Extract machine info
-      let machine_ids = list.map(context.machines, fn(m) { m.machine_id })
-      let expires_at =
-        list.first(context.machines)
-        |> result.map(fn(m) { m.expires_at })
-        |> result.unwrap(0)
-
-      // Extract customer info
-      let plan_id = context.customer.plan_id
-      let stripe_price_id = context.customer.stripe_price_id
-
-      // TODO: Could also cache the limits here for quick access
-
-      actor.continue(
-        State(
-          ..state,
-          machine_ids: machine_ids,
-          machines_expire_at: expires_at,
-          plan_id: plan_id,
-          stripe_price_id: stripe_price_id,
-        ),
-      )
     }
 
     customer_types.RecordMetric(
@@ -671,44 +672,22 @@ fn handle_message(
       actor.stop()
     }
 
-    customer_types.PlanLimitChanged(
-      business_id,
-      customer_id,
-      metric_name,
-      new_limit,
-      operator,
-      action,
-    ) -> {
-      // Find the existing MetricActor and update its limits directly
-      let client_key = business_id <> ":" <> customer_id
-
-      case metric_actor.lookup_metric_subject(client_key, metric_name) {
-        Ok(metric_subject) -> {
-          // Send direct limit update to existing actor
-          process.send(
-            metric_subject,
-            metric_types.UpdatePlanLimit(new_limit, operator, action),
-          )
-          logging.log(
-            logging.Info,
-            "[ClientActor] ✅ Updated plan limit directly",
-          )
-        }
-        Error(_) -> {
-          logging.log(
-            logging.Debug,
-            "[ClientActor] No existing metric to update",
-          )
-        }
-      }
-      actor.continue(updated_state)
+    customer_types.GetMachines(reply) -> {
+      process.send(reply, state.machine_ids)
+      actor.continue(state)
     }
 
-    // In handle_message, add cases:
-    customer_types.UpdateMachines(machine_ids, expires_at) -> {
+    customer_types.GetPlan(reply) -> {
+      process.send(reply, #(state.plan_id, state.stripe_price_id))
+      actor.continue(state)
+    }
+
+    // Rename these existing cases for clarity:
+    customer_types.SetMachinesList(machine_ids, expires_at) -> {
+      // Was UpdateMachines
       logging.log(
         logging.Info,
-        "[CustomerActor] Updating machines for "
+        "[CustomerActor] Setting machines list for "
           <> state.customer_id
           <> " - "
           <> int.to_string(list.length(machine_ids))
@@ -719,24 +698,82 @@ fn handle_message(
       )
     }
 
-    customer_types.UpdatePlan(plan_id, stripe_price_id) -> {
+    customer_types.SetPlan(plan_id, stripe_price_id) -> {
+      // Was UpdatePlan
       logging.log(
         logging.Info,
-        "[CustomerActor] Updating plan for " <> state.customer_id,
+        "[CustomerActor] Setting plan for " <> state.customer_id,
       )
       actor.continue(
         State(..state, plan_id: plan_id, stripe_price_id: stripe_price_id),
       )
     }
 
-    customer_types.GetMachines(reply) -> {
-      process.send(reply, state.machine_ids)
-      actor.continue(state)
+    // Add new realtime cases:
+    customer_types.RealtimeMachineChange(machine, event_type) -> {
+      case event_type {
+        "insert" -> {
+          let new_machines = [machine.machine_id, ..state.machine_ids]
+          actor.continue(
+            State(
+              ..state,
+              machine_ids: new_machines,
+              machines_expire_at: machine.expires_at,
+            ),
+          )
+        }
+        "update" -> {
+          case list.contains(state.machine_ids, machine.machine_id) {
+            True ->
+              actor.continue(
+                State(..state, machines_expire_at: machine.expires_at),
+              )
+            False -> actor.continue(state)
+          }
+        }
+        "delete" -> {
+          let new_machines =
+            list.filter(state.machine_ids, fn(id) { id != machine.machine_id })
+          actor.continue(State(..state, machine_ids: new_machines))
+        }
+        _ -> actor.continue(state)
+      }
     }
 
-    customer_types.GetPlan(reply) -> {
-      process.send(reply, #(state.plan_id, state.stripe_price_id))
-      actor.continue(state)
+    customer_types.RealtimePlanChange(plan_id, price_id) -> {
+      actor.continue(
+        State(..state, plan_id: plan_id, stripe_price_id: price_id),
+      )
+    }
+
+    customer_types.SetContextFromDatabase(context) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerActor] Updating context for " <> state.customer_id,
+      )
+
+      // Extract machine info
+      let machine_ids = list.map(context.machines, fn(m) { m.machine_id })
+      let expires_at =
+        list.first(context.machines)
+        |> result.map(fn(m) { m.expires_at })
+        |> result.unwrap(0)
+
+      // Extract customer info
+      let plan_id = context.customer.plan_id
+      let stripe_price_id = context.customer.stripe_price_id
+
+      // TODO: Could also cache the limits here for quick access
+
+      actor.continue(
+        State(
+          ..state,
+          machine_ids: machine_ids,
+          machines_expire_at: expires_at,
+          plan_id: plan_id,
+          stripe_price_id: stripe_price_id,
+        ),
+      )
     }
   }
 }
@@ -829,6 +866,25 @@ pub fn start_link(
                   <> string.inspect(e),
               )
             }
+          }
+
+          let customer_channel = "customers:update:" <> customer_id
+          case
+            glixir.pubsub_subscribe_with_registry_key(
+              utils.realtime_events_bus(),
+              customer_channel,
+              "actors@customer_actor",
+              "handle_realtime_update",
+              registry_key,
+            )
+          {
+            Ok(_) ->
+              logging.log(logging.Info, "[CustomerActor] Subscribed to updates")
+            Error(e) ->
+              logging.log(
+                logging.Error,
+                "[CustomerActor] Subscribe failed: " <> string.inspect(e),
+              )
           }
 
           // Load plan limits and create limit-checking metrics
@@ -926,4 +982,67 @@ pub fn start(
     shutdown_timeout: 5000,
     child_type: glixir.worker,
   )
+}
+
+pub fn handle_realtime_update(registry_key: String, message: String) -> Nil {
+  // First decode the outer message structure
+  let message_decoder = {
+    use table <- decode.field("table", decode.string)
+    use event <- decode.field("event", decode.string)
+    use record <- decode.field("record", decode.dynamic)
+    decode.success(#(table, event, record))
+  }
+
+  case json.parse(message, message_decoder) {
+    Ok(#("customers", "update", new_record)) -> {
+      // Parse customer update directly from payload
+      case decode.run(new_record, customer_types.customer_decoder()) {
+        Ok(customer) -> {
+          case
+            glixir.lookup_subject_string(
+              utils.tracktags_registry(),
+              registry_key,
+            )
+          {
+            Ok(customer_subject) -> {
+              process.send(
+                customer_subject,
+                customer_types.RealtimePlanChange(
+                  customer.plan_id,
+                  customer.stripe_price_id,
+                ),
+              )
+            }
+            Error(_) -> Nil
+          }
+        }
+        Error(_) -> Nil
+      }
+    }
+
+    Ok(#("customer_machines", event, new_record)) -> {
+      // Parse machine changes directly
+      case decode.run(new_record, customer_types.customer_machine_decoder()) {
+        Ok(machine) -> {
+          case
+            glixir.lookup_subject_string(
+              utils.tracktags_registry(),
+              registry_key,
+            )
+          {
+            Ok(customer_subject) -> {
+              process.send(
+                customer_subject,
+                customer_types.RealtimeMachineChange(machine, event),
+              )
+            }
+            Error(_) -> Nil
+          }
+        }
+        Error(_) -> Nil
+      }
+    }
+
+    _ -> Nil
+  }
 }

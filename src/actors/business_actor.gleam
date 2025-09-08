@@ -8,7 +8,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
-import gleam/option
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleam/string
@@ -19,11 +19,14 @@ import storage/metric_store
 import types/business_types
 import types/customer_types
 import types/metric_types
+import utils/auth
+import utils/crypto
 import utils/utils
 
 pub type State {
   State(
     account_id: String,
+    business: Option(business_types.Business),
     metrics_supervisor: glixir.DynamicSupervisor(
       #(
         String,
@@ -193,6 +196,46 @@ fn handle_message(
       }
     }
 
+    business_types.RegisterApiKey(api_key) -> {
+      let key_hash = crypto.hash_api_key(api_key)
+      // Look up our own subject from the registry
+      case
+        glixir.lookup_subject_string(
+          utils.tracktags_registry(),
+          state.account_id,
+        )
+      {
+        Ok(self_subject) -> {
+          case auth.register_business_api_key(key_hash, self_subject) {
+            Ok(_) ->
+              logging.log(
+                logging.Info,
+                "[BusinessActor] Registered API key for " <> state.account_id,
+              )
+            Error(e) ->
+              logging.log(
+                logging.Error,
+                "[BusinessActor] Failed to register API key: " <> e,
+              )
+          }
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[BusinessActor] Could not find self in registry to register API key",
+          )
+        }
+      }
+      actor.continue(state)
+    }
+    business_types.RealtimeBusinessUpdate(business) -> {
+      logging.log(
+        logging.Info,
+        "[BusinessActor] Updating business data for " <> state.account_id,
+      )
+
+      actor.continue(State(..state, business: Some(business)))
+    }
     business_types.EnsureCustomerExists(customer_id, context, reply) -> {
       case
         get_or_spawn_client_simple(
@@ -203,7 +246,10 @@ fn handle_message(
       {
         Ok(customer_subject) -> {
           // Send context to customer
-          process.send(customer_subject, customer_types.UpdateContext(context))
+          process.send(
+            customer_subject,
+            customer_types.SetContextFromDatabase(context),
+          )
           // Reply with the subject
           process.send(reply, customer_subject)
         }
@@ -533,6 +579,7 @@ pub fn start_link(
       customers_supervisor: customers_supervisor,
       last_accessed: current_time,
       cleanup_threshold: 2_592_000,
+      business: None,
     )
 
   use started <- result.try(
@@ -581,6 +628,29 @@ pub fn start_link(
           <> string.inspect(e),
       )
     }
+  }
+
+  // Subscribe to business realtime updates
+  let business_channel = "businesses:update:" <> account_id
+  case
+    glixir.pubsub_subscribe_with_registry_key(
+      utils.realtime_events_bus(),
+      business_channel,
+      "actors@business_actor",
+      "handle_business_realtime_update",
+      account_id,
+    )
+  {
+    Ok(_) ->
+      logging.log(
+        logging.Info,
+        "[BusinessActor] Subscribed to realtime updates",
+      )
+    Error(_) ->
+      logging.log(
+        logging.Warning,
+        "[BusinessActor] Failed to subscribe to realtime",
+      )
   }
 
   Ok(started.data)
@@ -730,4 +800,36 @@ pub fn start(
     shutdown_timeout: 5000,
     child_type: glixir.worker,
   )
+}
+
+// In handle_business_realtime_update:
+pub fn handle_business_realtime_update(
+  registry_key: String,
+  message: String,
+) -> Nil {
+  let message_decoder = {
+    use table <- decode.field("table", decode.string)
+    use record <- decode.field("record", decode.dynamic)
+    decode.success(#(table, record))
+  }
+
+  case json.parse(message, message_decoder) {
+    Ok(#("businesses", record)) -> {
+      case decode.run(record, business_types.business_decoder()) {
+        Ok(business) -> {
+          case lookup_business_subject(registry_key) {
+            Ok(subject) -> {
+              process.send(
+                subject,
+                business_types.RealtimeBusinessUpdate(business),
+              )
+            }
+            Error(_) -> Nil
+          }
+        }
+        Error(_) -> Nil
+      }
+    }
+    _ -> Nil
+  }
 }

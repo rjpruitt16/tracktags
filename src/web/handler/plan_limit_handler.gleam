@@ -10,6 +10,7 @@ import gleam/result
 import gleam/string
 import logging
 import types/customer_types
+import utils/auth
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -56,74 +57,75 @@ const valid_actions = ["deny", "allow_overage", "webhook", "scale"]
 // AUTHENTICATION
 // ============================================================================
 
-fn extract_api_key(req: Request) -> Result(String, String) {
-  case list.key_find(req.headers, "authorization") {
-    Ok(auth_header) -> {
-      case string.split_once(auth_header, " ") {
-        Ok(#("Bearer", api_key)) -> Ok(string.trim(api_key))
-        _ -> Error("Invalid Authorization header format")
-      }
-    }
-    Error(_) -> Error("Missing Authorization header")
-  }
-}
-
+// In plan_limit_handler.gleam
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
-  case extract_api_key(req) {
-    Error(error) -> {
-      logging.log(logging.Warning, "[PlanLimitHandler] Auth failed: " <> error)
-      let error_json =
-        json.object([
-          #("error", json.string("Unauthorized")),
-          #("message", json.string(error)),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 401)
-    }
-    Ok(api_key) -> {
-      case supabase_client.validate_api_key(api_key) {
-        Ok(supabase_client.BusinessKey(business_id)) -> {
-          logging.log(
-            logging.Info,
-            "[PlanLimitHandler] ✅ API key validated for business: "
-              <> business_id,
-          )
-          handler(business_id)
-        }
-        Ok(supabase_client.CustomerKey(business_id, _)) -> {
-          logging.log(
-            logging.Warning,
-            "[PlanLimitHandler] Customer key cannot manage plan limits for business: "
-              <> business_id,
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Forbidden")),
-              #(
-                "message",
-                json.string("Customer keys cannot manage plan limits"),
+  auth.with_auth(req, fn(auth_result, api_key, is_admin) {
+    case auth_result {
+      auth.ActorCached(auth.BusinessActor(business_id, _)) ->
+        handler(business_id)
+
+      auth.DatabaseValid(supabase_client.BusinessKey(business_id)) -> {
+        case is_admin {
+          True -> {
+            // Admin shouldn't be managing plan limits directly
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Forbidden")),
+                  #(
+                    "message",
+                    json.string("Admin key cannot manage plan limits directly"),
+                  ),
+                ]),
               ),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 403)
+              403,
+            )
+          }
+          False -> {
+            let _ = auth.ensure_actor_from_auth(auth_result, api_key)
+            handler(business_id)
+          }
         }
-        Error(supabase_client.Unauthorized) -> {
-          let error_json =
+      }
+
+      auth.ActorCached(auth.CustomerActor(_business_id, _, _)) -> {
+        // Customer keys forbidden for these handlers
+        let error_json =
+          json.object([
+            #("error", json.string("Forbidden")),
+            #(
+              "message",
+              json.string("Customer keys cannot access this endpoint"),
+            ),
+          ])
+        wisp.json_response(json.to_string_tree(error_json), 403)
+      }
+
+      auth.DatabaseValid(supabase_client.CustomerKey(_, _)) -> {
+        let error_json =
+          json.object([
+            #("error", json.string("Forbidden")),
+            #(
+              "message",
+              json.string("Customer keys cannot access this endpoint"),
+            ),
+          ])
+        wisp.json_response(json.to_string_tree(error_json), 403)
+      }
+
+      auth.InvalidKey(_) -> {
+        wisp.json_response(
+          json.to_string_tree(
             json.object([
               #("error", json.string("Unauthorized")),
               #("message", json.string("Invalid API key")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 401)
-        }
-        Error(_) -> {
-          let error_json =
-            json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("API key validation failed")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
-        }
+            ]),
+          ),
+          401,
+        )
       }
     }
-  }
+  })
 }
 
 // ============================================================================

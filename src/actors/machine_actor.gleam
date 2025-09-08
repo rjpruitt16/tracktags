@@ -14,6 +14,10 @@ import logging
 import types/customer_types
 import utils/utils
 
+import clients/resend_client
+
+// Add at top of file with other imports
+
 pub type Message {
   InitializeSelf(process.Subject(Message))
   PollProvisioningQueue
@@ -379,6 +383,16 @@ fn handle_provision_failure(
           task.id,
           error_message,
         )
+
+      // Send failure email to business owner
+      let _ =
+        resend_client.send_provision_failed(
+          task.business_id,
+          task.customer_id,
+          error_message,
+          new_attempts,
+        )
+
       logging.log(
         logging.Error,
         "[MachineActor] Task "
@@ -425,6 +439,9 @@ fn handle_terminate(task: supabase_client.ProvisioningTask) -> Nil {
   // Get all machines for this customer
   let _ = case supabase_client.get_customer_machines(task.customer_id) {
     Ok(machines) -> {
+      let machine_count = list.length(machines)
+      // Track for email
+
       list.each(machines, fn(machine) {
         case is_mock {
           True -> {
@@ -470,6 +487,20 @@ fn handle_terminate(task: supabase_client.ProvisioningTask) -> Nil {
         }
       })
 
+      // Send termination email if machines were terminated
+      case machine_count > 0 {
+        True -> {
+          let _ =
+            resend_client.send_all_terminated(
+              task.business_id,
+              task.customer_id,
+              machine_count,
+            )
+          Nil
+        }
+        False -> Nil
+      }
+
       // Update customer actor to clear machines
       update_customer_actor_machines(task.customer_id)
 
@@ -506,7 +537,7 @@ fn update_customer_actor_machines(customer_id: String) -> Nil {
         Ok(customer_subject) -> {
           process.send(
             customer_subject,
-            customer_types.UpdateMachines(machine_ids, expires_at),
+            customer_types.SetMachinesList(machine_ids, expires_at),
           )
         }
         Error(_) -> {

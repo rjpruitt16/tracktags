@@ -1,9 +1,8 @@
-# test/integration/test_proxy_forward.hurl
 # Complete TracktTags integration test with environment variables
 
-# Step 1: Create business
+# Step 1: Create business (admin operation)
 POST {{TRACKTAGS_URL}}/api/v1/businesses
-Authorization: Bearer {{ADMIN_API_KEY}}
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
 Content-Type: application/json
 {
   "business_name": "Test Business {{test_id}}",
@@ -13,14 +12,13 @@ HTTP 201
 [Captures]
 business_id: jsonpath "$.business_id"
 
-# Step 2: Create business API key
+# Step 2: Create business API key (admin operation)
 POST {{TRACKTAGS_URL}}/api/v1/keys
-Authorization: Bearer {{ADMIN_API_KEY}}
-X-Business-ID: {{business_id}}
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
 Content-Type: application/json
 {
   "business_id": "{{business_id}}",
-  "integration_type": "business",
+  "key_type": "business",
   "key_name": "primary",
   "credentials": {
     "business_id": "{{business_id}}",
@@ -36,7 +34,7 @@ GET {{TRACKTAGS_URL}}/api/v1/metrics
 Authorization: Bearer {{business_key}}
 [Options]
 retry: 15
-retry-interval: 2000ms
+retry-interval: 2000
 HTTP 200
 
 # Step 4: Create customer
@@ -62,14 +60,13 @@ HTTP 201
 [Captures]
 customer_key: jsonpath "$.api_key"
 
-
 # Step 6: Verify customer key with retries
 GET {{TRACKTAGS_URL}}/api/v1/metrics
 Authorization: Bearer {{customer_key}}
 [Options]
 delay: 3000
 retry: 15
-retry-interval: 2000ms
+retry-interval: 2000
 HTTP 200
 
 # Step 7: Business creates customer metric
@@ -93,7 +90,7 @@ GET {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{cust
 Authorization: Bearer {{customer_key}}
 [Options]
 retry: 15
-retry-interval: 2000ms
+retry-interval: 2000
 HTTP 200
 
 # Step 9: Customer cannot update metric directly
@@ -120,6 +117,41 @@ HTTP 200
 [Asserts]
 jsonpath "$.status" == "allowed"
 jsonpath "$.breach_status.is_breached" == false
+
+# Step 10.5: Provision a machine for the customer (admin)
+POST {{TRACKTAGS_URL}}/admin/provision/test
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
+Content-Type: application/json
+{
+  "customer_id": "{{customer_id}}",
+  "business_id": "{{business_id}}"
+}
+HTTP 200
+
+# Step 10.6: Verify context updated with machine (via proxy headers)
+POST {{TRACKTAGS_URL}}/api/v1/proxy
+Authorization: Bearer {{customer_key}}
+Content-Type: application/json
+{
+  "scope": "customer",
+  "metric_name": "api_calls", 
+  "target_url": "{{PROXY_TARGET_URL}}",
+  "method": "GET"
+}
+HTTP 200
+
+# Step 10.6: Verify context updated with machine (via proxy headers)
+POST {{TRACKTAGS_URL}}/api/v1/proxy
+Authorization: Bearer {{customer_key}}
+Content-Type: application/json
+{
+  "scope": "customer",
+  "metric_name": "api_calls", 
+  "target_url": "{{PROXY_TARGET_URL}}",
+  "method": "GET"
+}
+HTTP 200
+# The proxy should add X-TracktTags-Owned-Machines header with machine IDs
 
 # Step 11: Business updates metric to limit
 PUT {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}

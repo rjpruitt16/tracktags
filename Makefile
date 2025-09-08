@@ -21,28 +21,29 @@ unit-test:
 # Run integration tests using Python test runner
 integration-test:
 	@echo "Running integration tests with test runner..."
-	@MOCK_MODE=true python3 test/integration/test_runner.py
+	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py
 	@echo "Cleaning up test data..."
 	@bash test/integration/cleanup_test_data.sh
 
 # Run specific test pattern
 integration-test-pattern:
 	@echo "Running integration tests matching pattern: $(PATTERN)"
-	@MOCK_MODE=true python3 test/integration/test_runner.py --pattern "$(PATTERN)"
+	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --pattern "$(PATTERN)"
 	@bash test/integration/cleanup_test_data.sh
 
 # Run integration tests with services already running
 integration-test-quick:
 	@echo "Running integration tests (assuming services running)..."
-	@MOCK_MODE=true python3 test/integration/test_runner.py --skip-services
+	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --skip-services
 	@bash test/integration/cleanup_test_data.sh
 
 # Run integration tests in verbose mode
 integration-test-verbose:
 	@echo "Running integration tests (verbose)..."
-	@MOCK_MODE=true python3 test/integration/test_runner.py --verbose
-	@bash test/integration/cleanup_test_data.sh# Run all tests locally
+	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --verbose
+	@bash test/integration/cleanup_test_data.sh
 
+# Run all tests locally
 test: unit-test integration-test
 
 # Docker commands with .env support
@@ -65,9 +66,9 @@ docker-up: docker-build
 test-docker: docker-up
 	@echo "Running tests against Docker environment..."
 	@sleep 5
-	@echo "Using ADMIN_API_KEY: $${ADMIN_API_KEY:-tk_admin_SUPER_SECRET_KEY_123456789}"
+	@echo "Using ADMIN_SECRET_KEY: $${ADMIN_SECRET_KEY:-admin_secret_key_123}"
 	hurl --test --retry 3 --retry-interval 5000 --very-verbose \
-		--variable ADMIN_API_KEY=$${ADMIN_API_KEY:-tk_admin_SUPER_SECRET_KEY_123456789} \
+		--variable ADMIN_SECRET_KEY=$${ADMIN_SECRET_KEY:-admin_secret_key_123} \
 		--variable TRACKTAGS_URL=http://localhost:8080 \
 		--variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \

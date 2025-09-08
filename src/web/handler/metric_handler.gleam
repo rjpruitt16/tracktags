@@ -1,5 +1,4 @@
 // src/web/handler/metric_handler.gleam - COMPLETE VERSION
-import actors/application
 import actors/metric_actor
 import clients/supabase_client
 import gleam/dict.{type Dict}
@@ -17,7 +16,9 @@ import gleam/string
 import glixir
 import logging
 import storage/metric_store
+import types/application_types
 import types/metric_types.{type MetricMetadata}
+import utils/auth
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -107,65 +108,57 @@ fn extract_api_key(req: Request) -> Result(String, String) {
   }
 }
 
+// In metric_handler.gleam
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
-  case extract_api_key(req) {
-    Error(error) -> {
-      logging.log(logging.Warning, "[MetricHandler] Auth failed: " <> error)
-      let error_json =
-        json.object([
-          #("error", json.string("Unauthorized")),
-          #("message", json.string(error)),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 401)
-    }
-    Ok(api_key) -> {
-      case supabase_client.validate_api_key(api_key) {
-        Ok(supabase_client.BusinessKey(business_id)) -> {
-          logging.log(
-            logging.Info,
-            "[MetricHandler] ✅ Business key validated: " <> business_id,
-          )
-          handler(business_id)
-        }
-        Ok(supabase_client.CustomerKey(business_id, customer_id)) -> {
-          logging.log(
-            logging.Info,
-            "[MetricHandler] ✅ Customer key validated: "
-              <> business_id
-              <> "/"
-              <> customer_id,
-          )
-          // ✅ return the raw business_id; scope comes from query params, not auth
-          handler(business_id)
-        }
-        Error(supabase_client.NotFound(_)) ->
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Unauthorized")),
-                #("message", json.string("Invalid API key")),
-              ]),
-            ),
-            401,
-          )
-        Error(err) -> {
-          logging.log(
-            logging.Error,
-            "[MetricHandler] Auth error: " <> string.inspect(err),
-          )
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Service error")),
-                #("message", json.string("API key validation failed")),
-              ]),
-            ),
-            500,
-          )
+  auth.with_auth(req, fn(auth_result, api_key, is_admin) {
+    case auth_result {
+      auth.ActorCached(auth.BusinessActor(business_id, _)) ->
+        handler(business_id)
+
+      auth.ActorCached(auth.CustomerActor(business_id, _, _)) ->
+        handler(business_id)
+
+      auth.DatabaseValid(supabase_client.BusinessKey(business_id)) -> {
+        case is_admin {
+          True -> {
+            // Admin shouldn't be creating metrics directly
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Forbidden")),
+                  #(
+                    "message",
+                    json.string("Admin key cannot create metrics directly"),
+                  ),
+                ]),
+              ),
+              403,
+            )
+          }
+          False -> {
+            // Ensure actor exists for future caching
+            let _ = auth.ensure_actor_from_auth(auth_result, api_key)
+            handler(business_id)
+          }
         }
       }
+
+      auth.DatabaseValid(supabase_client.CustomerKey(business_id, _)) ->
+        handler(business_id)
+
+      auth.InvalidKey(_) -> {
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Unauthorized")),
+              #("message", json.string("Invalid API key")),
+            ]),
+          ),
+          401,
+        )
+      }
     }
-  }
+  })
 }
 
 fn with_auth_typed(
@@ -409,7 +402,7 @@ fn validate_stripe_billing_interval(
 // ============================================================================
 
 fn get_application_actor() -> Result(
-  process.Subject(application.ApplicationMessage),
+  process.Subject(application_types.ApplicationMessage),
   String,
 ) {
   case
@@ -928,7 +921,7 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
 
       process.send(
         app_actor,
-        application.SendMetricToBusiness(
+        application_types.SendMetricToBusiness(
           business_id: business_id,
           metric_name: req.metric_name,
           tick_type: tick_type,
@@ -1122,7 +1115,7 @@ pub fn create_client_metric_internal(
     Ok(app_actor) -> {
       process.send(
         app_actor,
-        application.SendMetricToCustomer(
+        application_types.SendMetricToCustomer(
           business_id: business_id,
           customer_id: customer_id,
           metric_name: metric_name,

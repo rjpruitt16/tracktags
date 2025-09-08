@@ -2,7 +2,6 @@
 
 import birl
 import clients/supabase_client
-import clients/supabase_realtime_client
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -15,8 +14,6 @@ import gleam/string
 import glixir
 import logging
 import storage/metric_batch_store
-import types/business_types
-import types/customer_types
 import types/metric_types.{type MetricBatch}
 import utils/utils
 
@@ -27,8 +24,6 @@ import utils/utils
 pub type Message {
   BatchMetric(metric: MetricBatch)
   FlushInterval(tick_type: String)
-  StartRealtimeConnection
-  RealtimeReconnect(retry_count: Int)
   Shutdown
   ForceFlush
 }
@@ -124,12 +119,6 @@ pub fn start() -> Result(process.Subject(Message), actor.StartError) {
         }
       }
 
-      logging.log(logging.Info, "[SupabaseActor] ✅ SupabaseActor started")
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] 🚀 Sending StartRealtimeConnection message",
-      )
-      process.send(subject, StartRealtimeConnection)
       Ok(subject)
     }
     Error(error) -> {
@@ -267,35 +256,6 @@ fn handle_message(
       // TODO: Flush all active intervals or implement differently
       actor.continue(state)
     }
-    StartRealtimeConnection -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] 📨 Received StartRealtimeConnection message",
-      )
-      logging.log(logging.Info, "[SupabaseActor] Starting Realtime connection")
-      start_realtime_connection(0)
-      actor.continue(state)
-    }
-    RealtimeReconnect(retry_count) -> {
-      let backoff_ms = case retry_count {
-        0 -> 1000
-        1 -> 2000
-        2 -> 4000
-        3 -> 8000
-        4 -> 16_000
-        _ -> 30_000
-      }
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] 🔄 Realtime retrying in "
-          <> int.to_string(backoff_ms)
-          <> "ms...",
-      )
-
-      process.sleep(backoff_ms)
-      start_realtime_connection(retry_count)
-      actor.continue(BatchingState(..state, realtime_retry_count: retry_count))
-    }
 
     Shutdown -> {
       logging.log(logging.Info, "[SupabaseActor] 🛑 Shutdown requested")
@@ -414,151 +374,6 @@ fn flush_interval_to_supabase(
       }
 
       actor.continue(state)
-    }
-  }
-}
-
-// Public FFI functions for Elixir callbacks
-pub fn realtime_reconnect(retry_count: Int) {
-  case
-    glixir.lookup_subject(
-      utils.tracktags_registry(),
-      utils.supabase_actor_key(),
-      glixir.atom_key_encoder,
-    )
-  {
-    Ok(subj) -> {
-      process.send(subj, RealtimeReconnect(retry_count))
-    }
-    Error(err) -> {
-      logging.log(
-        logging.Error,
-        "[SupabaseActor] ❌ Registry lookup failed: " <> string.inspect(err),
-      )
-    }
-  }
-}
-
-// Update the function signature:
-pub fn process_limit_update(
-  business_id: String,
-  customer_id: String,
-  metric_name: String,
-  limit_value: Float,
-  limit_operator: String,
-  breach_action: String,
-) -> Nil {
-  case customer_id {
-    "" ->
-      notify_business_customers(
-        business_id,
-        metric_name,
-        limit_value,
-        limit_operator,
-        breach_action,
-      )
-    _ ->
-      notify_customer_actor(
-        business_id,
-        customer_id,
-        metric_name,
-        limit_value,
-        limit_operator,
-        breach_action,
-      )
-  }
-}
-
-fn start_realtime_connection(retry_count: Int) -> Nil {
-  logging.log(logging.Info, "[SupabaseActor] 🚀 Starting Realtime connection")
-
-  case supabase_realtime_client.start_realtime_connection(retry_count) {
-    supabase_realtime_client.RealtimeStarted(_) -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] ✅ Realtime connection started successfully",
-      )
-    }
-    supabase_realtime_client.RealtimeError(r) -> {
-      logging.log(
-        logging.Error,
-        "[SupabaseActor] ❌ Realtime start error: " <> r,
-      )
-    }
-  }
-}
-
-fn notify_customer_actor(
-  business_id: String,
-  customer_id: String,
-  metric_name: String,
-  limit_value: Float,
-  limit_operator: String,
-  breach_action: String,
-) -> Nil {
-  let registry_key = "client:" <> business_id <> ":" <> customer_id
-  case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
-    Ok(customer_subject) -> {
-      // Send the new message type with actual data
-      process.send(
-        customer_subject,
-        customer_types.PlanLimitChanged(
-          business_id: business_id,
-          customer_id: customer_id,
-          metric_name: metric_name,
-          new_limit_value: limit_value,
-          limit_operator: limit_operator,
-          breach_action: breach_action,
-        ),
-      )
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] ✅ Notified ClientActor: "
-          <> business_id
-          <> "/"
-          <> customer_id,
-      )
-    }
-    Error(_) -> {
-      logging.log(
-        logging.Debug,
-        "[SupabaseActor] ClientActor not found: "
-          <> business_id
-          <> "/"
-          <> customer_id,
-      )
-    }
-  }
-}
-
-fn notify_business_customers(
-  business_id: String,
-  metric_name: String,
-  limit_value: Float,
-  limit_operator: String,
-  breach_action: String,
-) -> Nil {
-  case business_types.lookup_business_subject(business_id) {
-    Ok(business_subject) -> {
-      process.send(
-        business_subject,
-        business_types.RefreshPlanLimit(
-          metric_name: metric_name,
-          new_limit_value: limit_value,
-          limit_operator: limit_operator,
-          breach_action: breach_action,
-        ),
-      )
-      logging.log(
-        logging.Info,
-        "[SupabaseActor] ✅ Sent plan refresh to BusinessActor: " <> business_id,
-      )
-    }
-    Error(_) -> {
-      logging.log(
-        logging.Debug,
-        "[SupabaseActor] BusinessActor not found: " <> business_id,
-      )
     }
   }
 }

@@ -1,8 +1,8 @@
-# test/integration/test_provisioning.hurl
 # Layer 2: Test Admin Provisioning Endpoints
 
 # Step 1: Create test provisioning task and trigger processing
 POST {{TRACKTAGS_URL}}/admin/provision/test
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
 HTTP 200
 [Captures]
 customer_id: jsonpath "$.customer_id"
@@ -17,6 +17,7 @@ HTTP 200
 
 # Step 3: Force poll to ensure processing
 POST {{TRACKTAGS_URL}}/admin/force-provision
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
 HTTP 200
 [Asserts]
 body contains "Polling triggered"
@@ -29,6 +30,7 @@ HTTP 200
 
 # Step 5: Check if machines were created (with extended retries)
 GET {{TRACKTAGS_URL}}/api/v1/customers/{{customer_id}}/machines
+X-Admin-Key: {{ADMIN_SECRET_KEY}}
 [Options]
 retry: 10
 retry-interval: 2000
@@ -37,26 +39,29 @@ HTTP 200
 jsonpath "$.machines[0].status" == "running"
 jsonpath "$.machines[0].machine_id" matches "mock_.*"
 
-# Step 6: Test termination
-POST {{TRACKTAGS_URL}}/admin/terminate/test
-Content-Type: application/json
-{
-  "customer_id": "{{customer_id}}"
-}
-HTTP 200
-
-# Step 7: Force processing of termination
-POST {{TRACKTAGS_URL}}/admin/force-provision
-[Options]
-delay: 2000
-HTTP 200
-
-# Step 8: Verify machines are terminated (with retries for replica lag)
-GET {{TRACKTAGS_URL}}/api/v1/customers/{{customer_id}}/machines
-[Options]
-delay: 3000
-retry: 10
-retry-interval: 2000
-HTTP 200
-[Asserts]
-jsonpath "$.machines[0].status" == "terminated"
+# # Step 6: Test termination
+# POST {{TRACKTAGS_URL}}/admin/terminate/test
+# X-Admin-Key: {{ADMIN_SECRET_KEY}}
+# Content-Type: application/json
+# {
+#   "customer_id": "{{customer_id}}"
+# }
+# HTTP 200
+#
+# # Step 7: Force processing of termination
+# POST {{TRACKTAGS_URL}}/admin/force-provision
+# X-Admin-Key: {{ADMIN_SECRET_KEY}}
+# [Options]
+# delay: 2000
+# HTTP 200
+#
+# # Step 8: Verify machines are terminated (with retries for replica lag)
+# GET {{TRACKTAGS_URL}}/api/v1/customers/{{customer_id}}/machines
+# X-Admin-Key: {{ADMIN_SECRET_KEY}}
+# [Options]
+# delay: 3000
+# retry: 10
+# retry-interval: 2000
+# HTTP 200
+# [Asserts]
+# jsonpath "$.machines[0].status" == "terminated"

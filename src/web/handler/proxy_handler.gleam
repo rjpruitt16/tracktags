@@ -1,6 +1,5 @@
 // src/web/handler/proxy_handler.gleam
 
-import actors/application
 import actors/metric_actor
 import clients/supabase_client
 import gleam/dict
@@ -9,6 +8,7 @@ import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/httpc
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -16,8 +16,10 @@ import gleam/result
 import gleam/string
 import glixir
 import logging
+import types/application_types
 import types/customer_types
 import types/metric_types
+import utils/auth
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -174,7 +176,7 @@ fn process_proxy_request(
                 logging.Info,
                 "[ProxyHandler] ✅ Request ALLOWED - forwarding to target",
               )
-              forward_request_to_target(req, breach_status)
+              forward_request_to_target(req, breach_status, scope, None)
             }
           }
         }
@@ -344,97 +346,196 @@ fn should_deny_request(breach_status: BreachStatus) -> Bool {
 fn forward_request_to_target(
   req: ProxyRequest,
   breach_status: BreachStatus,
+  scope: metric_types.MetricScope,
+  context: option.Option(customer_types.CustomerContext),
 ) -> Response {
   logging.log(
     logging.Info,
     "[ProxyHandler] 🚀 Forwarding request to: " <> req.target_url,
   )
 
-  let http_method = case string.uppercase(req.method) {
-    "GET" -> http.Get
-    "POST" -> http.Post
-    "PUT" -> http.Put
-    "DELETE" -> http.Delete
-    "PATCH" -> http.Patch
-    _ -> http.Get
+  // Get TracktTags URL from environment, default to localhost:8080
+  let tracktags_url = utils.get_env_or("TRACKTAGS_URL", "http://localhost:8080")
+
+  // Extract just the host:port from the URL for comparison
+  let tracktags_host = case string.split(tracktags_url, "://") {
+    [_, rest] ->
+      string.split(rest, "/") |> list.first |> result.unwrap("localhost:8080")
+    _ -> "localhost:8080"
   }
 
-  case request.to(req.target_url) {
-    Error(_) -> {
+  // Check for loops - only if target contains our actual host
+  case
+    string.contains(req.target_url, tracktags_host)
+    || string.contains(req.target_url, "/api/v1/proxy")
+  {
+    True -> {
       logging.log(
-        logging.Error,
-        "[ProxyHandler] ❌ Invalid target URL: " <> req.target_url,
+        logging.Warning,
+        "[ProxyHandler] Loop detected in target URL: " <> req.target_url,
       )
       let error_json =
         json.object([
-          #("error", json.string("Invalid URL")),
-          #("message", json.string("Target URL is malformed")),
+          #("error", json.string("Loop Detected")),
+          #("message", json.string("Cannot proxy back to TracktTags")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
-    Ok(base_req) -> {
-      let req_with_headers =
-        dict.fold(req.headers, base_req, fn(acc_req, key, value) {
-          request.set_header(acc_req, key, value)
-        })
-
-      let final_req = case http_method, req.body {
-        http.Post, Some(json_body) -> {
-          req_with_headers
-          |> request.set_method(http.Post)
-          |> request.set_body(json_body)
-        }
-        http.Put, Some(json_body) -> {
-          req_with_headers
-          |> request.set_method(http.Put)
-          |> request.set_body(json_body)
-        }
-        http.Patch, Some(json_body) -> {
-          req_with_headers
-          |> request.set_method(http.Patch)
-          |> request.set_body(json_body)
-        }
-        http.Get, None -> {
-          req_with_headers
-          |> request.set_method(http.Get)
-        }
-        http.Delete, None -> {
-          req_with_headers
-          |> request.set_method(http.Delete)
-        }
-        _, _ -> req_with_headers |> request.set_method(http_method)
-      }
-
-      case httpc.send(final_req) {
-        Ok(response) -> {
+    False -> {
+      // Check if request already has TracktTags headers (indicating it's been proxied)
+      case dict.get(req.headers, "x-tracktags-customer-id") {
+        Ok(_) -> {
           logging.log(
-            logging.Info,
-            "[ProxyHandler] ✅ Target responded with status: "
-              <> string.inspect(response.status),
-          )
-
-          let forwarded_response =
-            ForwardedResponse(
-              status_code: response.status,
-              headers: dict.from_list(response.headers),
-              body: response.body,
-            )
-
-          let success_json =
-            allowed_response_to_json(breach_status, forwarded_response)
-          wisp.json_response(json.to_string_tree(success_json), 200)
-        }
-        Error(http_error) -> {
-          logging.log(
-            logging.Error,
-            "[ProxyHandler] ❌ HTTP error: " <> string.inspect(http_error),
+            logging.Warning,
+            "[ProxyHandler] Request already proxied - TracktTags headers detected",
           )
           let error_json =
             json.object([
-              #("error", json.string("Proxy Error")),
-              #("message", json.string("Failed to forward request to target")),
+              #("error", json.string("Double Proxy Detected")),
+              #(
+                "message",
+                json.string(
+                  "Request has already been proxied through TracktTags",
+                ),
+              ),
             ])
-          wisp.json_response(json.to_string_tree(error_json), 502)
+          wisp.json_response(json.to_string_tree(error_json), 400)
+        }
+        Error(_) -> {
+          // Safe to proceed with forwarding
+          let http_method = case string.uppercase(req.method) {
+            "GET" -> http.Get
+            "POST" -> http.Post
+            "PUT" -> http.Put
+            "DELETE" -> http.Delete
+            "PATCH" -> http.Patch
+            _ -> http.Get
+          }
+
+          case request.to(req.target_url) {
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[ProxyHandler] ❌ Invalid target URL: " <> req.target_url,
+              )
+              let error_json =
+                json.object([
+                  #("error", json.string("Invalid URL")),
+                  #("message", json.string("Target URL is malformed")),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 400)
+            }
+            Ok(base_req) -> {
+              // Add forwarded headers from original request
+              let req_with_headers =
+                dict.fold(req.headers, base_req, fn(acc_req, key, value) {
+                  request.set_header(acc_req, key, value)
+                })
+
+              // Add TracktTags metadata headers based on scope and context
+              let req_with_metadata = case scope, context {
+                metric_types.Customer(bid, cid), Some(ctx) -> {
+                  let machine_ids =
+                    list.map(ctx.machines, fn(m) { m.machine_id })
+                  req_with_headers
+                  |> request.set_header("X-TracktTags-Customer-Id", cid)
+                  |> request.set_header("X-TracktTags-Business-Id", bid)
+                  |> request.set_header(
+                    "X-TracktTags-Owned-Machines",
+                    string.join(machine_ids, ","),
+                  )
+                  |> request.set_header(
+                    "X-TracktTags-Plan-Id",
+                    option.unwrap(ctx.customer.plan_id, "free"),
+                  )
+                  |> request.set_header(
+                    "X-TracktTags-Machine-Count",
+                    int.to_string(list.length(ctx.machines)),
+                  )
+                  |> request.set_header("X-TracktTags-Proxied", "true")
+                }
+                metric_types.Business(bid), _ -> {
+                  req_with_headers
+                  |> request.set_header("X-TracktTags-Business-Id", bid)
+                  |> request.set_header("X-TracktTags-Scope", "business")
+                  |> request.set_header("X-TracktTags-Proxied", "true")
+                }
+                _, _ -> {
+                  req_with_headers
+                  |> request.set_header("X-TracktTags-Proxied", "true")
+                }
+              }
+
+              // Build final request with body
+              let final_req = case http_method, req.body {
+                http.Post, Some(body) -> {
+                  req_with_metadata
+                  |> request.set_method(http.Post)
+                  |> request.set_header("Content-Type", "application/json")
+                  |> request.set_body(body)
+                }
+                http.Put, Some(body) -> {
+                  req_with_metadata
+                  |> request.set_method(http.Put)
+                  |> request.set_header("Content-Type", "application/json")
+                  |> request.set_body(body)
+                }
+                http.Patch, Some(body) -> {
+                  req_with_metadata
+                  |> request.set_method(http.Patch)
+                  |> request.set_header("Content-Type", "application/json")
+                  |> request.set_body(body)
+                }
+                http.Get, _ -> {
+                  req_with_metadata
+                  |> request.set_method(http.Get)
+                }
+                http.Delete, _ -> {
+                  req_with_metadata
+                  |> request.set_method(http.Delete)
+                }
+                _, _ -> req_with_metadata |> request.set_method(http_method)
+              }
+
+              // Send the request
+              case httpc.send(final_req) {
+                Ok(response) -> {
+                  logging.log(
+                    logging.Info,
+                    "[ProxyHandler] ✅ Target responded with status: "
+                      <> int.to_string(response.status),
+                  )
+
+                  let forwarded_response =
+                    ForwardedResponse(
+                      status_code: response.status,
+                      headers: dict.from_list(response.headers),
+                      body: response.body,
+                    )
+
+                  let success_json =
+                    allowed_response_to_json(breach_status, forwarded_response)
+                  wisp.json_response(json.to_string_tree(success_json), 200)
+                }
+                Error(http_error) -> {
+                  logging.log(
+                    logging.Error,
+                    "[ProxyHandler] ❌ HTTP error: "
+                      <> string.inspect(http_error),
+                  )
+                  let error_json =
+                    json.object([
+                      #("error", json.string("Proxy Error")),
+                      #(
+                        "message",
+                        json.string("Failed to forward request to target"),
+                      ),
+                    ])
+                  wisp.json_response(json.to_string_tree(error_json), 502)
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -609,52 +710,85 @@ fn validate_proxy_request(
 // AUTHENTICATION (Reused from other handlers)
 // ============================================================================
 
-fn extract_api_key(req: Request) -> Result(String, String) {
-  case list.key_find(req.headers, "authorization") {
-    Ok(auth_header) -> {
-      case string.split_once(auth_header, " ") {
-        Ok(#("Bearer", api_key)) -> Ok(string.trim(api_key))
-        _ -> Error("Invalid Authorization header format")
-      }
-    }
-    Error(_) -> Error("Missing Authorization header")
-  }
-}
-
+// In proxy_handler.gleam
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
-  case extract_api_key(req) {
-    Error(error) -> {
-      logging.log(logging.Warning, "[ProxyHandler] Auth failed: " <> error)
-      let error_json =
-        json.object([
-          #("error", json.string("Unauthorized")),
-          #("message", json.string(error)),
-        ])
-      wisp.json_response(json.to_string_tree(error_json), 401)
-    }
-    Ok(api_key) -> {
-      // Use new combined validation
-      case supabase_client.validate_key_with_context(api_key) {
-        Ok(supabase_client.BusinessValidation(business_id)) ->
-          handler(business_id)
-        Ok(supabase_client.CustomerValidation(business_id, customer_id, context)) ->
-          handle_customer_request_with_context(
-            req,
-            business_id,
-            customer_id,
-            context,
-          )
-        Ok(supabase_client.InvalidKey) | Error(_) -> {
-          let error_json =
+  auth.with_auth(req, fn(auth_result, api_key, is_admin) {
+    case auth_result {
+      auth.ActorCached(auth.BusinessActor(business_id, _)) ->
+        handler(business_id)
+
+      auth.ActorCached(auth.CustomerActor(business_id, customer_id, _)) -> {
+        // Fetch context for customer
+        case
+          supabase_client.get_customer_full_context(business_id, customer_id)
+        {
+          Ok(context) ->
+            handle_customer_request_with_context(
+              req,
+              business_id,
+              customer_id,
+              context,
+            )
+          Error(_) ->
+            wisp.internal_server_error()
+            |> wisp.string_body("Failed to get customer context")
+        }
+      }
+
+      auth.DatabaseValid(supabase_client.BusinessKey(business_id)) -> {
+        case is_admin {
+          True -> {
+            // Admin shouldn't use proxy directly
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Forbidden")),
+                  #(
+                    "message",
+                    json.string("Admin key cannot use proxy endpoint"),
+                  ),
+                ]),
+              ),
+              403,
+            )
+          }
+          False -> {
+            let _ = auth.ensure_actor_from_auth(auth_result, api_key)
+            handler(business_id)
+          }
+        }
+      }
+
+      auth.DatabaseValid(supabase_client.CustomerKey(business_id, customer_id)) -> {
+        case
+          supabase_client.get_customer_full_context(business_id, customer_id)
+        {
+          Ok(context) ->
+            handle_customer_request_with_context(
+              req,
+              business_id,
+              customer_id,
+              context,
+            )
+          Error(_) ->
+            wisp.internal_server_error()
+            |> wisp.string_body("Failed to get customer context")
+        }
+      }
+
+      auth.InvalidKey(_) -> {
+        wisp.json_response(
+          json.to_string_tree(
             json.object([
               #("error", json.string("Unauthorized")),
               #("message", json.string("Invalid API key")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 401)
-        }
+            ]),
+          ),
+          401,
+        )
       }
     }
-  }
+  })
 }
 
 fn handle_customer_request_with_context(
@@ -711,12 +845,16 @@ fn ensure_and_update_customer_actor(
   case get_application_actor() {
     Ok(app_actor) -> {
       let reply = process.new_subject()
+
+      // Send with api_key empty string since we don't have it here
       process.send(
         app_actor,
-        application.EnsureCustomerActor(
+        application_types.EnsureCustomerActor(
           business_id,
           customer_id,
           context,
+          "",
+          // Empty API key since we're already authenticated
           reply,
         ),
       )
@@ -733,7 +871,7 @@ fn ensure_and_update_customer_actor(
 
 // Add this function near the bottom of proxy_handler.gleam (around line 700)
 fn get_application_actor() -> Result(
-  process.Subject(application.ApplicationMessage),
+  process.Subject(application_types.ApplicationMessage),
   String,
 ) {
   case
