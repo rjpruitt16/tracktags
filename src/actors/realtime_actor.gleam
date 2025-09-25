@@ -2,6 +2,7 @@
 import clients/supabase_realtime_client
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleam/otp/actor
 import gleam/result
@@ -79,9 +80,27 @@ fn handle_message(state: State, msg: Message) -> actor.Next(State, Message) {
     }
 
     Reconnect(count) -> {
+      // Simple exponential backoff with pattern matching
+      let delay_seconds = case count {
+        0 -> 1
+        1 -> 2
+        2 -> 4
+        3 -> 8
+        4 -> 16
+        5 -> 32
+        _ -> 60
+        // Max out at 60 seconds
+      }
+
+      let delay_ms = delay_seconds * 1000
+      process.sleep(delay_ms)
+
       logging.log(
         logging.Info,
-        "[RealtimeActor] Reconnecting, attempt: " <> string.inspect(count),
+        "[RealtimeActor] Reconnecting after "
+          <> int.to_string(delay_seconds)
+          <> "s, attempt: "
+          <> int.to_string(count),
       )
 
       case supabase_realtime_client.start_realtime_connection(count) {
@@ -94,7 +113,8 @@ fn handle_message(state: State, msg: Message) -> actor.Next(State, Message) {
             logging.Error,
             "[RealtimeActor] Reconnect failed: " <> reason,
           )
-          actor.continue(State(retry_count: count))
+          actor.continue(State(retry_count: count + 1))
+          // Increment for next time
         }
       }
     }
