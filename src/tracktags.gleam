@@ -32,10 +32,11 @@ pub fn start_link() -> Result(process.Pid, String) {
   logging.log(logging.Info, "[Main] start_link called")
   // crash if doesn't have resend key
   let _resend_key = utils.require_env("RESEND_API_KEY")
-  let port_str = utils.get_env_or("TRACKTAGS_PORT", "8080")
+
+  let port_str = utils.get_env_or("TRACKTAGS_PORT", "4001")
   let port = case int.parse(port_str) {
     Ok(p) -> p
-    Error(_) -> 8080
+    Error(_) -> 4001
   }
 
   let bind_address = utils.get_env_or("BIND_ADDRESS", "127.0.0.1")
