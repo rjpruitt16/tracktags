@@ -36,25 +36,13 @@ jobs:
           echo "SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}" >> .env
           echo "SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}" >> .env
           echo "SUPABASE_REALTIME_URL=${{ secrets.SUPABASE_REALTIME_URL }}" >> .env
-          echo "ADMIN_API_KEY=${{ secrets.ADMIN_API_KEY }}" >> .env
+          echo "ADMIN_SECRET_KEY=${{ secrets.ADMIN_SECRET_KEY }}" >> .env
           echo "ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}" >> .env
+          echo "RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}" >> .env
           echo "SELF_HOSTED=false" >> .env
       
-      - name: Run Docker integration tests with retry
-        uses: nick-fields/retry@v2
-        continue-on-error: true  # Don't fail the whole workflow
-        with:
-          timeout_minutes: 10
-          max_attempts: 3
-          retry_wait_seconds: 30
-          command: make test-docker
-          warning_on_retry: true
-          on_retry_command: |
-            echo "Test failed, showing Docker logs..."
-            docker compose -f docker-compose.test.yml logs --tail=50
-            echo "Cleaning up before retry..."
-            docker compose -f docker-compose.test.yml down
-            docker system prune -f
+      - name: Run Docker integration tests
+        run: make test-docker  
   
   release:
     needs: test

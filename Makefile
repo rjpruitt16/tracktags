@@ -50,7 +50,7 @@ test-docker:
 		--variable TRACKTAGS_URL=http://localhost:8080 \
 		--variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \
-		test/integration/test_proxy_forward.hurl || \
+		test/integration/*.hurl || \
 		(echo "Test failed, showing container logs:"; \
 		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
 		 exit 1)
