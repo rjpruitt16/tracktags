@@ -5,6 +5,7 @@ import gleam/result
 import gleam/string
 import logging
 import mist
+import utils/cachex
 import utils/utils
 import web/router
 import wisp
@@ -45,6 +46,13 @@ pub fn start_link() -> Result(process.Pid, String) {
     "[Main] Config: " <> bind_address <> ":" <> int.to_string(port),
   )
 
+  let cache_opts = []
+  // Empty list - use defaults
+  case cachex.start_link("domain_cache", cache_opts) {
+    Ok(_) -> logging.log(logging.Info, "Domain cache started")
+    Error(e) ->
+      logging.log(logging.Warning, "Cache start failed: " <> string.inspect(e))
+  }
   let self_hosted =
     string.lowercase(utils.get_env_or("SELF_HOSTED", "false")) == "true"
 

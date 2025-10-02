@@ -187,7 +187,13 @@ pub fn extract_api_key(req: Request) -> Result(String, String) {
 
 ///  Check for admin key in X-Admin-Key header
 fn check_admin_key(req: Request) -> Bool {
-  case list.key_find(req.headers, "x-admin-key") {
+  // Try both cases since HTTP headers should be case-insensitive
+  let admin_key_result = case list.key_find(req.headers, "x-admin-key") {
+    Ok(key) -> Ok(key)
+    Error(_) -> list.key_find(req.headers, "X-Admin-Key")
+  }
+
+  case admin_key_result {
     Ok(admin_key) -> {
       let expected = utils.require_env("ADMIN_SECRET_KEY")
       logging.log(
@@ -197,18 +203,10 @@ fn check_admin_key(req: Request) -> Bool {
           <> ", expected length: "
           <> int.to_string(string.length(expected)),
       )
-      // Log first few characters for debugging
-      logging.log(
-        logging.Info,
-        "[Auth] Received starts with: "
-          <> string.slice(admin_key, 0, 5)
-          <> ", Expected starts with: "
-          <> string.slice(expected, 0, 5),
-      )
       admin_key == expected
     }
     Error(_) -> {
-      logging.log(logging.Info, "[Auth] No X-Admin-Key header found")
+      logging.log(logging.Info, "[Auth] No admin key header found")
       False
     }
   }

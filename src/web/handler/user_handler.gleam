@@ -605,8 +605,7 @@ pub fn create_business(req: Request) -> Response {
           }
 
           Ok(#(business_name, email)) -> {
-            let business_id = "biz_" <> utils.generate_random()
-
+            let business_id = "biz_" <> utils.generate_uuid()
             case
               supabase_client.create_business(business_id, business_name, email)
             {

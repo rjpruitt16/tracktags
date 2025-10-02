@@ -18,33 +18,8 @@ build:
 unit-test:
 	MOCK_MODE=true gleam test
 
-# Run integration tests using Python test runner
-integration-test:
-	@echo "Running integration tests with test runner..."
-	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py
-	@echo "Cleaning up test data..."
-	@bash test/integration/cleanup_test_data.sh
-
-# Run specific test pattern
-integration-test-pattern:
-	@echo "Running integration tests matching pattern: $(PATTERN)"
-	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --pattern "$(PATTERN)"
-	@bash test/integration/cleanup_test_data.sh
-
-# Run integration tests with services already running
-integration-test-quick:
-	@echo "Running integration tests (assuming services running)..."
-	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --skip-services
-	@bash test/integration/cleanup_test_data.sh
-
-# Run integration tests in verbose mode
-integration-test-verbose:
-	@echo "Running integration tests (verbose)..."
-	@MOCK_MODE=true ADMIN_SECRET_KEY=admin_secret_key_123 python3 test/integration/test_runner.py --verbose
-	@bash test/integration/cleanup_test_data.sh
-
 # Run all tests locally
-test: unit-test integration-test
+test: unit-test 
 
 # Docker commands with .env support
 docker-build: $(DOCKER_BUILD_STAMP)
@@ -52,6 +27,7 @@ docker-build: $(DOCKER_BUILD_STAMP)
 $(DOCKER_BUILD_STAMP): Dockerfile $(shell find src -type f -name "*.gleam") gleam.toml manifest.toml
 	docker build -t tracktags .
 	@touch $(DOCKER_BUILD_STAMP)
+
 
 docker-up: docker-build
 	@echo "Cleaning up old containers..."
@@ -63,12 +39,14 @@ docker-up: docker-build
 	@docker ps | grep tracktags
 	@curl -f http://localhost:8080/health || docker logs tracktags-tracktags-1 | tail -20
 
-test-docker: docker-up
+test-docker:
+	@if [ "$(REBUILD)" = "true" ]; then rm -f $(DOCKER_BUILD_STAMP); fi
+	@$(MAKE) docker-up
 	@echo "Running tests against Docker environment..."
 	@sleep 5
-	@echo "Using ADMIN_SECRET_KEY: $${ADMIN_SECRET_KEY:-admin_secret_key_123}"
+	@echo "Using ADMIN_SECRET_KEY: $${ADMIN_SECRET_KEY}"
 	hurl --test --retry 3 --retry-interval 5000 --very-verbose \
-		--variable ADMIN_SECRET_KEY=$${ADMIN_SECRET_KEY:-admin_secret_key_123} \
+		--variable ADMIN_SECRET_KEY=$${ADMIN_SECRET_KEY} \
 		--variable TRACKTAGS_URL=http://localhost:8080 \
 		--variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \
@@ -78,6 +56,7 @@ test-docker: docker-up
 		 exit 1)
 	@bash test/integration/cleanup_test_data.sh
 	@make docker-down
+
 
 docker-down:
 	docker compose -f docker-compose.test.yml down
