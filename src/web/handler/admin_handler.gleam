@@ -116,6 +116,7 @@ pub fn override_subscription_status(
                   // status second
                   option.unwrap(price_id, "price_unknown"),
                   // price_id third
+                  None,
                 )
               {
                 Ok(_) -> {

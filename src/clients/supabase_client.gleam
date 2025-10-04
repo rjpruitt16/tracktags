@@ -701,17 +701,24 @@ pub fn create_business(
 // For TrackTags platform webhooks
 pub fn update_business_subscription(
   stripe_customer_id: String,
-  // TrackTags customer
   status: String,
   price_id: String,
+  subscription_ends_at: Option(Int),
 ) -> Result(response.Response(String), SupabaseError) {
-  // Update businesses table WHERE stripe_customer_id matches
-  let update_json =
-    json.object([
-      #("stripe_subscription_status", json.string(status)),
-      #("stripe_price_id", json.string(price_id)),
-    ])
+  let base_fields = [
+    #("subscription_status", json.string(status)),
+    #("stripe_price_id", json.string(price_id)),
+  ]
 
+  let all_fields = case subscription_ends_at {
+    Some(timestamp) -> [
+      #("subscription_ends_at", json.string(utils.unix_to_iso8601(timestamp))),
+      ..base_fields
+    ]
+    None -> base_fields
+  }
+
+  let update_json = json.object(all_fields)
   let url = "/businesses?stripe_customer_id=eq." <> stripe_customer_id
   make_request(http.Patch, url, Some(json.to_string(update_json)))
 }

@@ -40,6 +40,7 @@ pub type StripeData {
     status: Option(String),
     price_id: Option(String),
     metadata: Option(Dict(String, String)),
+    current_period_end: Option(Int),
   )
 }
 
@@ -382,12 +383,19 @@ fn stripe_data_decoder() -> decode.Decoder(StripeData) {
     decode.optional(decode.dict(decode.string, decode.string)),
   )
 
+  use current_period_end <- decode.optional_field(
+    "current_period_end",
+    None,
+    decode.optional(decode.int),
+  )
+
   decode.success(StripeData(
     customer,
     subscription_id,
     status,
     price_id,
     metadata,
+    current_period_end,
   ))
 }
 
@@ -556,6 +564,7 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
               stripe_customer_id,
               status,
               price_id,
+              event.data.current_period_end,
             )
           {
             Ok(_) -> Success("Subscription updated for existing customer")
@@ -582,6 +591,7 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
                           stripe_customer_id,
                           status,
                           price_id,
+                          event.data.current_period_end,
                         )
                       {
                         Ok(_) -> Success("New subscription created and mapped")
@@ -626,6 +636,7 @@ fn handle_subscription_updated(event: StripeEvent) -> WebhookResult {
           stripe_customer_id,
           status,
           price_id,
+          event.data.current_period_end,
         )
       {
         Ok(_) -> Success("Subscription updated")
@@ -705,6 +716,7 @@ fn handle_payment_failure_gracefully(
       // status
       option.unwrap(data.price_id, "unknown"),
       // price_id
+      None,
     )
   {
     Ok(_) -> {
@@ -743,6 +755,7 @@ fn handle_subscription_cancellation(
           customer_id,
           "canceled",
           option.unwrap(data.price_id, "unknown"),
+          None,
         )
       {
         Ok(_) -> {
@@ -813,6 +826,7 @@ fn update_business_plan_after_payment(
           customer_id,
           "active",
           option.unwrap(data.price_id, "unknown"),
+          None,
         )
       {
         Ok(_) -> {
