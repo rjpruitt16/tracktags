@@ -996,6 +996,55 @@ fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
 // BUSINESS PLAN LIMITS MANAGEMENT
 // ============================================================================
 
+/// Link a user to a business
+pub fn link_user_to_business(
+  user_id: String,
+  business_id: String,
+  role: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Linking user "
+      <> user_id
+      <> " to business "
+      <> business_id
+      <> " with role "
+      <> role,
+  )
+
+  let link_data =
+    json.object([
+      #("user_id", json.string(user_id)),
+      #("business_id", json.string(business_id)),
+      #("role", json.string(role)),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/user_businesses",
+    Some(json.to_string(link_data)),
+  ))
+
+  case response.status {
+    201 | 200 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ User linked to business successfully",
+      )
+      Ok(Nil)
+    }
+    409 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] User already linked to business",
+      )
+      Ok(Nil)
+      // Not an error - idempotent
+    }
+    _ -> Error(DatabaseError("Failed to link user to business"))
+  }
+}
+
 /// Create a business-level plan limit
 pub fn create_business_plan_limit(
   business_id: String,

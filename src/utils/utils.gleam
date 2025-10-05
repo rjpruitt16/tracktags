@@ -5,6 +5,7 @@ import gleam/erlang/atom
 import gleam/int
 import gleam/option.{None, Some}
 import gleam/string
+import gluid
 import logging
 
 // ============================================================================
@@ -124,14 +125,6 @@ pub fn unix_to_iso8601(unix_timestamp: Int) -> String {
   birl.to_iso8601(dt)
 }
 
-@external(erlang, "uuid", "uuid_to_string")
-fn uuid_to_string(uuid: a, format: b) -> String
-
-@external(erlang, "uuid", "get_v4")
-fn get_v4_uuid() -> a
-
 pub fn generate_uuid() -> String {
-  let uuid = get_v4_uuid()
-  let format = atom.create("default")
-  uuid_to_string(uuid, format)
+  gluid.guidv4()
 }

@@ -588,7 +588,12 @@ pub fn create_business(req: Request) -> Response {
         let decoder = {
           use business_name <- decode.field("business_name", decode.string)
           use email <- decode.field("email", decode.string)
-          decode.success(#(business_name, email))
+          use user_id <- decode.optional_field(
+            "user_id",
+            None,
+            decode.optional(decode.string),
+          )
+          decode.success(#(business_name, email, user_id))
         }
 
         case decode.run(json_data, decoder) {
@@ -604,8 +609,9 @@ pub fn create_business(req: Request) -> Response {
             )
           }
 
-          Ok(#(business_name, email)) -> {
+          Ok(#(business_name, email, user_id)) -> {
             let business_id = "biz_" <> utils.generate_uuid()
+
             case
               supabase_client.create_business(business_id, business_name, email)
             {
@@ -615,16 +621,66 @@ pub fn create_business(req: Request) -> Response {
                   "[UserHandler] Created business: " <> business.business_id,
                 )
 
-                wisp.json_response(
-                  json.to_string_tree(
-                    json.object([
-                      #("business_id", json.string(business.business_id)),
-                      #("business_name", json.string(business.business_name)),
-                      #("email", json.string(business.email)),
-                    ]),
-                  ),
-                  201,
-                )
+                // If user_id provided, link user to business
+                let link_result = case user_id {
+                  Some(uid) -> {
+                    logging.log(
+                      logging.Info,
+                      "[UserHandler] Linking user "
+                        <> uid
+                        <> " to business "
+                        <> business_id,
+                    )
+                    supabase_client.link_user_to_business(
+                      uid,
+                      business_id,
+                      "owner",
+                    )
+                  }
+                  None -> Ok(Nil)
+                }
+
+                case link_result {
+                  Ok(_) -> {
+                    wisp.json_response(
+                      json.to_string_tree(
+                        json.object([
+                          #("business_id", json.string(business.business_id)),
+                          #(
+                            "business_name",
+                            json.string(business.business_name),
+                          ),
+                          #("email", json.string(business.email)),
+                        ]),
+                      ),
+                      201,
+                    )
+                  }
+                  Error(err) -> {
+                    logging.log(
+                      logging.Error,
+                      "[UserHandler] Failed to link user to business: "
+                        <> string.inspect(err),
+                    )
+                    // Business was created but linking failed
+                    wisp.json_response(
+                      json.to_string_tree(
+                        json.object([
+                          #("error", json.string("Partial Success")),
+                          #(
+                            "message",
+                            json.string(
+                              "Business created but user linking failed",
+                            ),
+                          ),
+                          #("business_id", json.string(business.business_id)),
+                        ]),
+                      ),
+                      207,
+                      // Multi-Status
+                    )
+                  }
+                }
               }
 
               Error(err) -> {
