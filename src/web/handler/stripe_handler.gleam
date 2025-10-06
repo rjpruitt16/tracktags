@@ -121,7 +121,6 @@ pub fn handle_stripe_webhook(req: Request) -> Response {
 
 // Add this new function for deduplication
 fn process_webhook_with_dedup(body: String, signature: String) -> Response {
-  // First parse the event to get the ID
   case parse_stripe_event(body) {
     Error(err) -> {
       logging.log(logging.Error, "[StripeWebhook] Parse error: " <> err)
@@ -129,17 +128,23 @@ fn process_webhook_with_dedup(body: String, signature: String) -> Response {
     }
     Ok(event) -> {
       // Check if already processed
-      case check_and_record_event(event.id, event.event_type, body) {
+      case
+        check_and_record_event(
+          event.id,
+          event.event_type,
+          body,
+          "platform",
+          None,
+        )
+      {
         Error(supabase_client.DatabaseError(msg)) -> {
           case string.contains(msg, "already exists") {
             True -> {
-              // Already processed - return success to stop Stripe retries
               logging.log(
                 logging.Info,
                 "[StripeWebhook] Event already processed: " <> event.id,
               )
-              wisp.ok()
-              |> wisp.string_body("{\"received\": true}")
+              wisp.ok() |> wisp.string_body("{\"received\": true}")
             }
             False -> {
               logging.log(
@@ -161,27 +166,55 @@ fn process_webhook_with_dedup(body: String, signature: String) -> Response {
           // Now verify signature and process
           case verify_and_process(body, signature) {
             Success(message) -> {
+              // Mark as completed
+              let _ =
+                supabase_client.update_stripe_event_status(
+                  event.id,
+                  "completed",
+                  None,
+                )
               logging.log(logging.Info, "[StripeWebhook] Success: " <> message)
-              wisp.ok()
-              |> wisp.string_body("{\"received\": true}")
+              wisp.ok() |> wisp.string_body("{\"received\": true}")
             }
             InvalidSignature -> {
+              // Send to DLQ
+              let _ =
+                supabase_client.update_stripe_event_status(
+                  event.id,
+                  "failed",
+                  Some("Invalid signature"),
+                )
               logging.log(logging.Error, "[StripeWebhook] Invalid signature")
-              wisp.bad_request()
+              // Return 200 to stop Stripe retries - we'll handle manually
+              wisp.ok() |> wisp.string_body("{\"received\": true}")
             }
             InvalidPayload(err) -> {
+              // Send to DLQ
+              let _ =
+                supabase_client.update_stripe_event_status(
+                  event.id,
+                  "failed",
+                  Some("Invalid payload: " <> err),
+                )
               logging.log(
                 logging.Error,
                 "[StripeWebhook] Invalid payload: " <> err,
               )
-              wisp.bad_request()
+              wisp.ok() |> wisp.string_body("{\"received\": true}")
             }
             ProcessingError(err) -> {
+              // Send to DLQ
+              let _ =
+                supabase_client.update_stripe_event_status(
+                  event.id,
+                  "failed",
+                  Some("Processing error: " <> err),
+                )
               logging.log(
                 logging.Error,
                 "[StripeWebhook] Processing error: " <> err,
               )
-              wisp.internal_server_error()
+              wisp.ok() |> wisp.string_body("{\"received\": true}")
             }
           }
         }
@@ -351,7 +384,7 @@ fn extract_signature_parts(
 }
 
 /// Parse Stripe webhook event JSON
-fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
+pub fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
   case json.parse(json_string, stripe_event_decoder()) {
     Error(_) -> Error("Invalid JSON format")
     Ok(event) -> Ok(event)
@@ -420,7 +453,7 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
 }
 
 /// Process parsed Stripe event based on type
-fn process_stripe_event(event: StripeEvent) -> WebhookResult {
+pub fn process_stripe_event(event: StripeEvent) -> WebhookResult {
   logging.log(
     logging.Info,
     "[StripeHandler] Processing Stripe event: " <> event.id,
@@ -1189,10 +1222,13 @@ fn fetch_stripe_event_from_api(
 }
 
 // Record event to prevent duplicates
+// Update check_and_record_event to pass source
 fn check_and_record_event(
   event_id: String,
   event_type: StripeEventType,
   raw_payload: String,
+  source: String,
+  source_business_id: Option(String),
 ) -> Result(Nil, supabase_client.SupabaseError) {
   let event_type_string = case event_type {
     InvoicePaymentSucceeded -> "invoice.payment_succeeded"
@@ -1208,10 +1244,10 @@ fn check_and_record_event(
     event_id,
     event_type_string,
     None,
-    // business_id - will be extracted from event
     None,
-    // customer_id - will be extracted from event
     raw_payload,
+    source,
+    source_business_id,
   )
 }
 
@@ -1228,7 +1264,15 @@ fn process_webhook_with_dedup_for_business(
       // Check if already processed (with business prefix to avoid collisions)
       let prefixed_event_id = "biz_" <> business_id <> "_" <> event.id
 
-      case check_and_record_event(prefixed_event_id, event.event_type, body) {
+      case
+        check_and_record_event(
+          prefixed_event_id,
+          event.event_type,
+          body,
+          "business",
+          Some(business_id),
+        )
+      {
         Error(supabase_client.DatabaseError(msg)) -> {
           case string.contains(msg, "already exists") {
             True -> Success("Event already processed")

@@ -1,5 +1,6 @@
 // src/web/handler/user_handler.gleam=
 import clients/supabase_client
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
@@ -11,6 +12,7 @@ import gleam/string
 import glixir
 import logging
 import types/customer_types
+import utils/audit
 import utils/auth
 import utils/utils
 import wisp.{type Request, type Response}
@@ -747,6 +749,19 @@ pub fn delete_business(req: Request, business_id: String) -> Response {
               supabase_client.soft_delete_business(business_id, user_id, reason)
             {
               Ok(message) -> {
+                // In delete_business - after successful delete (around line 820)
+                let _ =
+                  audit.log_action(
+                    "delete_business",
+                    "business",
+                    business_id,
+                    dict.from_list([
+                      #("reason", case reason {
+                        Some(r) -> json.string(r)
+                        None -> json.string("No reason provided")
+                      }),
+                    ]),
+                  )
                 wisp.json_response(
                   json.to_string_tree(
                     json.object([
@@ -805,6 +820,14 @@ pub fn restore_business(req: Request, business_id: String) -> Response {
       True -> {
         case supabase_client.restore_deleted_business(business_id) {
           Ok(message) -> {
+            // In restore_business - after successful restore (around line 865)
+            let _ =
+              audit.log_action(
+                "restore_business",
+                "business",
+                business_id,
+                dict.new(),
+              )
             wisp.json_response(
               json.to_string_tree(
                 json.object([

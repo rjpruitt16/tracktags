@@ -98,7 +98,7 @@ fn load_client_plan_limits(
   case supabase_client.get_customer_by_id(business_id, customer_id) {
     Ok(customer) -> {
       // Try stripe_product_id first (from customers table)
-      case customer.stripe_product_id {
+      case customer.stripe_price_id {
         Some(product_id) -> {
           logging.log(
             logging.Info,

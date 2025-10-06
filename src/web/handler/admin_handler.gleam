@@ -8,9 +8,11 @@ import gleam/erlang/process
 import gleam/http
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import logging
+import utils/audit
 import utils/auth
 import utils/utils
 import web/handler/stripe_handler
@@ -127,6 +129,15 @@ pub fn override_subscription_status(
                       <> " -> "
                       <> status,
                   )
+                  let _ =
+                    audit.log_action(
+                      "override_subscription",
+                      "business",
+                      business_id,
+                      dict.from_list([
+                        #("new_status", json.string(status)),
+                      ]),
+                    )
                   let success_json =
                     json.object([
                       #("status", json.string("success")),
@@ -386,4 +397,105 @@ fn parse_override_request(
     Error(errors) ->
       Error("Invalid override payload: " <> string.inspect(errors))
   }
+}
+
+// ============================================================================
+// DLQ (DEAD LETTER QUEUE) ENDPOINTS
+// ============================================================================
+
+pub fn list_failed_webhooks(req: Request) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Get)
+
+  case supabase_client.get_failed_stripe_events(50) {
+    Ok(events) -> {
+      let events_json =
+        events
+        |> list.map(fn(event) {
+          json.object([
+            #("event_id", json.string(event.event_id)),
+            #("event_type", json.string(event.event_type)),
+            #("status", json.string(event.status)),
+            #("retry_count", json.int(event.retry_count)),
+            #("error_message", case event.error_message {
+              Some(msg) -> json.string(msg)
+              None -> json.null()
+            }),
+            #("created_at", json.string(event.created_at)),
+          ])
+        })
+        |> json.array(from: _, of: fn(x) { x })
+
+      wisp.json_response(
+        json.to_string_tree(json.object([#("events", events_json)])),
+        200,
+      )
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+pub fn retry_webhook(req: Request, event_id: String) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Post)
+
+  logging.log(logging.Info, "[AdminHandler] Retrying webhook: " <> event_id)
+
+  case supabase_client.get_stripe_event_by_id(event_id) {
+    Ok(event) -> {
+      // Reprocess it
+      case parse_stripe_event(event.raw_payload) {
+        Ok(parsed_event) -> {
+          case stripe_handler.process_stripe_event(parsed_event) {
+            stripe_handler.Success(_) -> {
+              let _ =
+                supabase_client.update_stripe_event_status(
+                  event_id,
+                  "completed",
+                  None,
+                )
+              let _ =
+                audit.log_action(
+                  "retry_webhook",
+                  "stripe_event",
+                  event_id,
+                  dict.new(),
+                )
+              wisp.ok() |> wisp.string_body("Retry successful")
+            }
+            _ -> {
+              let _ = supabase_client.increment_retry_count(event_id)
+              wisp.internal_server_error()
+              |> wisp.string_body("Retry failed")
+            }
+          }
+        }
+        Error(e) -> wisp.bad_request() |> wisp.string_body(e)
+      }
+    }
+    Error(_) -> wisp.not_found()
+  }
+}
+
+// ============================================================================
+// AUDIT LOG ENDPOINTS
+// ============================================================================
+
+pub fn list_audit_logs(req: Request) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Get)
+
+  // TODO: Add query params for filtering
+  case supabase_client.get_audit_logs(100, None, None) {
+    Ok(_logs) -> {
+      // Return audit logs
+      wisp.ok() |> wisp.string_body("Audit logs endpoint")
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+// Helper to parse Stripe event (make public in stripe_handler)
+fn parse_stripe_event(json_string: String) {
+  stripe_handler.parse_stripe_event(json_string)
 }

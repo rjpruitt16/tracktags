@@ -645,6 +645,279 @@ pub fn get_plan_limits_by_stripe_price_id(
 }
 
 // ============================================================================
+// DLQ FUNCTIONS
+// ============================================================================
+
+pub type StripeEventRecord {
+  StripeEventRecord(
+    event_id: String,
+    event_type: String,
+    status: String,
+    retry_count: Int,
+    raw_payload: String,
+    error_message: Option(String),
+    created_at: String,
+  )
+}
+
+fn stripe_event_decoder() -> decode.Decoder(StripeEventRecord) {
+  use event_id <- decode.field("event_id", decode.string)
+  use event_type <- decode.field("event_type", decode.string)
+  use status <- decode.field("status", decode.string)
+  use retry_count <- decode.optional_field("retry_count", 0, decode.int)
+  use raw_payload <- decode.field("raw_payload", decode.string)
+  use error_message <- decode.optional_field(
+    "error_message",
+    None,
+    decode.optional(decode.string),
+  )
+  use created_at <- decode.field("created_at", decode.string)
+
+  decode.success(StripeEventRecord(
+    event_id,
+    event_type,
+    status,
+    retry_count,
+    raw_payload,
+    error_message,
+    created_at,
+  ))
+}
+
+pub fn get_failed_stripe_events(
+  limit: Int,
+) -> Result(List(StripeEventRecord), SupabaseError) {
+  let path =
+    "/stripe_events?status=eq.failed&order=created_at.desc&limit="
+    <> int.to_string(limit)
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(stripe_event_decoder())) {
+        Ok(events) -> Ok(events)
+        Error(_) -> Error(ParseError("Invalid events"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get failed events"))
+  }
+}
+
+pub fn get_stripe_event_by_id(
+  event_id: String,
+) -> Result(StripeEventRecord, SupabaseError) {
+  let path = "/stripe_events?event_id=eq." <> event_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(stripe_event_decoder())) {
+        Ok([event]) -> Ok(event)
+        Ok([]) -> Error(NotFound("Event not found"))
+        _ -> Error(ParseError("Invalid response"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get event"))
+  }
+}
+
+pub fn increment_retry_count(event_id: String) -> Result(Nil, SupabaseError) {
+  let body =
+    json.object([#("p_event_id", json.string(event_id))]) |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/increment_stripe_event_retry",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to increment retry count"))
+  }
+}
+
+// ============================================================================
+// AUDIT LOG FUNCTIONS
+// ============================================================================
+
+pub fn insert_audit_log(
+  actor_id: String,
+  action: String,
+  resource_type: String,
+  resource_id: String,
+  details: json.Json,
+) -> Result(Nil, SupabaseError) {
+  let body =
+    json.object([
+      #("actor_id", json.string(actor_id)),
+      #("action", json.string(action)),
+      #("resource_type", json.string(resource_type)),
+      #("resource_id", json.string(resource_id)),
+      #("details", details),
+    ])
+    |> json.to_string()
+
+  use response <- result.try(make_request(http.Post, "/audit_logs", Some(body)))
+
+  case response.status {
+    201 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to insert audit log"))
+  }
+}
+
+pub fn get_audit_logs(
+  limit: Int,
+  actor_id: Option(String),
+  resource_type: Option(String),
+) -> Result(List(json.Json), SupabaseError) {
+  let base_path =
+    "/audit_logs?order=created_at.desc&limit=" <> int.to_string(limit)
+
+  let actor_filter = case actor_id {
+    Some(id) -> "&actor_id=eq." <> id
+    None -> ""
+  }
+
+  let type_filter = case resource_type {
+    Some(rt) -> "&resource_type=eq." <> rt
+    None -> ""
+  }
+
+  let path = base_path <> actor_filter <> type_filter
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      // Return raw JSON - frontend will decode
+      Ok([])
+    }
+    _ -> Error(DatabaseError("Failed to get audit logs"))
+  }
+}
+
+// ============================================================================
+// RECONCILIATION FUNCTIONS
+// ============================================================================
+
+pub fn get_active_stripe_subscriptions() -> Result(
+  List(business_types.Business),
+  SupabaseError,
+) {
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/get_active_stripe_subscriptions",
+    None,
+  ))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(business_types.business_decoder()),
+        )
+      {
+        Ok(businesses) -> Ok(businesses)
+        Error(_) -> Error(ParseError("Invalid businesses"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get active subscriptions"))
+  }
+}
+
+pub fn get_businesses_with_stripe_integration() -> Result(
+  List(String),
+  SupabaseError,
+) {
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/get_businesses_with_stripe_integration",
+    None,
+  ))
+
+  case response.status {
+    200 -> {
+      let decoder = decode.field("business_id", decode.string, decode.success)
+      case json.parse(response.body, decode.list(decoder)) {
+        Ok(business_ids) -> Ok(business_ids)
+        Error(_) -> Error(ParseError("Invalid business IDs"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get businesses"))
+  }
+}
+
+pub fn get_business_active_customers(
+  business_id: String,
+) -> Result(List(customer_types.Customer), SupabaseError) {
+  let body =
+    json.object([#("p_business_id", json.string(business_id))])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/get_business_active_customers",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok(customers) -> Ok(customers)
+        Error(_) -> Error(ParseError("Invalid customers"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get active customers"))
+  }
+}
+
+pub fn insert_reconciliation_record(
+  reconciliation_type: String,
+  business_id: Option(String),
+  total_checked: Int,
+  mismatches_found: Int,
+  mismatches_fixed: Int,
+  errors_encountered: Int,
+  details: json.Json,
+) -> Result(Nil, SupabaseError) {
+  let body =
+    json.object([
+      #("reconciliation_type", json.string(reconciliation_type)),
+      #("business_id", case business_id {
+        Some(id) -> json.string(id)
+        None -> json.null()
+      }),
+      #("total_checked", json.int(total_checked)),
+      #("mismatches_found", json.int(mismatches_found)),
+      #("mismatches_fixed", json.int(mismatches_fixed)),
+      #("errors_encountered", json.int(errors_encountered)),
+      #("details", details),
+      #("started_at", json.string("NOW()")),
+    ])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/stripe_reconciliation",
+    Some(body),
+  ))
+
+  case response.status {
+    201 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to insert reconciliation record"))
+  }
+}
+
+// ============================================================================
 // BUSINESS MANAGEMENT
 // ============================================================================
 
@@ -1416,58 +1689,42 @@ pub fn insert_stripe_event(
   business_id: Option(String),
   customer_id: Option(String),
   raw_payload: String,
+  source: String,
+  source_business_id: Option(String),
 ) -> Result(Nil, SupabaseError) {
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Recording Stripe event: "
-      <> event_id
-      <> " ("
-      <> event_type
-      <> ")",
-  )
-
-  let base_fields = [
-    #("event_id", json.string(event_id)),
-    #("event_type", json.string(event_type)),
-    #("status", json.string("processing")),
-    #("raw_payload", json.string(raw_payload)),
-  ]
-
-  let with_business = case business_id {
-    Some(bid) -> [#("business_id", json.string(bid)), ..base_fields]
-    None -> base_fields
-  }
-
-  let all_fields = case customer_id {
-    Some(cid) -> [#("customer_id", json.string(cid)), ..with_business]
-    None -> with_business
-  }
-
-  let event_data = json.object(all_fields)
+  let body =
+    json.object([
+      #("event_id", json.string(event_id)),
+      #("event_type", json.string(event_type)),
+      #("business_id", case business_id {
+        Some(id) -> json.string(id)
+        None -> json.null()
+      }),
+      #("customer_id", case customer_id {
+        Some(id) -> json.string(id)
+        None -> json.null()
+      }),
+      #("raw_payload", json.string(raw_payload)),
+      #("source", json.string(source)),
+      // ADD THIS
+      #("source_business_id", case source_business_id {
+        // ADD THIS
+        Some(id) -> json.string(id)
+        None -> json.null()
+      }),
+      #("status", json.string("pending")),
+    ])
+    |> json.to_string()
 
   use response <- result.try(make_request(
     http.Post,
     "/stripe_events",
-    Some(json.to_string(event_data)),
+    Some(body),
   ))
 
   case response.status {
-    201 | 200 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] ✅ Stripe event recorded: " <> event_id,
-      )
-      Ok(Nil)
-    }
-    409 -> {
-      // Event already exists (duplicate)
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] Event already processed (duplicate): " <> event_id,
-      )
-      Error(DatabaseError("Event already exists"))
-    }
-    _ -> Error(DatabaseError("Failed to record Stripe event"))
+    201 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to insert event"))
   }
 }
 
