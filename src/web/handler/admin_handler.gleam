@@ -105,23 +105,26 @@ pub fn override_subscription_status(
     "[AdminHandler] Overriding subscription for: " <> business_id,
   )
 
-  // Parse override request
   case parse_override_request(json_data) {
-    Ok(#(status, price_id)) -> {
-      // First, get the business to find stripe_customer_id
+    Ok(#(status, price_id, expires_in_days)) -> {
       case supabase_client.get_business(business_id) {
         Ok(business) -> {
           case business.stripe_customer_id {
             Some(stripe_customer_id) -> {
+              // Calculate override expiration if provided
+              let override_expires_at = case expires_in_days {
+                Some(days) ->
+                  Some(utils.current_timestamp() + { days * 86_400 })
+                None -> None
+              }
+
               case
-                supabase_client.update_business_subscription(
+                supabase_client.update_business_subscription_with_override(
                   stripe_customer_id,
-                  // Use stripe_customer_id
                   status,
-                  // status second
                   option.unwrap(price_id, "price_unknown"),
-                  // price_id third
                   None,
+                  override_expires_at,
                 )
               {
                 Ok(_) -> {
@@ -130,7 +133,12 @@ pub fn override_subscription_status(
                     "[AdminHandler] ✅ Subscription override successful: "
                       <> business_id
                       <> " -> "
-                      <> status,
+                      <> status
+                      <> case expires_in_days {
+                      Some(days) ->
+                        " (expires in " <> int.to_string(days) <> " days)"
+                      None -> ""
+                    },
                   )
                   let _ =
                     audit.log_action(
@@ -139,6 +147,10 @@ pub fn override_subscription_status(
                       business_id,
                       dict.from_list([
                         #("new_status", json.string(status)),
+                        #("expires_in_days", case expires_in_days {
+                          Some(days) -> json.int(days)
+                          None -> json.null()
+                        }),
                       ]),
                     )
                   let success_json =
@@ -146,6 +158,10 @@ pub fn override_subscription_status(
                       #("status", json.string("success")),
                       #("business_id", json.string(business_id)),
                       #("subscription_status", json.string(status)),
+                      #("override_expires_in_days", case expires_in_days {
+                        Some(days) -> json.int(days)
+                        None -> json.null()
+                      }),
                       #("message", json.string("Subscription status updated")),
                     ])
                   wisp.json_response(json.to_string_tree(success_json), 200)
@@ -384,7 +400,7 @@ pub fn force_provision(req: Request) -> Response {
 
 fn parse_override_request(
   data: Dynamic,
-) -> Result(#(String, Option(String)), String) {
+) -> Result(#(String, Option(String), Option(Int)), String) {
   let decoder = {
     use status <- decode.field("status", decode.string)
     use price_id_opt <- decode.optional_field(
@@ -392,7 +408,12 @@ fn parse_override_request(
       None,
       decode.optional(decode.string),
     )
-    decode.success(#(status, price_id_opt))
+    use expires_in_days <- decode.optional_field(
+      "expires_in_days",
+      None,
+      decode.optional(decode.int),
+    )
+    decode.success(#(status, price_id_opt, expires_in_days))
   }
 
   case decode.run(data, decoder) {

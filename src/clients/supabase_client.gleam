@@ -1141,6 +1141,43 @@ pub fn create_business(
   }
 }
 
+/// Update business subscription with optional override expiration
+pub fn update_business_subscription_with_override(
+  stripe_customer_id: String,
+  status: String,
+  price_id: String,
+  subscription_ends_at: Option(Int),
+  override_expires_at: Option(Int),
+) -> Result(response.Response(String), SupabaseError) {
+  let base_fields = [
+    #("subscription_status", json.string(status)),
+    #("stripe_price_id", json.string(price_id)),
+  ]
+
+  let with_subscription_end = case subscription_ends_at {
+    Some(timestamp) -> [
+      #("subscription_ends_at", json.string(utils.unix_to_iso8601(timestamp))),
+      ..base_fields
+    ]
+    None -> base_fields
+  }
+
+  let all_fields = case override_expires_at {
+    Some(timestamp) -> [
+      #(
+        "subscription_override_expires_at",
+        json.string(utils.unix_to_iso8601(timestamp)),
+      ),
+      ..with_subscription_end
+    ]
+    None -> with_subscription_end
+  }
+
+  let update_json = json.object(all_fields)
+  let url = "/businesses?stripe_customer_id=eq." <> stripe_customer_id
+  make_request(http.Patch, url, Some(json.to_string(update_json)))
+}
+
 // For TrackTags platform webhooks
 pub fn update_business_subscription(
   stripe_customer_id: String,
@@ -1186,6 +1223,43 @@ pub fn update_customer_subscription(
     <> "&stripe_customer_id=eq."
     <> stripe_customer_id
   make_request(http.Patch, url, Some(json.to_string(update_json)))
+}
+
+/// Update customer subscription period tracking
+pub fn update_customer_subscription_period(
+  business_id: String,
+  customer_id: String,
+  last_invoice_date: Int,
+  subscription_ends_at: Int,
+) -> Result(Nil, SupabaseError) {
+  let update_json =
+    json.object([
+      #(
+        "last_invoice_date",
+        json.string(utils.unix_to_iso8601(last_invoice_date)),
+      ),
+      #(
+        "subscription_ends_at",
+        json.string(utils.unix_to_iso8601(subscription_ends_at)),
+      ),
+    ])
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to update customer subscription period"))
+  }
 }
 
 /// Get business by Stripe customer ID (for webhook processing)

@@ -27,7 +27,6 @@ import wisp.{type Request, type Response}
 // ============================================================================
 // TYPES
 // ============================================================================
-
 pub type ProxyRequest {
   ProxyRequest(
     scope: String,
@@ -157,7 +156,6 @@ fn process_proxy_request(
     "[ProxyHandler] 🎯 Processing proxy request: " <> req.target_url,
   )
 
-  // Step 1: Parse scope using our new MetricScope system
   case metric_types.string_to_scope(req.scope, business_id, req.customer_id) {
     Error(scope_error) -> {
       let error_json =
@@ -168,55 +166,68 @@ fn process_proxy_request(
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
     Ok(scope) -> {
-      // Step 2: Generate lookup key and check metric status
       let lookup_key = metric_types.scope_to_lookup_key(scope)
 
-      logging.log(
-        logging.Info,
-        "[ProxyHandler] 🔍 Checking metric: "
-          <> lookup_key
-          <> "/"
-          <> req.metric_name,
-      )
+      // NEW: Check if metric_name is empty
+      case string.length(req.metric_name) {
+        0 -> {
+          // No specific metric - return ALL plan limit statuses
+          logging.log(
+            logging.Info,
+            "[ProxyHandler] 🔍 No metric specified - checking all plan limits",
+          )
+          check_all_plan_limits_and_forward(lookup_key, scope, business_id, req)
+        }
+        _ -> {
+          // Original behavior - check specific metric
+          logging.log(
+            logging.Info,
+            "[ProxyHandler] 🔍 Checking metric: "
+              <> lookup_key
+              <> "/"
+              <> req.metric_name,
+          )
 
-      case
-        check_metric_breach_status(
-          lookup_key,
-          req.metric_name,
-          scope,
-          business_id,
-        )
-      {
-        Ok(breach_status) -> {
-          case should_deny_request(breach_status) {
-            True -> {
-              logging.log(
-                logging.Warning,
-                "[ProxyHandler] 🚨 Request DENIED - metric over limit",
-              )
-              create_denied_response(breach_status)
+          case
+            check_metric_breach_status(
+              lookup_key,
+              req.metric_name,
+              scope,
+              business_id,
+            )
+          {
+            Ok(breach_status) -> {
+              case should_deny_request(breach_status) {
+                True -> {
+                  logging.log(
+                    logging.Warning,
+                    "[ProxyHandler] 🚨 Request DENIED - metric over limit",
+                  )
+                  create_denied_response(breach_status)
+                }
+                False -> {
+                  logging.log(
+                    logging.Info,
+                    "[ProxyHandler] ✅ Request ALLOWED - forwarding to target",
+                  )
+                  forward_request_to_target(req, breach_status, scope, None)
+                }
+              }
             }
-            False -> {
+
+            Error(error_msg) -> {
               logging.log(
-                logging.Info,
-                "[ProxyHandler] ✅ Request ALLOWED - forwarding to target",
+                logging.Error,
+                "[ProxyHandler] ❌ Failed to check metric status: " <> error_msg,
               )
-              forward_request_to_target(req, breach_status, scope, None)
+              let error_json =
+                json.object([
+                  #("error", json.string("Internal Server Error")),
+                  #("message", json.string("Failed to check metric status")),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 500)
             }
           }
-        }
-
-        Error(error_msg) -> {
-          logging.log(
-            logging.Error,
-            "[ProxyHandler] ❌ Failed to check metric status: " <> error_msg,
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Internal Server Error")),
-              #("message", json.string("Failed to check metric status")),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 500)
         }
       }
     }
@@ -861,35 +872,27 @@ fn validate_proxy_request(
       Error([
         decode.DecodeError(
           "Invalid",
-          "scope must be 'business' or 'client'",
+          "scope must be 'business' or 'customer'",
           [],
         ),
       ])
   }
   |> result.try(fn(_) {
-    // Validate customer_id for client scope
+    // Validate customer_id for customer scope
     case req.scope, req.customer_id {
       "customer", None ->
         Error([
           decode.DecodeError(
             "Invalid",
-            "customer_id required for client scope",
+            "customer_id required for customer scope",
             [],
           ),
         ])
       _, _ -> Ok(Nil)
     }
   })
+  |> result.try(fn(_) { Ok(Nil) })
   |> result.try(fn(_) {
-    // Validate metric_name
-    case string.length(req.metric_name) {
-      0 ->
-        Error([decode.DecodeError("Invalid", "metric_name cannot be empty", [])])
-      _ -> Ok(Nil)
-    }
-  })
-  |> result.try(fn(_) {
-    // Validate target_url
     case
       string.starts_with(req.target_url, "http://")
       || string.starts_with(req.target_url, "https://")
@@ -1070,7 +1073,6 @@ fn ensure_and_update_customer_actor(
   }
 }
 
-// Add this function near the bottom of proxy_handler.gleam (around line 700)
 fn get_application_actor() -> Result(
   process.Subject(application_types.ApplicationMessage),
   String,
@@ -1084,5 +1086,388 @@ fn get_application_actor() -> Result(
   {
     Ok(subject) -> Ok(subject)
     Error(_) -> Error("Application actor not found")
+  }
+}
+
+fn forward_with_limit_metadata(
+  req: ProxyRequest,
+  limit_statuses: List(#(String, BreachStatus)),
+  scope: metric_types.MetricScope,
+  context: option.Option(customer_types.CustomerContext),
+) -> Response {
+  // Build JSON of all limits
+  let limits_json =
+    json.object(
+      list.map(limit_statuses, fn(pair) {
+        let #(metric_name, status) = pair
+        #(
+          metric_name,
+          json.object([
+            #("current_usage", json.float(status.current_usage)),
+            #("limit_value", json.float(status.limit_value)),
+            #("limit_operator", json.string(status.limit_operator)),
+            #("is_breached", json.bool(status.is_breached)),
+            #("remaining", case status.remaining {
+              Some(r) -> json.float(r)
+              None -> json.null()
+            }),
+          ]),
+        )
+      }),
+    )
+
+  logging.log(
+    logging.Info,
+    "[ProxyHandler] 🚀 Forwarding request to: " <> req.target_url,
+  )
+
+  let business_id = case scope {
+    metric_types.Business(bid) -> bid
+    metric_types.Customer(bid, _) -> bid
+  }
+
+  let domain = extract_domain_from_url(req.target_url)
+
+  case verify_domain_authorization(domain, business_id) {
+    Ok(False) -> {
+      logging.log(
+        logging.Warning,
+        "[ProxyHandler] Domain not authorized: " <> domain,
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Unauthorized Domain")),
+            #(
+              "message",
+              json.string(
+                "Domain "
+                <> domain
+                <> " has not authorized business_id: "
+                <> business_id,
+              ),
+            ),
+          ]),
+        ),
+        403,
+      )
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[ProxyHandler] Domain verification failed: " <> e,
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Domain Verification Failed")),
+            #("message", json.string(e)),
+          ]),
+        ),
+        502,
+      )
+    }
+    Ok(True) -> {
+      let tracktags_url =
+        utils.get_env_or("TRACKTAGS_URL", "http://localhost:8080")
+
+      let tracktags_host = case string.split(tracktags_url, "://") {
+        [_, rest] ->
+          string.split(rest, "/")
+          |> list.first
+          |> result.unwrap("localhost:8080")
+        _ -> "localhost:8080"
+      }
+
+      case
+        string.contains(req.target_url, tracktags_host)
+        || string.contains(req.target_url, "/api/v1/proxy")
+      {
+        True -> {
+          logging.log(
+            logging.Warning,
+            "[ProxyHandler] Loop detected in target URL: " <> req.target_url,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Loop Detected")),
+              #("message", json.string("Cannot proxy back to TracktTags")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 400)
+        }
+        False -> {
+          case dict.get(req.headers, "x-tracktags-customer-id") {
+            Ok(_) -> {
+              logging.log(
+                logging.Warning,
+                "[ProxyHandler] Request already proxied - TracktTags headers detected",
+              )
+              let error_json =
+                json.object([
+                  #("error", json.string("Double Proxy Detected")),
+                  #(
+                    "message",
+                    json.string(
+                      "Request has already been proxied through TracktTags",
+                    ),
+                  ),
+                ])
+              wisp.json_response(json.to_string_tree(error_json), 400)
+            }
+            Error(_) -> {
+              let http_method = case string.uppercase(req.method) {
+                "GET" -> http.Get
+                "POST" -> http.Post
+                "PUT" -> http.Put
+                "DELETE" -> http.Delete
+                "PATCH" -> http.Patch
+                _ -> http.Get
+              }
+
+              case request.to(req.target_url) {
+                Error(_) -> {
+                  logging.log(
+                    logging.Error,
+                    "[ProxyHandler] ❌ Invalid target URL: " <> req.target_url,
+                  )
+                  let error_json =
+                    json.object([
+                      #("error", json.string("Invalid URL")),
+                      #("message", json.string("Target URL is malformed")),
+                    ])
+                  wisp.json_response(json.to_string_tree(error_json), 400)
+                }
+                Ok(base_req) -> {
+                  let req_with_headers =
+                    dict.fold(req.headers, base_req, fn(acc_req, key, value) {
+                      request.set_header(acc_req, key, value)
+                    })
+
+                  // NEW: Add X-TracktTags-Limits header with all limit statuses
+                  let req_with_limits =
+                    req_with_headers
+                    |> request.set_header(
+                      "X-TracktTags-Limits",
+                      json.to_string(limits_json),
+                    )
+
+                  let req_with_metadata = case scope, context {
+                    metric_types.Customer(bid, cid), Some(ctx) -> {
+                      let machine_ids =
+                        list.map(ctx.machines, fn(m) { m.machine_id })
+                      req_with_limits
+                      |> request.set_header("X-TracktTags-Customer-Id", cid)
+                      |> request.set_header("X-TracktTags-Business-Id", bid)
+                      |> request.set_header(
+                        "X-TracktTags-Owned-Machines",
+                        string.join(machine_ids, ","),
+                      )
+                      |> request.set_header(
+                        "X-TracktTags-Plan-Id",
+                        option.unwrap(ctx.customer.plan_id, "free"),
+                      )
+                      |> request.set_header(
+                        "X-TracktTags-Machine-Count",
+                        int.to_string(list.length(ctx.machines)),
+                      )
+                      |> request.set_header("X-TracktTags-Proxied", "true")
+                    }
+                    metric_types.Business(bid), _ -> {
+                      req_with_limits
+                      |> request.set_header("X-TracktTags-Business-Id", bid)
+                      |> request.set_header("X-TracktTags-Scope", "business")
+                      |> request.set_header("X-TracktTags-Proxied", "true")
+                    }
+                    _, _ -> {
+                      req_with_limits
+                      |> request.set_header("X-TracktTags-Proxied", "true")
+                    }
+                  }
+
+                  let final_req = case http_method, req.body {
+                    http.Post, Some(body) -> {
+                      req_with_metadata
+                      |> request.set_method(http.Post)
+                      |> request.set_header("Content-Type", "application/json")
+                      |> request.set_body(body)
+                    }
+                    http.Put, Some(body) -> {
+                      req_with_metadata
+                      |> request.set_method(http.Put)
+                      |> request.set_header("Content-Type", "application/json")
+                      |> request.set_body(body)
+                    }
+                    http.Patch, Some(body) -> {
+                      req_with_metadata
+                      |> request.set_method(http.Patch)
+                      |> request.set_header("Content-Type", "application/json")
+                      |> request.set_body(body)
+                    }
+                    http.Get, _ -> {
+                      req_with_metadata
+                      |> request.set_method(http.Get)
+                    }
+                    http.Delete, _ -> {
+                      req_with_metadata
+                      |> request.set_method(http.Delete)
+                    }
+                    _, _ -> req_with_metadata |> request.set_method(http_method)
+                  }
+
+                  case httpc.send(final_req) {
+                    Ok(response) -> {
+                      logging.log(
+                        logging.Info,
+                        "[ProxyHandler] ✅ Target responded with status: "
+                          <> int.to_string(response.status),
+                      )
+
+                      let forwarded_response =
+                        ForwardedResponse(
+                          status_code: response.status,
+                          headers: dict.from_list(response.headers),
+                          body: response.body,
+                        )
+
+                      // Create a dummy breach status since we're not breached
+                      let success_status =
+                        BreachStatus(
+                          is_breached: False,
+                          current_usage: 0.0,
+                          limit_value: 0.0,
+                          limit_operator: "gte",
+                          breach_action: "allow",
+                          remaining: None,
+                        )
+
+                      let success_json =
+                        allowed_response_to_json(
+                          success_status,
+                          forwarded_response,
+                        )
+                      wisp.json_response(json.to_string_tree(success_json), 200)
+                    }
+                    Error(http_error) -> {
+                      logging.log(
+                        logging.Error,
+                        "[ProxyHandler] ❌ HTTP error: "
+                          <> string.inspect(http_error),
+                      )
+                      let error_json =
+                        json.object([
+                          #("error", json.string("Proxy Error")),
+                          #(
+                            "message",
+                            json.string("Failed to forward request to target"),
+                          ),
+                        ])
+                      wisp.json_response(json.to_string_tree(error_json), 502)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn check_all_plan_limits_and_forward(
+  lookup_key: String,
+  scope: metric_types.MetricScope,
+  business_id: String,
+  req: ProxyRequest,
+) -> Response {
+  case scope {
+    metric_types.Customer(bid, cid) -> {
+      case supabase_client.get_customer_full_context(bid, cid) {
+        Ok(context) -> {
+          // Check status of ALL plan limit metrics
+          let limit_statuses =
+            list.filter_map(context.plan_limits, fn(limit) {
+              case
+                check_metric_breach_status(
+                  lookup_key,
+                  limit.metric_name,
+                  scope,
+                  business_id,
+                )
+              {
+                Ok(status) -> Ok(#(limit.metric_name, status))
+                Error(_) -> Error(Nil)
+                // Metric doesn't exist yet - skip it
+              }
+            })
+
+          logging.log(
+            logging.Info,
+            "[ProxyHandler] 📊 Checked "
+              <> int.to_string(list.length(limit_statuses))
+              <> " plan limit metrics",
+          )
+
+          // Check if ANY would deny
+          let any_denials =
+            list.any(limit_statuses, fn(pair) {
+              let #(_, status) = pair
+              should_deny_request(status)
+            })
+
+          case any_denials {
+            True -> {
+              // Find first denial
+              case
+                list.find(limit_statuses, fn(pair) {
+                  let #(_, s) = pair
+                  should_deny_request(s)
+                })
+              {
+                Ok(#(metric_name, breach_status)) -> {
+                  logging.log(
+                    logging.Warning,
+                    "[ProxyHandler] 🚨 DENIED - " <> metric_name <> " over limit",
+                  )
+                  create_denied_response(breach_status)
+                }
+                Error(_) -> wisp.internal_server_error()
+              }
+            }
+            False -> {
+              // Forward with ALL statuses in custom header
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] ✅ All limits OK - forwarding with metadata",
+              )
+              forward_with_limit_metadata(
+                req,
+                limit_statuses,
+                scope,
+                Some(context),
+              )
+            }
+          }
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[ProxyHandler] ❌ Failed to get customer context",
+          )
+          wisp.internal_server_error()
+        }
+      }
+    }
+    metric_types.Business(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Invalid Request")),
+            #("message", json.string("metric_name required for business scope")),
+          ]),
+        ),
+        400,
+      )
+    }
   }
 }

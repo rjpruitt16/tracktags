@@ -4,6 +4,7 @@ import gleam/bit_array
 import gleam/crypto as gleam_crypto
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/http
 import gleam/int
 import gleam/json
@@ -11,7 +12,9 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import glixir
 import logging
+import types/customer_types
 import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
@@ -223,56 +226,72 @@ fn process_webhook_with_dedup(body: String, signature: String) -> Response {
   }
 }
 
-// Add this new function
 fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Ok(stripe_customer_id) -> {
-      logging.log(
-        logging.Info,
-        "[StripeHandler] 💳 Invoice finalized for Stripe customer: "
-          <> stripe_customer_id,
-      )
-
-      // Look up OUR customer by Stripe's customer ID
       case supabase_client.get_customer_by_stripe_customer(stripe_customer_id) {
         Ok(customer) -> {
-          // Reset StripeBilling metrics for THIS customer
+          // 1. Update subscription tracking columns
+          let next_period_end = utils.current_timestamp() + 2_592_000
+          // 30 days
+          let _ =
+            supabase_client.update_customer_subscription_period(
+              customer.business_id,
+              customer.customer_id,
+              utils.current_timestamp(),
+              // last_invoice_date
+              next_period_end,
+              // subscription_ends_at
+            )
+
+          // 2. Reset billing metrics in-memory
+          case
+            lookup_customer_actor(customer.business_id, customer.customer_id)
+          {
+            Ok(customer_subject) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] 🔄 Sending reset to customer actor",
+              )
+              process.send(customer_subject, customer_types.ResetStripeMetrics)
+            }
+            Error(_) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] Customer actor offline - will reset on spawn",
+              )
+            }
+          }
+
+          // 3. Fallback: Reset in database
           case
             supabase_client.reset_customer_stripe_billing_metrics(
               customer.business_id,
               customer.customer_id,
             )
           {
-            Ok(_) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] ✅ Reset billing metrics for customer: "
-                  <> customer.customer_id,
-              )
+            Ok(_) ->
               Success("Billing cycle reset for: " <> customer.customer_id)
-            }
-            Error(error) -> {
-              logging.log(
-                logging.Error,
-                "[StripeHandler] ❌ Failed to reset metrics: "
-                  <> string.inspect(error),
-              )
+            Error(error) ->
               ProcessingError("Reset failed: " <> string.inspect(error))
-            }
           }
         }
-        Error(_) -> {
-          // No customer found - they might not be using metered billing
-          logging.log(
-            logging.Info,
-            "[StripeHandler] No customer found for Stripe ID: "
-              <> stripe_customer_id,
-          )
+        Error(_) ->
           Success("No metered billing customer for: " <> stripe_customer_id)
-        }
       }
     }
     Error(error) -> ProcessingError("Failed to extract customer: " <> error)
+  }
+}
+
+fn lookup_customer_actor(
+  business_id: String,
+  customer_id: String,
+) -> Result(process.Subject(customer_types.Message), String) {
+  let registry_key = "client:" <> business_id <> ":" <> customer_id
+  case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Customer actor not found")
   }
 }
 
