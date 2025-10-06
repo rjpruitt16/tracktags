@@ -94,28 +94,33 @@ fn load_client_plan_limits(
       <> customer_id,
   )
 
-  // Get the client record to find its plan_id
+  // Get the customer record
   case supabase_client.get_customer_by_id(business_id, customer_id) {
     Ok(customer) -> {
-      case customer.plan_id {
-        Some(plan_id) -> {
+      // Try stripe_product_id first (from customers table)
+      case customer.stripe_product_id {
+        Some(product_id) -> {
           logging.log(
             logging.Info,
-            "[ClientActor] Client has plan: " <> plan_id,
+            "[ClientActor] Customer has Stripe product: " <> product_id,
           )
-
-          // Get plan limits for this plan
-          case supabase_client.get_plan_limits_by_plan_id(plan_id) {
-            Ok(plan_limits) -> {
+          // Look up limits via Stripe price
+          case supabase_client.get_plan_limits_by_stripe_price_id(product_id) {
+            Ok([]) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] No plan limits for product: " <> product_id,
+              )
+              Ok(Nil)
+            }
+            Ok(limits) -> {
               logging.log(
                 logging.Info,
                 "[ClientActor] Found "
-                  <> string.inspect(list.length(plan_limits))
+                  <> string.inspect(list.length(limits))
                   <> " plan limits",
               )
-
-              // Create limit-checking metrics for each plan limit
-              list.try_each(plan_limits, fn(limit) {
+              list.try_each(limits, fn(limit) {
                 create_limit_checking_metric(
                   business_id,
                   customer_id,
@@ -129,27 +134,60 @@ fn load_client_plan_limits(
             Error(e) -> {
               logging.log(
                 logging.Warning,
-                "[ClientActor] Failed to get plan limits: " <> string.inspect(e),
+                "[ClientActor] Failed to load limits: " <> string.inspect(e),
               )
-              Error("Failed to get plan limits")
+              Ok(Nil)
             }
           }
         }
         None -> {
-          logging.log(
-            logging.Info,
-            "[ClientActor] Client has no plan assigned - skipping limit creation",
-          )
-          Ok(Nil)
+          // Fallback to plan_id if no Stripe product
+          case customer.plan_id {
+            Some(plan_id) -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] Customer has plan_id: " <> plan_id,
+              )
+              case supabase_client.get_plan_limits_by_plan_id(plan_id) {
+                Ok(limits) -> {
+                  list.try_each(limits, fn(limit) {
+                    create_limit_checking_metric(
+                      business_id,
+                      customer_id,
+                      limit,
+                      metrics_supervisor,
+                    )
+                  })
+                  |> result.map_error(fn(_) { "Failed to create limits" })
+                  |> result.map(fn(_) { Nil })
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Warning,
+                    "[ClientActor] Failed to get plan limits: "
+                      <> string.inspect(e),
+                  )
+                  Ok(Nil)
+                }
+              }
+            }
+            None -> {
+              logging.log(
+                logging.Info,
+                "[ClientActor] Customer has no plan assigned - skipping limits",
+              )
+              Ok(Nil)
+            }
+          }
         }
       }
     }
     Error(e) -> {
       logging.log(
         logging.Error,
-        "[ClientActor] Failed to get client record: " <> string.inspect(e),
+        "[ClientActor] Failed to get customer record: " <> string.inspect(e),
       )
-      Error("Failed to get client record")
+      Error("Failed to get customer record")
     }
   }
 }

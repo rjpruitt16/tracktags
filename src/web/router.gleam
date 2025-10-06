@@ -39,6 +39,18 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
+    ["api", "v1", "businesses", business_id] ->
+      case req.method {
+        Delete -> user_handler.delete_business(req, business_id)
+        _ -> wisp.method_not_allowed([Delete])
+      }
+
+    ["api", "v1", "businesses", business_id, "restore"] ->
+      case req.method {
+        Post -> user_handler.restore_business(req, business_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
     ["admin", "provision", "test"] -> admin_handler.provision_test(req)
     ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
 

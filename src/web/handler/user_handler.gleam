@@ -707,3 +707,126 @@ pub fn create_business(req: Request) -> Response {
     }
   })
 }
+
+pub fn delete_business(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Delete)
+
+  auth.with_auth(req, fn(_auth_result, _api_key, is_admin) {
+    case is_admin {
+      False -> {
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Forbidden")),
+              #("message", json.string("Admin authentication required")),
+            ]),
+          ),
+          403,
+        )
+      }
+      True -> {
+        use json_data <- wisp.require_json(req)
+
+        let decoder = {
+          use reason <- decode.optional_field(
+            "reason",
+            None,
+            decode.optional(decode.string),
+          )
+          use user_id <- decode.optional_field(
+            "user_id",
+            None,
+            decode.optional(decode.string),
+          )
+          decode.success(#(reason, user_id))
+        }
+
+        case decode.run(json_data, decoder) {
+          Ok(#(reason, user_id)) -> {
+            case
+              supabase_client.soft_delete_business(business_id, user_id, reason)
+            {
+              Ok(message) -> {
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("success", json.bool(True)),
+                      #("message", json.string(message)),
+                      #("business_id", json.string(business_id)),
+                    ]),
+                  ),
+                  200,
+                )
+              }
+              Error(_) -> {
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("error", json.string("Failed to delete business")),
+                    ]),
+                  ),
+                  500,
+                )
+              }
+            }
+          }
+          Error(_) -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Invalid request")),
+                ]),
+              ),
+              400,
+            )
+          }
+        }
+      }
+    }
+  })
+}
+
+pub fn restore_business(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Post)
+
+  auth.with_auth(req, fn(_auth_result, _api_key, is_admin) {
+    case is_admin {
+      False -> {
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Forbidden")),
+              #("message", json.string("Admin authentication required")),
+            ]),
+          ),
+          403,
+        )
+      }
+      True -> {
+        case supabase_client.restore_deleted_business(business_id) {
+          Ok(message) -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("success", json.bool(True)),
+                  #("message", json.string(message)),
+                ]),
+              ),
+              200,
+            )
+          }
+          Error(_) -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Failed to restore business")),
+                ]),
+              ),
+              500,
+            )
+          }
+        }
+      }
+    }
+  })
+}

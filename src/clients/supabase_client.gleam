@@ -603,9 +603,143 @@ pub fn downgrade_to_free_limits(
   Ok(Nil)
 }
 
+// Add to supabase_client.gleam
+pub fn get_plan_limits_by_stripe_price_id(
+  stripe_price_id: String,
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting plan limits for Stripe price: " <> stripe_price_id,
+  )
+
+  // First, find the plan by stripe_price_id
+  let plan_query = "/plans?stripe_price_id=eq." <> stripe_price_id
+
+  use plan_response <- result.try(make_request(http.Get, plan_query, None))
+
+  case plan_response.status {
+    200 -> {
+      // Parse to get plan_id
+      let plan_id_decoder = decode.field("id", decode.string, decode.success)
+
+      case json.parse(plan_response.body, decode.list(plan_id_decoder)) {
+        Ok([plan_id]) -> {
+          // Now get limits for this plan_id (function already exists!)
+          get_plan_limits_by_plan_id(plan_id)
+        }
+        Ok([]) -> {
+          logging.log(
+            logging.Info,
+            "No plan found for price: " <> stripe_price_id,
+          )
+          Ok([])
+          // No plan configured for this price
+        }
+        Ok([_, _, ..]) ->
+          Error(DatabaseError("Multiple plans with same price_id"))
+        Error(_) -> Error(ParseError("Invalid plan response"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to lookup plan by price_id"))
+  }
+}
+
 // ============================================================================
 // BUSINESS MANAGEMENT
 // ============================================================================
+
+/// Soft delete a business (30-day recovery window)
+pub fn soft_delete_business(
+  business_id: String,
+  user_id: Option(String),
+  reason: Option(String),
+) -> Result(String, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Soft deleting business: " <> business_id,
+  )
+
+  let params = [
+    #("p_business_id", json.string(business_id)),
+    #("p_user_id", case user_id {
+      Some(uid) -> json.string(uid)
+      None -> json.null()
+    }),
+    #("p_reason", case reason {
+      Some(r) -> json.string(r)
+      None -> json.null()
+    }),
+  ]
+
+  let body = json.object(params) |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/soft_delete_business",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Business soft deleted: " <> business_id,
+      )
+      Ok("Business scheduled for deletion in 30 days")
+    }
+    _ -> Error(DatabaseError("Failed to soft delete business"))
+  }
+}
+
+/// Restore a soft-deleted business (within 30-day window)
+pub fn restore_deleted_business(
+  business_id: String,
+) -> Result(String, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Restoring business: " <> business_id,
+  )
+
+  let body =
+    json.object([#("p_business_id", json.string(business_id))])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/restore_deleted_business",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Business restored: " <> business_id,
+      )
+      Ok("Business restored successfully")
+    }
+    _ -> Error(DatabaseError("Failed to restore business"))
+  }
+}
+
+/// Get list of businesses pending permanent deletion
+pub fn get_pending_deletions() -> Result(List(String), SupabaseError) {
+  let path =
+    "/businesses?deleted_at=not.is.null&deletion_scheduled_for=lte.now()"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      let decoder = decode.field("business_id", decode.string, decode.success)
+      case json.parse(response.body, decode.list(decoder)) {
+        Ok(business_ids) -> Ok(business_ids)
+        Error(_) -> Error(ParseError("Invalid deletion list"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get pending deletions"))
+  }
+}
 
 // ADD this function (around line 900, near other business functions)
 /// Set stripe_customer_id for a business (initial mapping from Stripe webhook)

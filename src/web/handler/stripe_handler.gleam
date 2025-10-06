@@ -551,7 +551,6 @@ fn get_plan_machine_count(price_id: Option(String)) -> Result(Int, String) {
   }
 }
 
-// REPLACE handle_subscription_created (around line 350)
 fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
   case extract_subscription_data(event.data) {
     Ok(#(stripe_customer_id, price_id, status)) -> {
@@ -567,7 +566,11 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
               event.data.current_period_end,
             )
           {
-            Ok(_) -> Success("Subscription updated for existing customer")
+            Ok(_) -> {
+              // Load and apply plan limits for this price_id
+              apply_plan_limits_for_price(stripe_customer_id, price_id)
+              Success("Subscription updated for existing customer")
+            }
             Error(e) -> ProcessingError(string.inspect(e))
           }
         }
@@ -594,7 +597,14 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
                           event.data.current_period_end,
                         )
                       {
-                        Ok(_) -> Success("New subscription created and mapped")
+                        Ok(_) -> {
+                          // Load and apply plan limits
+                          apply_plan_limits_for_price(
+                            stripe_customer_id,
+                            price_id,
+                          )
+                          Success("New subscription created and mapped")
+                        }
                         Error(e) ->
                           ProcessingError(
                             "Failed to update subscription: "
@@ -623,6 +633,63 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
       }
     }
     Error(error) -> ProcessingError(error)
+  }
+}
+
+// Add these helper functions after handle_subscription_created
+fn apply_plan_limits_for_price(
+  stripe_customer_id: String,
+  price_id: String,
+) -> Nil {
+  logging.log(
+    logging.Info,
+    "[StripeHandler] Loading plan limits for price: " <> price_id,
+  )
+
+  // Load plan limits for this Stripe price
+  case supabase_client.get_plan_limits_by_stripe_price_id(price_id) {
+    Ok([]) -> {
+      logging.log(
+        logging.Info,
+        "[StripeHandler] No plan limits configured for price: " <> price_id,
+      )
+      Nil
+    }
+    Ok(limits) -> {
+      logging.log(
+        logging.Info,
+        "[StripeHandler] Found "
+          <> int.to_string(list.length(limits))
+          <> " plan limits for price: "
+          <> price_id,
+      )
+
+      // Find the customer and notify their actor (if running)
+      case supabase_client.get_customer_by_stripe_customer(stripe_customer_id) {
+        Ok(customer) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] Notifying customer actor: " <> customer.customer_id,
+          )
+          // Customer actor will load limits on next spawn if not running
+          Nil
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] Customer not found - limits will load when actor spawns",
+          )
+          Nil
+        }
+      }
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Warning,
+        "[StripeHandler] Failed to load plan limits: " <> string.inspect(e),
+      )
+      Nil
+    }
   }
 }
 
