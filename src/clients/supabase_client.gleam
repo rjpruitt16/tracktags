@@ -2048,6 +2048,57 @@ pub fn insert_provisioning_queue(
   }
 }
 
+pub fn soft_delete_customer(
+  business_id: String,
+  customer_id: String,
+  deleted_by: String,
+) -> Result(String, SupabaseError) {
+  let body =
+    json.object([
+      #("deleted_at", json.string("NOW()")),
+      #("deleted_by", json.string(deleted_by)),
+    ])
+    |> json.to_string()
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use response <- result.try(make_request(http.Patch, path, Some(body)))
+
+  case response.status {
+    200 | 204 -> Ok("Customer soft deleted")
+    _ -> Error(DatabaseError("Failed to soft delete customer"))
+  }
+}
+
+pub fn restore_deleted_customer(
+  business_id: String,
+  customer_id: String,
+) -> Result(String, SupabaseError) {
+  let body =
+    json.object([
+      #("deleted_at", json.null()),
+      #("deleted_by", json.null()),
+    ])
+    |> json.to_string()
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use response <- result.try(make_request(http.Patch, path, Some(body)))
+
+  case response.status {
+    200 | 204 -> Ok("Customer restored")
+    _ -> Error(DatabaseError("Failed to restore customer"))
+  }
+}
+
 pub fn get_customer_full_context(
   business_id: String,
   customer_id: String,
@@ -2686,7 +2737,11 @@ pub fn get_business_customers(
     "[SupabaseClient] Getting customers for business: " <> business_id,
   )
 
-  let path = "/customers?business_id=eq." <> business_id
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&deleted_at=is.null"
+    <> "&select=customer_id,customer_name,plan_id,stripe_price_id"
 
   use response <- result.try(make_request(http.Get, path, None))
 
@@ -2728,10 +2783,11 @@ pub fn get_customer_by_id(
   )
 
   let path =
-    "/customers?customer_id=eq."
-    <> customer_id
-    <> "&business_id=eq."
+    "/customers?business_id=eq."
     <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+    <> "&deleted_at=is.null"
 
   use response <- result.try(make_request(http.Get, path, None))
 

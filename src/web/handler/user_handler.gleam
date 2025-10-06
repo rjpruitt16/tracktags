@@ -408,39 +408,61 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
 }
 
 pub fn delete_customer(req: Request, customer_id: String) -> Response {
-  let request_id = string.inspect(utils.system_time())
-  logging.log(
-    logging.Info,
-    "[CustomerHandler] 🔍 DELETE CUSTOMER REQUEST START - ID: "
-      <> request_id
-      <> " client: "
-      <> customer_id,
-  )
-
   use <- wisp.require_method(req, http.Delete)
   use business_id <- with_auth(req)
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🗑️ Deleting customer: "
-      <> business_id
-      <> "/"
-      <> customer_id,
+    "[CustomerHandler] Attempting to delete customer: " <> customer_id,
   )
 
-  let success_json =
-    json.object([
-      #("message", json.string("Delete customer - LOGGED")),
-      #("business_id", json.string(business_id)),
-      #("customer_id", json.string(customer_id)),
-    ])
-
-  logging.log(
-    logging.Info,
-    "[CustomerHandler] 🔍 DELETE CUSTOMER REQUEST END - ID: " <> request_id,
-  )
-
-  wisp.json_response(json.to_string_tree(success_json), 200)
+  // Verify customer belongs to this business BEFORE deleting
+  case supabase_client.get_customer_by_id(business_id, customer_id) {
+    Ok(_customer) -> {
+      // Customer exists and belongs to this business, safe to delete
+      case
+        supabase_client.soft_delete_customer(
+          business_id,
+          customer_id,
+          business_id,
+        )
+      {
+        Ok(_) -> {
+          let _ =
+            audit.log_action(
+              "delete_customer",
+              "customer",
+              customer_id,
+              dict.from_list([#("business_id", json.string(business_id))]),
+            )
+          logging.log(
+            logging.Info,
+            "[CustomerHandler] Successfully deleted customer: " <> customer_id,
+          )
+          wisp.ok() |> wisp.string_body("Customer deleted")
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Error,
+            "[CustomerHandler] Failed to delete customer: " <> customer_id,
+          )
+          wisp.internal_server_error()
+        }
+      }
+    }
+    Error(supabase_client.NotFound(_)) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Not Found")),
+            #("message", json.string("Customer not found")),
+          ]),
+        ),
+        404,
+      )
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
 }
 
 // ============================================================================
