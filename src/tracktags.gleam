@@ -1,7 +1,11 @@
 import actors/application
+import clockwork
+import clockwork_schedule
 import gleam/erlang/process
+import gleam/http
+import gleam/http/request
+import gleam/httpc
 import gleam/int
-import gleam/result
 import gleam/string
 import logging
 import mist
@@ -46,6 +50,28 @@ pub fn start_link() -> Result(process.Pid, String) {
     "[Main] Config: " <> bind_address <> ":" <> int.to_string(port),
   )
 
+  // In your main application supervisor
+  let assert Ok(recon_cron) = clockwork.from_string("0 2 * * *")
+  // 2 AM daily
+
+  // In tracktags.gleam - update the reconciliation scheduler
+  let _recon_scheduler =
+    clockwork_schedule.new("stripe_reconciliation", recon_cron, fn() {
+      let _ =
+        httpc.send(
+          request.new()
+          |> request.set_method(http.Post)
+          |> request.set_host("127.0.0.1")
+          |> request.set_port(port)
+          |> request.set_path("/admin/reconcile-platform")
+          |> request.set_header(
+            "x-admin-key",
+            utils.require_env("ADMIN_SECRET_KEY"),
+          ),
+        )
+      Nil
+    })
+    |> clockwork_schedule.with_logging()
   let cache_opts = []
   // Empty list - use defaults
   case cachex.start_link("domain_cache", cache_opts) {

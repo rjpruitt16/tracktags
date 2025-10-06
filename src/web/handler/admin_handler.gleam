@@ -1,5 +1,6 @@
 // src/web/handler/admin_handler.gleam
 import actors/machine_actor
+import clients/stripe_client
 import clients/supabase_client
 import gleam/dict
 import gleam/dynamic.{type Dynamic}
@@ -10,8 +11,10 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import logging
+import types/business_types
 import utils/audit
 import utils/auth
 import utils/utils
@@ -498,4 +501,104 @@ pub fn list_audit_logs(req: Request) -> Response {
 // Helper to parse Stripe event (make public in stripe_handler)
 fn parse_stripe_event(json_string: String) {
   stripe_handler.parse_stripe_event(json_string)
+}
+
+pub fn reconcile_platform(req: Request) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Post)
+
+  logging.log(logging.Info, "[AdminHandler] Starting platform reconciliation")
+
+  case supabase_client.get_active_stripe_subscriptions() {
+    Ok(businesses) -> {
+      let results =
+        list.map(businesses, fn(business) {
+          reconcile_business_subscription(business)
+        })
+
+      let total = list.length(results)
+      let successes = list.count(results, fn(r) { result.is_ok(r) })
+      let failures = total - successes
+
+      let _ =
+        audit.log_action(
+          "reconcile_platform",
+          "reconciliation",
+          "platform",
+          dict.from_list([
+            #("total_checked", json.int(total)),
+            #("successes", json.int(successes)),
+            #("failures", json.int(failures)),
+          ]),
+        )
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("status", json.string("completed")),
+            #("total_checked", json.int(total)),
+            #("mismatches_fixed", json.int(successes)),
+            #("errors", json.int(failures)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+fn reconcile_business_subscription(
+  business: business_types.Business,
+) -> Result(Nil, String) {
+  case business.stripe_subscription_id {
+    None -> Ok(Nil)
+    Some(sub_id) -> {
+      // Get platform Stripe key
+      let api_key = utils.require_env("STRIPE_API_KEY")
+
+      case stripe_client.get_subscription(sub_id, api_key) {
+        Ok(stripe_sub) -> {
+          // Compare status
+          case stripe_sub.status == business.subscription_status {
+            True -> Ok(Nil)
+            // Match - all good
+            False -> {
+              logging.log(
+                logging.Warning,
+                "[Reconciliation] Mismatch for "
+                  <> business.business_id
+                  <> " - DB: "
+                  <> business.subscription_status
+                  <> " Stripe: "
+                  <> stripe_sub.status,
+              )
+
+              // Get price_id from items
+              let price_id = case stripe_sub.items.data {
+                [item, ..] -> item.price.id
+                [] -> "unknown"
+              }
+
+              // Fix it - Stripe is source of truth
+              case business.stripe_customer_id {
+                Some(cust_id) -> {
+                  supabase_client.update_business_subscription(
+                    cust_id,
+                    stripe_sub.status,
+                    price_id,
+                    Some(stripe_sub.current_period_end),
+                  )
+                  |> result.map(fn(_) { Nil })
+                  |> result.map_error(fn(_) { "Failed to update" })
+                }
+                None -> Error("No stripe_customer_id")
+              }
+            }
+          }
+        }
+        Error(e) -> Error(e)
+      }
+    }
+  }
 }

@@ -92,3 +92,76 @@ pub fn report_usage(
     }
   }
 }
+
+/// Get subscription from Stripe API
+pub fn get_subscription(
+  subscription_id: String,
+  api_key: String,
+) -> Result(StripeSubscription, String) {
+  let req =
+    request.new()
+    |> request.set_method(http.Get)
+    |> request.set_scheme(http.Https)
+    |> request.set_host("api.stripe.com")
+    |> request.set_path("/v1/subscriptions/" <> subscription_id)
+    |> request.set_header("Authorization", "Bearer " <> api_key)
+
+  case httpc.send(req) {
+    Ok(resp) if resp.status == 200 -> {
+      parse_stripe_subscription(resp.body)
+    }
+    Ok(resp) -> Error("Stripe API error: " <> int.to_string(resp.status))
+    Error(_) -> Error("HTTP request failed")
+  }
+}
+
+pub type StripeSubscription {
+  StripeSubscription(
+    id: String,
+    status: String,
+    customer: String,
+    current_period_end: Int,
+    items: StripeSubscriptionItems,
+  )
+}
+
+pub type StripeSubscriptionItems {
+  StripeSubscriptionItems(data: List(StripeSubscriptionItem))
+}
+
+pub type StripeSubscriptionItem {
+  StripeSubscriptionItem(price: StripePrice)
+}
+
+pub type StripePrice {
+  StripePrice(id: String)
+}
+
+fn parse_stripe_subscription(body: String) -> Result(StripeSubscription, String) {
+  let decoder = {
+    use id <- decode.field("id", decode.string)
+    use status <- decode.field("status", decode.string)
+    use customer <- decode.field("customer", decode.string)
+    use current_period_end <- decode.field("current_period_end", decode.int)
+    use items <- decode.subfield(
+      ["items", "data"],
+      decode.list({
+        use price <- decode.subfield(["price", "id"], decode.string)
+        decode.success(StripeSubscriptionItem(StripePrice(price)))
+      }),
+    )
+
+    decode.success(StripeSubscription(
+      id,
+      status,
+      customer,
+      current_period_end,
+      StripeSubscriptionItems(items),
+    ))
+  }
+
+  case json.parse(body, decoder) {
+    Ok(sub) -> Ok(sub)
+    Error(_) -> Error("Failed to parse Stripe subscription")
+  }
+}

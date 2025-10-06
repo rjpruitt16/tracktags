@@ -55,6 +55,11 @@ pub fn handle_request(req: Request) -> Response {
         Get -> admin_handler.list_audit_logs(req)
         _ -> wisp.method_not_allowed([Get])
       }
+    ["admin", "reconcile-platform"] ->
+      case req.method {
+        Post -> admin_handler.reconcile_platform(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
 
     ["api", "v1", "businesses", business_id] ->
       case req.method {
