@@ -9,6 +9,7 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import logging
+import utils/audit
 import utils/auth
 import utils/crypto
 import utils/utils
@@ -536,20 +537,59 @@ pub fn update_key(req: Request, key_type: String, key_name: String) -> Response 
   }
 }
 
-/// DELETE - DELETE /api/v1/key/{key_type}/{key_name}
+/// DELETE - DELETE /api/v1/keys/{key_type}/{key_name}
 pub fn delete_key(req: Request, key_type: String, key_name: String) -> Response {
   use <- wisp.require_method(req, http.Delete)
   use business_id <- with_auth(req)
 
-  // TODO: Implement delete key
-  let success_json =
-    json.object([
-      #("message", json.string("Delete key - TODO")),
-      #("key_type", json.string(key_type)),
-      #("key_name", json.string(key_name)),
-      #("business_id", json.string(business_id)),
-    ])
-  wisp.json_response(json.to_string_tree(success_json), 200)
+  // Admin can't delete without knowing which business
+  case business_id {
+    "admin" -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string("Admin must specify business_id in path")),
+          ]),
+        ),
+        400,
+      )
+    }
+    _ -> {
+      logging.log(
+        logging.Info,
+        "[KeyHandler] Deleting key: "
+          <> business_id
+          <> "/"
+          <> key_type
+          <> "/"
+          <> key_name,
+      )
+
+      case
+        supabase_client.deactivate_integration_key(
+          business_id,
+          key_type,
+          key_name,
+        )
+      {
+        Ok(_) -> {
+          let _ =
+            audit.log_action(
+              "delete_key",
+              "integration_key",
+              business_id <> "/" <> key_type <> "/" <> key_name,
+              dict.from_list([
+                #("key_type", json.string(key_type)),
+                #("key_name", json.string(key_name)),
+              ]),
+            )
+          wisp.ok() |> wisp.string_body("Key deleted")
+        }
+        Error(_) -> wisp.internal_server_error()
+      }
+    }
+  }
 }
 
 // ============================================================================
@@ -651,90 +691,131 @@ fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
               <> req.key_name,
           )
 
-          // Extract or generate the API key
-          let api_key = case dict.get(req.credentials, "api_key") {
-            Ok(key_value) -> key_value
-            Error(_) -> "tk_" <> business_id <> "_" <> utils.generate_random()
-          }
-
-          // Hash the ACTUAL API KEY (not a UUID!)
-          let api_key_hash = crypto.hash_api_key(api_key)
-
-          // Encrypt credentials
-          case encrypt_credentials(req.credentials) {
-            Error(err) -> {
-              logging.log(
-                logging.Error,
-                "[KeyHandler] Encryption failed: " <> err,
-              )
-              wisp.json_response(
-                json.to_string_tree(
-                  json.object([
-                    #("error", json.string("Internal Server Error")),
-                    #("message", json.string("Failed to encrypt credentials")),
-                  ]),
-                ),
-                500,
-              )
-            }
-            Ok(encrypted) -> {
-              // Store in database with the correct function name
-              case
-                supabase_client.store_integration_key_with_hash(
-                  business_id,
-                  req.key_type,
-                  req.key_name,
-                  encrypted,
-                  api_key_hash,
-                  // Store the hash of the actual API key
-                  None,
-                  // No metadata
-                )
-              {
-                Ok(_) -> {
-                  logging.log(
-                    logging.Info,
-                    "[KeyHandler] ✅ Business key created with hash: "
-                      <> string.slice(api_key_hash, 0, 10)
-                      <> "...",
-                  )
-
-                  logging.log(
-                    logging.Info,
-                    "[KeyHandler] 🔍 CREATE key END - ID: " <> request_id,
-                  )
-
-                  // Return the plain text API key to the user (only time they see it)
+          // NEW: Check if already at limit (2 keys per type)
+          case
+            supabase_client.get_integration_keys(
+              business_id,
+              Some(req.key_type),
+            )
+          {
+            Ok(existing_keys) -> {
+              let active_count =
+                list.count(existing_keys, fn(k) { k.is_active })
+              case active_count >= 2 {
+                True -> {
                   wisp.json_response(
                     json.to_string_tree(
                       json.object([
-                        #("api_key", json.string(api_key)),
-                        #("key_name", json.string(req.key_name)),
-                        #("key_type", json.string(req.key_type)),
-                        #("business_id", json.string(business_id)),
+                        #("error", json.string("Key Limit Reached")),
+                        #(
+                          "message",
+                          json.string(
+                            "Maximum 2 active keys per type. Delete a key first.",
+                          ),
+                        ),
                       ]),
                     ),
-                    201,
+                    409,
                   )
                 }
-                Error(err) -> {
-                  logging.log(
-                    logging.Error,
-                    "[KeyHandler] Database error: " <> string.inspect(err),
-                  )
-                  wisp.json_response(
-                    json.to_string_tree(
-                      json.object([
-                        #("error", json.string("Internal Server Error")),
-                        #("message", json.string("Failed to create key")),
-                      ]),
-                    ),
-                    500,
-                  )
+                False -> {
+                  // Continue with key creation
+                  create_and_store_key(business_id, req, request_id)
                 }
               }
             }
+            Error(_) -> {
+              // No existing keys or error checking - continue
+              create_and_store_key(business_id, req, request_id)
+            }
           }
+        }
+      }
+    }
+  }
+}
+
+// Extract the key creation logic into a helper
+fn create_and_store_key(
+  business_id: String,
+  req: KeyRequest,
+  request_id: String,
+) -> Response {
+  // Extract or generate the API key
+  let api_key = case dict.get(req.credentials, "api_key") {
+    Ok(key_value) -> key_value
+    Error(_) -> "tk_" <> business_id <> "_" <> utils.generate_random()
+  }
+
+  // Hash the ACTUAL API KEY (not a UUID!)
+  let api_key_hash = crypto.hash_api_key(api_key)
+
+  // Encrypt credentials
+  case encrypt_credentials(req.credentials) {
+    Error(err) -> {
+      logging.log(logging.Error, "[KeyHandler] Encryption failed: " <> err)
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Internal Server Error")),
+            #("message", json.string("Failed to encrypt credentials")),
+          ]),
+        ),
+        500,
+      )
+    }
+    Ok(encrypted) -> {
+      // Store in database
+      case
+        supabase_client.store_integration_key_with_hash(
+          business_id,
+          req.key_type,
+          req.key_name,
+          encrypted,
+          api_key_hash,
+          None,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[KeyHandler] ✅ Business key created with hash: "
+              <> string.slice(api_key_hash, 0, 10)
+              <> "...",
+          )
+
+          logging.log(
+            logging.Info,
+            "[KeyHandler] 🔍 CREATE key END - ID: " <> request_id,
+          )
+
+          // Return the plain text API key to the user (only time they see it)
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("api_key", json.string(api_key)),
+                #("key_name", json.string(req.key_name)),
+                #("key_type", json.string(req.key_type)),
+                #("business_id", json.string(business_id)),
+              ]),
+            ),
+            201,
+          )
+        }
+        Error(err) -> {
+          logging.log(
+            logging.Error,
+            "[KeyHandler] Database error: " <> string.inspect(err),
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Internal Server Error")),
+                #("message", json.string("Failed to create key")),
+              ]),
+            ),
+            500,
+          )
         }
       }
     }

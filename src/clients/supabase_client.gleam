@@ -131,6 +131,42 @@ pub fn validate_key_with_context(
   }
 }
 
+pub fn deactivate_integration_key(
+  business_id: String,
+  key_type: String,
+  key_name: String,
+) -> Result(Nil, SupabaseError) {
+  let body = json.object([#("is_active", json.bool(False))]) |> json.to_string()
+
+  let path =
+    "/integration_keys?business_id=eq."
+    <> business_id
+    <> "&key_type=eq."
+    <> key_type
+    <> "&key_name=eq."
+    <> key_name
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Deactivating key at path: " <> path,
+  )
+
+  use response <- result.try(make_request(http.Patch, path, Some(body)))
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Deactivate response: "
+      <> int.to_string(response.status)
+      <> " - "
+      <> response.body,
+  )
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    _ -> Error(DatabaseError("Failed to deactivate key: " <> response.body))
+  }
+}
+
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
@@ -2347,7 +2383,14 @@ pub fn get_integration_keys(
     Some(kt) -> "&key_type=eq." <> kt
     None -> ""
   }
-  let path = "/integration_keys?business_id=eq." <> business_id <> type_filter
+
+  // ADD THIS LINE - only return active keys
+  let active_filter = "&is_active=eq.true"
+  let path =
+    "/integration_keys?business_id=eq."
+    <> business_id
+    <> type_filter
+    <> active_filter
 
   use response <- result.try(make_request(http.Get, path, None))
 
