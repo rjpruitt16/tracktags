@@ -431,8 +431,26 @@ pub fn list_failed_webhooks(req: Request) -> Response {
   use <- with_admin_auth(req)
   use <- wisp.require_method(req, http.Get)
 
-  case supabase_client.get_failed_stripe_events(50) {
+  // Get business_id from query params
+  let business_id =
+    wisp.get_query(req)
+    |> list.key_find("business_id")
+    |> result.unwrap("")
+
+  logging.log(
+    logging.Info,
+    "[AdminHandler] Getting failed webhooks for business: " <> business_id,
+  )
+
+  case supabase_client.get_failed_stripe_events_for_business(business_id, 50) {
     Ok(events) -> {
+      logging.log(
+        logging.Info,
+        "[AdminHandler] Found "
+          <> int.to_string(list.length(events))
+          <> " failed events",
+      )
+
       let events_json =
         events
         |> list.map(fn(event) {
@@ -455,7 +473,21 @@ pub fn list_failed_webhooks(req: Request) -> Response {
         200,
       )
     }
-    Error(_) -> wisp.internal_server_error()
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[AdminHandler] Failed to get webhooks: " <> string.inspect(err),
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Internal Server Error")),
+            #("message", json.string("Failed to fetch failed webhooks")),
+          ]),
+        ),
+        500,
+      )
+    }
   }
 }
 

@@ -771,20 +771,56 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEventRecord) {
   ))
 }
 
-pub fn get_failed_stripe_events(
+pub fn get_failed_stripe_events_for_business(
+  business_id: String,
   limit: Int,
 ) -> Result(List(StripeEventRecord), SupabaseError) {
-  let path =
-    "/stripe_events?status=eq.failed&order=created_at.desc&limit="
-    <> int.to_string(limit)
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting failed events for business: " <> business_id,
+  )
+
+  let path = case business_id {
+    "" ->
+      "/stripe_events?status=eq.failed&order=created_at.desc&limit="
+      <> int.to_string(limit)
+      <> "&select=event_id,event_type,status,retry_count,raw_payload::text,error_message,created_at"
+    _ ->
+      "/stripe_events?business_id=eq."
+      <> business_id
+      <> "&status=eq.failed&order=created_at.desc&limit="
+      <> int.to_string(limit)
+      <> "&select=event_id,event_type,status,retry_count,raw_payload::text,error_message,created_at"
+  }
 
   use response <- result.try(make_request(http.Get, path, None))
+
+  // ✅ ADD THIS LOGGING
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Response status: " <> int.to_string(response.status),
+  )
+  logging.log(logging.Info, "[SupabaseClient] Response body: " <> response.body)
 
   case response.status {
     200 -> {
       case json.parse(response.body, decode.list(stripe_event_decoder())) {
-        Ok(events) -> Ok(events)
-        Error(_) -> Error(ParseError("Invalid events"))
+        Ok(events) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] Successfully parsed "
+              <> int.to_string(list.length(events))
+              <> " events",
+          )
+          Ok(events)
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] Parse error: " <> string.inspect(e),
+          )
+          Error(ParseError("Invalid events"))
+        }
       }
     }
     _ -> Error(DatabaseError("Failed to get failed events"))
