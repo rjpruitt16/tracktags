@@ -2,76 +2,161 @@
 
 **The only service you need to launch your product in a weekend.**
 
-Built for indie hackers who need **billing metrics** and **auto-scaling** without the enterprise complexity. Launch fast, scale automatically, stay focused on your customers.
+Built for indie hackers who need **billing metrics** and **usage tracking** without the enterprise complexity. Launch fast, scale automatically, stay focused on your customers.
 
 ## 🎯 Why TrackTags?
 
-- **⚡ Weekend Launch Ready**: Get metrics, billing, and scaling in hours, not weeks
+- **⚡ Weekend Launch Ready**: Get metrics, billing, and plan limits in hours, not weeks
 - **💰 Revenue-First**: Built-in Stripe integration for usage-based billing  
-- **🔄 Auto-Scale**: Fly.io machine API integration for demand-based scaling
+- **🔄 Business Logic Focus**: Let your services focus on features, not billing infrastructure
 - **🛡️ Fault Tolerant**: Built on the BEAM with OTP supervision trees
-- **🔐 Security First**: Encrypted API keys with Doppler integration (coming soon)
+- **🔐 Security First**: Encrypted API keys and webhook signature verification
 
 Perfect for **GTM engineers** who need reliability without the DevOps overhead.
 
 ---
 
+## 💡 Why I Built This
+
+I created TrackTags to power [EZThrottle.network](https://ezthrottle.network) - a rate limiting service that needed robust billing, auth, and usage tracking **without getting distracted from the core business logic**.
+
+The beauty of TrackTags is simple: **your services handle business logic, TrackTags handles everything else.**
+
+- Proxy API checks plan limits **before** forwarding requests
+- Your service processes successfully, **then** increments usage
+- No failed requests = no wasted quota
+- No billing infrastructure in your codebase
+
+---
+
 ## 🚀 Quick Start
 
-### 1. Create an API Key
+### 1. Create a Business (Platform Admin)
 ```bash
-curl -X POST "https://api.tracktags.com/api/v1/keys" \
-  -H "Authorization: Bearer your_admin_key" \
+curl -X POST "https://api.tracktags.com/api/v1/businesses" \
+  -H "X-Admin-Key: your_admin_key" \
   -H "Content-Type: application/json" \
   -d '{
-    "integration_type": "api",
-    "key_name": "production",
+    "business_name": "Acme Corp",
+    "email": "admin@acme.com"
+  }'
+
+# Response: {"business_id": "biz_abc123", ...}
+```
+
+### 2. Generate Business API Key
+```bash
+curl -X POST "https://api.tracktags.com/api/v1/keys" \
+  -H "X-Admin-Key: your_admin_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "business_id": "biz_abc123",
+    "key_type": "business",
+    "key_name": "primary",
     "credentials": {
-      "environment": "production"
+      "business_id": "biz_abc123",
+      "api_key": "tk_live_generated_key"
     }
+  }'
+
+# Response: {"api_key": "tk_live_...", "warning": "Save this key!"}
+```
+
+### 3. Create a Customer
+```bash
+curl -X POST "https://api.tracktags.com/api/v1/customers" \
+  -H "Authorization: Bearer tk_live_your_business_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "customer_id": "cust_xyz789",
+    "customer_name": "Customer Inc",
+    "email": "contact@customer.com",
+    "plan_id": "plan_pro"
   }'
 ```
 
-### 2. Submit Business Metrics
+### 4. Generate Customer API Key
 ```bash
-# Track company-wide metrics
-curl -X POST "https://api.tracktags.com/api/v1/metrics" \
-  -H "Authorization: Bearer tk_live_your_key" \
+curl -X POST "https://api.tracktags.com/api/v1/customers/cust_xyz789/keys" \
+  -H "Authorization: Bearer tk_live_your_business_key" \
+  -H "Content-Type: application/json" \
+  -d '{"key_name": "customer_primary"}'
+
+# Response: {"api_key": "tk_cust_...", "warning": "Save this key!"}
+```
+
+### 5. Create Plan Limit Metrics
+```bash
+# Business creates metrics for customer (with plan limits)
+curl -X POST "https://api.tracktags.com/api/v1/metrics?scope=customer&customer_id=cust_xyz789" \
+  -H "Authorization: Bearer tk_live_your_business_key" \
   -H "Content-Type: application/json" \
   -d '{
     "metric_name": "api_calls",
-    "initial_value": 1.0,
-    "flush_interval": "5s",
     "operation": "SUM",
-    "metric_type": "reset"
+    "metric_type": "reset",
+    "flush_interval": "1d",
+    "initial_value": 0.0,
+    "limit_value": 1000.0,
+    "limit_operator": "gte",
+    "breach_action": "deny"
   }'
 ```
 
-### 3. Submit Client Metrics
+### 6. Use Proxy for Plan Enforcement
 ```bash
-# Track per-customer usage for billing
-curl -X POST "https://api.tracktags.com/api/v1/metrics?scope=client&client_id=customer_123" \
-  -H "Authorization: Bearer tk_live_your_key" \
+# Customer makes request through proxy
+curl -X POST "https://api.tracktags.com/api/v1/proxy" \
+  -H "Authorization: Bearer tk_cust_customer_key" \
   -H "Content-Type: application/json" \
   -d '{
-    "metric_name": "api_usage",
-    "initial_value": 50.0,
+    "scope": "customer",
+    "metric_name": "api_calls",
+    "target_url": "https://your-service.com/api/endpoint",
+    "method": "POST",
+    "body": "{\"data\": \"your_payload\"}"
+  }'
+
+# If under limit: {"status": "allowed", "forwarded_response": {...}}
+# If over limit: {"status": "denied", "error": "Plan limit exceeded"}
+```
+
+### 7. Increment After Success (Your Service)
+```bash
+# Your service successfully processes request, then increments
+curl -X PUT "https://api.tracktags.com/api/v1/metrics/api_calls?scope=customer&customer_id=cust_xyz789" \
+  -H "Authorization: Bearer tk_live_your_business_key" \
+  -H "Content-Type: application/json" \
+  -d '{"value": 1.0}'
+```
+
+### 8. Stripe Billing Integration
+```bash
+# Create StripeBilling metric for metered usage
+curl -X POST "https://api.tracktags.com/api/v1/metrics?scope=customer&customer_id=cust_xyz789" \
+  -H "Authorization: Bearer tk_live_your_business_key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "metric_name": "storage_gb",
+    "operation": "SUM",
+    "metric_type": "stripe_billing",
     "flush_interval": "1m",
-    "operation": "COUNT",
-    "metric_type": "checkpoint",
+    "initial_value": 0.0,
     "metadata": {
       "integrations": {
         "stripe": {
           "enabled": true,
-          "price_id": "price_1234"
+          "price_id": "price_1234567890",
+          "restore_on_startup": false,
+          "batch_interval": "1d"
         }
       }
     }
   }'
-```
 
-### 4. Machine Metrics (Coming Soon)
-Auto-scale your infrastructure based on real usage patterns.
+# Webhook URL for your business: https://api.tracktags.com/api/v1/webhooks/stripe/{business_id}
+# On invoice.finalized, TrackTags auto-reports usage to Stripe and resets metric
+```
 
 ---
 
@@ -79,11 +164,11 @@ Auto-scale your infrastructure based on real usage patterns.
 
 ```
 ┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Your App      │───▶│   TrackTags      │───▶│   Fly.io        │
-│                 │    │                  │    │   Auto-Scale    │
-│ Send Metrics    │    │ • Process        │    │                 │
-│ Get Billed      │    │ • Aggregate      │    │ Spin up/down    │
-│ Scale on Demand │    │ • Bill via Stripe│    │ based on load   │
+│   Your Service  │───▶│   TrackTags      │───▶│   Stripe API    │
+│                 │    │                  │    │                 │
+│ Business Logic  │    │ • Plan Limits    │    │ Usage Billing   │
+│ Only!           │    │ • Usage Tracking │    │                 │
+│                 │    │ • Proxy Checks   │    │ Auto-reports    │
 └─────────────────┘    └──────────────────┘    └─────────────────┘
 ```
 
@@ -91,22 +176,25 @@ Auto-scale your infrastructure based on real usage patterns.
 
 ---
 
-## 💡 Use Cases
+## 🔧 Metric Types
 
-### For SaaS Builders
-- **Usage-based billing**: Track API calls, storage, compute time
-- **Customer analytics**: Per-tenant metrics and insights  
-- **Auto-scaling**: Scale infrastructure based on real usage
+### Reset
+Resets to initial value on flush interval (e.g., daily API call limits)
 
-### For API Companies  
-- **Rate limiting**: Enforce plan limits automatically
-- **Revenue optimization**: Convert usage into revenue streams
-- **Reliability**: Never lose billing data, even during outages
+### Checkpoint  
+Accumulates indefinitely until explicitly reset (e.g., total lifetime usage)
 
-### For Indie Hackers
-- **Fast validation**: Get billing infrastructure in a weekend
-- **Focus on product**: Let TrackTags handle the infrastructure
-- **Scale when ready**: Built-in auto-scaling for when you hit PMF
+### StripeBilling
+Accumulates during billing period, reports to Stripe on `invoice.finalized`, then resets
+
+---
+
+## ⚠️ Experimental Features
+
+### Fly.io Auto-Scaling
+**Status**: 🚧 Experimental - Not production tested
+
+Machine provisioning via Fly.io API integration is implemented but **not battle-tested**. Use at your own risk for now.
 
 ---
 
@@ -120,41 +208,49 @@ Auto-scale your infrastructure based on real usage patterns.
 
 ---
 
-📄 License
+## 📄 License
 
-TrackTags is licensed under the Business Source License 1.1.
+TrackTags is licensed under the **Business Source License 1.1**.
 
-What this means:
+**What this means:**
 
 ✅ You CAN:
-
-Use TrackTags for your own business
-
-Self-host for internal use
-
-Modify and fork the code
-
-Contribute to the project
+- Use TrackTags for your own business
+- Self-host for internal use
+- Modify and fork the code
+- Contribute to the project
 
 ❌ You CANNOT:
+- Sell TrackTags as a hosted service to third parties
+- Compete with the official TrackTags hosting platform
 
-Sell TrackTags as a hosted service to third parties
+**Timeline:**
+- Until **3-4 years after official launch** (date TBD): BSL restrictions apply
+- After restriction period: Automatically becomes Apache 2.0 (fully open source)
 
-Compete with the official TrackTags hosting platform---
+This protects the commercial hosting business during the critical growth phase while ensuring eventual full open source.
 
-Timeline:
+---
 
-Until July 19, 2029: BSL restrictions apply
+## ☁️ Hosted Version
 
-After July 19, 2029: Automatically becomes Apache 2.0 (fully open source)
+A cloud version of TrackTags is available at **https://tracktags.fly.dev**
 
-This gives you 4 years to use TrackTags freely while protecting the commercial hosting business during the critical growth phase.
+⚠️ **Important**: I'm not guaranteeing support until **Q3 2026**. Use the hosted version at your own risk until then.
+
+For production use, **self-hosting is recommended** until the hosted version stabilizes.
+
+---
+
+## 🚢 Self-Hosting
 
 ```bash
 # Docker deployment
 docker run -p 8080:8080 \
   -e SUPABASE_URL=your_db_url \
   -e SUPABASE_KEY=your_db_key \
+  -e STRIPE_API_KEY=your_stripe_key \
+  -e STRIPE_WEBHOOK_SECRET=your_webhook_secret \
   tracktags/server:latest
 
 # Or build from source
@@ -165,8 +261,7 @@ gleam run
 
 **Requirements**: 
 - PostgreSQL database (or Supabase)
-- Optional: Fly.io account for auto-scaling
-- Optional: Stripe account for billing
+- Stripe account for billing (optional)
 
 ---
 
@@ -175,12 +270,11 @@ gleam run
 ### Current
 - ✅ **Supabase/PostgreSQL**: Metrics storage and analytics
 - ✅ **Stripe**: Usage-based billing and webhooks  
-- ✅ **Fly.io**: Auto-scaling machine management
+- 🚧 **Fly.io**: Auto-scaling machine management (experimental)
 
 ### Coming Soon
-- 🚧 **Doppler**: Secure API key rotation
-- 🚧 **Webhooks**: Send metrics to your own services
 - 🚧 **Dashboard**: Real-time metrics visualization
+- 🚧 **Webhooks**: Send metrics to your own services
 
 ---
 
@@ -218,11 +312,3 @@ Tired of being paged for Elixir bugs? I can write Gleam packages or services tha
 ---
 
 **⭐ Star this repo if TrackTags helps you launch faster!** Your support helps bring mature tooling to the Gleam ecosystem.
-
----
-
-## 📞 Support
-
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/tracktags/issues)
-
-**Built for indie hackers, by an indie hacker. Let's ship fast and scale smart.** 🚀
