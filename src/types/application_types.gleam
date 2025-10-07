@@ -52,5 +52,13 @@ pub type ApplicationMessage {
       Result(process.Subject(business_types.Message), String),
     ),
   )
+  UnregisterBusinessKey(
+    key_hash: String,
+    reply: process.Subject(Result(Nil, String)),
+  )
+  UnregisterCustomerKey(
+    key_hash: String,
+    reply: process.Subject(Result(Nil, String)),
+  )
   Shutdown
 }

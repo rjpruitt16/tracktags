@@ -291,6 +291,19 @@ fn handle_application_message(
       process.send(reply_to, result)
       actor.continue(state)
     }
+
+    application_types.UnregisterBusinessKey(key_hash, reply) -> {
+      let result = auth.unregister_business_api_key(key_hash)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
+    application_types.UnregisterCustomerKey(key_hash, reply) -> {
+      let result = auth.unregister_customer_api_key(key_hash)
+      process.send(reply, result)
+      actor.continue(state)
+    }
+
     application_types.Shutdown -> {
       logging.log(logging.Info, "[ApplicationActor] Shutting down")
       process.send(state.clock_actor, clock_actor.Shutdown)

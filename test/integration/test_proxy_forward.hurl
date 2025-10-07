@@ -12,22 +12,20 @@ HTTP 201
 [Captures]
 business_id: jsonpath "$.business_id"
 
-# Step 2: Create business API key (admin operation)
-POST {{TRACKTAGS_URL}}/api/v1/keys
+# Step 2: Create business API key
+POST {{TRACKTAGS_URL}}/api/v1/businesses/{{business_id}}/keys
 X-Admin-Key: {{ADMIN_SECRET_KEY}}
 Content-Type: application/json
 {
-  "business_id": "{{business_id}}",
   "key_type": "business",
   "key_name": "primary",
   "credentials": {
-    "business_id": "{{business_id}}",
-    "api_key": "tk_test_{{test_id}}"
+    "description": "Primary API Key"
   }
 }
 HTTP 201
 [Captures]
-business_key: jsonpath "$.api_key"
+business_key: jsonpath "$.api_key"    # <-- ADD THIS LINE
 
 # Step 3: Verify business key with retries
 GET {{TRACKTAGS_URL}}/api/v1/metrics
@@ -51,11 +49,17 @@ HTTP 201
 [Captures]
 customer_id: jsonpath "$.customer_id"
 
-# Step 5: Create customer API key
-POST {{TRACKTAGS_URL}}/api/v1/customers/{{customer_id}}/keys
+# Step 5: Create customer API key (NEW ROUTE)
+POST {{TRACKTAGS_URL}}/api/v1/businesses/{{business_id}}/customers/{{customer_id}}/keys
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
-{"key_name": "customer_primary"}
+{
+  "key_type": "customer_api",
+  "key_name": "{{customer_id}}",
+  "credentials": {
+    "description": "Customer API Key"
+  }
+}
 HTTP 201
 [Captures]
 customer_key: jsonpath "$.api_key"

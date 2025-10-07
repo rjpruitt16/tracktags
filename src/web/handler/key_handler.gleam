@@ -25,9 +25,18 @@ pub type KeyType {
   Fly
 }
 
+// Body-only request (no business_id in body)
+pub type KeyRequestBody {
+  KeyRequestBody(
+    key_type: String,
+    key_name: String,
+    credentials: Dict(String, String),
+  )
+}
+
+// Full request (with business_id from URL)
 pub type KeyRequest {
   KeyRequest(
-    business_id: option.Option(String),
     key_type: String,
     key_name: String,
     credentials: Dict(String, String),
@@ -99,19 +108,12 @@ fn validate_credentials(
 fn validate_business_credentials(
   credentials: Dict(String, String),
 ) -> Result(Nil, String) {
-  case dict.get(credentials, "business_id") {
-    Ok("biz_" <> _) -> Ok(Nil)
-    Ok(_) -> Error("Business ID must start with biz_")
-    Error(_) -> Error("Missing business_id for business key")
+  // Just validate description or other fields if needed
+  case dict.get(credentials, "description") {
+    Ok(_) -> Ok(Nil)
+    Error(_) -> Ok(Nil)
+    // Description is optional
   }
-  |> result.try(fn(_) {
-    case dict.get(credentials, "api_key") {
-      Ok("tk_live_" <> _) -> Ok(Nil)
-      Ok("tk_test_" <> _) -> Ok(Nil)
-      Ok(_) -> Error("API key must start with tk_live_ or tk_test_")
-      Error(_) -> Error("Missing api_key for business key")
-    }
-  })
 }
 
 fn validate_stripe_credentials(
@@ -241,20 +243,15 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
 // JSON DECODERS
 // ============================================================================
 
-fn key_request_decoder() -> decode.Decoder(KeyRequest) {
-  use business_id <- decode.optional_field(
-    "business_id",
-    None,
-    decode.optional(decode.string),
-  )
+fn key_request_body_decoder() -> decode.Decoder(KeyRequestBody) {
   use key_type <- decode.field("key_type", decode.string)
   use key_name <- decode.field("key_name", decode.string)
   use credentials <- decode.field(
     "credentials",
     decode.dict(decode.string, decode.string),
   )
-  decode.success(KeyRequest(
-    business_id: business_id,
+
+  decode.success(KeyRequestBody(
     key_type: key_type,
     key_name: key_name,
     credentials: credentials,
@@ -264,6 +261,450 @@ fn key_request_decoder() -> decode.Decoder(KeyRequest) {
 // ============================================================================
 // API ENDPOINTS
 // ============================================================================
+
+// src/web/handler/key_handler.gleam
+
+/// CREATE - POST /api/v1/businesses/{business_id}/keys
+pub fn create_business_key(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _ <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let result = {
+    use key_body <- result.try(decode.run(json_data, key_request_body_decoder()))
+
+    // Build full KeyRequest with business_id from URL
+    let key_req =
+      KeyRequest(
+        key_type: key_body.key_type,
+        key_name: key_body.key_name,
+        credentials: key_body.credentials,
+      )
+
+    use _ <- result.try(validate_key_request(key_req))
+    Ok(process_create_business_key(business_id, key_req))
+  }
+
+  case result {
+    Ok(response) -> response
+    Error(decode_errors) -> {
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] Bad request: " <> string.inspect(decode_errors),
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string("Invalid key data")),
+          ]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+/// LIST - GET /api/v1/businesses/{business_id}/keys
+pub fn list_business_keys(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use _ <- with_auth(req)
+
+  case supabase_client.get_integration_keys(business_id, None) {
+    Ok(keys) -> {
+      let response_data =
+        keys
+        |> list.map(fn(key) {
+          json.object([
+            #("id", json.string(key.id)),
+            #("key_type", json.string(key.key_type)),
+            #("key_name", json.string(key.key_name)),
+            #("is_active", json.bool(key.is_active)),
+            #("created_at", json.string(key.created_at)),
+          ])
+        })
+        |> json.array(from: _, of: fn(item) { item })
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("keys", response_data),
+            #("count", json.int(list.length(keys))),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+/// GET - GET /api/v1/businesses/{business_id}/keys/{key_type}/{key_name}
+pub fn get_business_key(
+  req: Request,
+  business_id: String,
+  key_type: String,
+  key_name: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use _ <- with_auth(req)
+
+  let composite_key = business_id <> "/" <> key_type <> "/" <> key_name
+
+  case supabase_client.get_integration_key_by_composite(composite_key) {
+    Ok(key) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("key_type", json.string(key.key_type)),
+            #("key_name", json.string(key.key_name)),
+            #("is_active", json.bool(key.is_active)),
+            #("created_at", json.string(key.created_at)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(supabase_client.NotFound(_)) -> wisp.not_found()
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+/// UPDATE - PUT /api/v1/businesses/{business_id}/keys/{key_type}/{key_name}
+pub fn update_business_key(
+  req: Request,
+  business_id: String,
+  key_type: String,
+  key_name: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Put)
+  use _ <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let decoder =
+    decode.field(
+      "credentials",
+      decode.dict(decode.string, decode.string),
+      decode.success,
+    )
+
+  case decode.run(json_data, decoder) {
+    Ok(credentials) -> {
+      case key_type {
+        "stripe_frontend" -> {
+          let frontend_json =
+            json.object([
+              #(
+                "pricing_table_id",
+                json.string(
+                  dict.get(credentials, "pricing_table_id") |> result.unwrap(""),
+                ),
+              ),
+              #(
+                "publishable_key",
+                json.string(
+                  dict.get(credentials, "publishable_key") |> result.unwrap(""),
+                ),
+              ),
+            ])
+
+          case
+            supabase_client.update_integration_key(
+              business_id,
+              key_type,
+              key_name,
+              json.to_string(frontend_json),
+            )
+          {
+            Ok(_) -> {
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("status", json.string("updated")),
+                    #("message", json.string("Configuration updated")),
+                  ]),
+                ),
+                200,
+              )
+            }
+            Error(_) -> wisp.internal_server_error()
+          }
+        }
+        _ -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #(
+                  "error",
+                  json.string("Update not supported for this key type"),
+                ),
+              ]),
+            ),
+            400,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Invalid request data"))]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+/// DELETE - DELETE /api/v1/businesses/{business_id}/keys/{key_type}/{key_name}
+pub fn delete_business_key(
+  req: Request,
+  business_id: String,
+  key_type: String,
+  key_name: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Delete)
+  use _ <- with_auth(req)
+
+  logging.log(
+    logging.Info,
+    "[KeyHandler] Deleting key: "
+      <> business_id
+      <> "/"
+      <> key_type
+      <> "/"
+      <> key_name,
+  )
+
+  case
+    supabase_client.deactivate_integration_key(business_id, key_type, key_name)
+  {
+    Ok(_) -> {
+      let _ =
+        audit.log_action(
+          "delete_key",
+          "integration_key",
+          business_id <> "/" <> key_type <> "/" <> key_name,
+          dict.from_list([
+            #("key_type", json.string(key_type)),
+            #("key_name", json.string(key_name)),
+          ]),
+        )
+      wisp.ok() |> wisp.string_body("Key deleted")
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+/// CREATE - POST /api/v1/businesses/{business_id}/customers/{customer_id}/keys
+pub fn create_customer_key(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _ <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let result = {
+    use key_body <- result.try(decode.run(json_data, key_request_body_decoder()))
+
+    // Validate key_name matches customer_id for customer keys
+    case key_body.key_type {
+      "customer_api" -> {
+        case key_body.key_name == customer_id {
+          True -> Ok(key_body)
+          False ->
+            Error([
+              decode.DecodeError(
+                "key_name must match customer_id for customer keys",
+                "",
+                [],
+              ),
+            ])
+        }
+      }
+      _ -> Ok(key_body)
+    }
+  }
+
+  case result {
+    Ok(_key_body) -> {
+      // Check if key already exists
+      case
+        supabase_client.get_integration_keys(business_id, Some("customer_api"))
+      {
+        Ok(existing_keys) -> {
+          let has_existing =
+            list.any(existing_keys, fn(key) {
+              key.key_name == customer_id && key.is_active
+            })
+
+          case has_existing {
+            True -> {
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("error", json.string("Conflict")),
+                    #(
+                      "message",
+                      json.string("Customer already has an active API key"),
+                    ),
+                  ]),
+                ),
+                409,
+              )
+            }
+            False -> generate_and_store_customer_key(business_id, customer_id)
+          }
+        }
+        Error(_) -> generate_and_store_customer_key(business_id, customer_id)
+      }
+    }
+    Error(decode_errors) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string(string.inspect(decode_errors))),
+          ]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+/// LIST - GET /api/v1/businesses/{business_id}/customers/{customer_id}/keys
+pub fn list_customer_keys(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use _ <- with_auth(req)
+
+  case supabase_client.get_integration_keys(business_id, Some("customer_api")) {
+    Ok(keys) -> {
+      let customer_keys =
+        list.filter(keys, fn(key) { key.key_name == customer_id })
+
+      let response_data =
+        customer_keys
+        |> list.map(fn(key) {
+          json.object([
+            #("id", json.string(key.id)),
+            #("key_name", json.string(key.key_name)),
+            #("is_active", json.bool(key.is_active)),
+            #("created_at", json.string(key.created_at)),
+          ])
+        })
+        |> json.array(from: _, of: fn(item) { item })
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("keys", response_data),
+            #("count", json.int(list.length(customer_keys))),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(_) -> wisp.internal_server_error()
+  }
+}
+
+pub fn delete_customer_key(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+  key_name: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Delete)
+  use _ <- with_auth(req)
+
+  // Validate that the key_name matches the customer_id (security check)
+  case key_name == customer_id {
+    False -> {
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] Attempt to delete key for wrong customer: key="
+          <> key_name
+          <> " customer="
+          <> customer_id,
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Forbidden")),
+            #("message", json.string("Key does not belong to this customer")),
+          ]),
+        ),
+        403,
+      )
+    }
+    True -> {
+      case
+        supabase_client.deactivate_integration_key(
+          business_id,
+          "customer_api",
+          customer_id,
+          // Use customer_id as the key_name
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[KeyHandler] ✅ Deleted customer key for: " <> customer_id,
+          )
+          wisp.ok() |> wisp.string_body("Key deleted")
+        }
+        Error(_) -> wisp.internal_server_error()
+      }
+    }
+  }
+}
+
+// Helper remains the same
+fn process_create_business_key(business_id: String, req: KeyRequest) -> Response {
+  // Check key limit
+  case supabase_client.get_integration_keys(business_id, Some(req.key_type)) {
+    Ok(existing_keys) -> {
+      let active_count = list.count(existing_keys, fn(k) { k.is_active })
+      case active_count >= 2 {
+        True -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Key Limit Reached")),
+                #(
+                  "message",
+                  json.string(
+                    "Maximum 2 active keys per type. Delete a key first.",
+                  ),
+                ),
+              ]),
+            ),
+            409,
+          )
+        }
+        False -> {
+          let request_id = utils.generate_request_id()
+          // Generate here
+          create_and_store_key(business_id, req, request_id)
+          // Pass it
+        }
+      }
+    }
+    Error(_) -> {
+      let request_id = utils.generate_request_id()
+      // Generate here
+      create_and_store_key(business_id, req, request_id)
+      // Pass it
+    }
+  }
+}
 
 /// CREATE - POST /api/v1/key
 pub fn create_key(req: Request) -> Response {
@@ -278,7 +719,16 @@ pub fn create_key(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use key_req <- result.try(decode.run(json_data, key_request_decoder()))
+    use key_body <- result.try(decode.run(json_data, key_request_body_decoder()))
+
+    // Build KeyRequest from body
+    let key_req =
+      KeyRequest(
+        key_type: key_body.key_type,
+        key_name: key_body.key_name,
+        credentials: key_body.credentials,
+      )
+
     use _ <- result.try(validate_key_request(key_req))
     Ok(process_create_key(business_id, key_req))
   }
@@ -634,23 +1084,16 @@ fn validate_key_request(
 
 fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
   let request_id = utils.generate_request_id()
-  logging.log(
-    logging.Info,
-    "[KeyHandler] 🔍 CREATE key START - ID: " <> request_id,
-  )
 
-  // Determine the actual business_id to use
+  // For business keys, business_id comes from auth
   let business_id = case business_id_param {
     "admin_override" -> {
-      case req.business_id {
-        option.Some(bid) -> bid
-        option.None -> ""
-      }
+      // Admin needs business_id somewhere - maybe query param?
+      business_id_param
     }
     _ -> business_id_param
   }
 
-  // Validate we have a business_id
   case business_id {
     "" -> {
       wisp.json_response(
@@ -664,72 +1107,33 @@ fn process_create_key(business_id_param: String, req: KeyRequest) -> Response {
       )
     }
     _ -> {
-      // Validate request matches
+      // Check key limit
       case
-        req.business_id == option.Some(business_id)
-        && req.key_type == "business"
+        supabase_client.get_integration_keys(business_id, Some(req.key_type))
       {
-        False -> {
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Bad Request")),
-                #("message", json.string("Invalid key creation request")),
-              ]),
-            ),
-            400,
-          )
-        }
-        True -> {
-          logging.log(
-            logging.Info,
-            "[KeyHandler] Processing CREATE key: "
-              <> business_id
-              <> "/"
-              <> req.key_type
-              <> "/"
-              <> req.key_name,
-          )
-
-          // NEW: Check if already at limit (2 keys per type)
-          case
-            supabase_client.get_integration_keys(
-              business_id,
-              Some(req.key_type),
-            )
-          {
-            Ok(existing_keys) -> {
-              let active_count =
-                list.count(existing_keys, fn(k) { k.is_active })
-              case active_count >= 2 {
-                True -> {
-                  wisp.json_response(
-                    json.to_string_tree(
-                      json.object([
-                        #("error", json.string("Key Limit Reached")),
-                        #(
-                          "message",
-                          json.string(
-                            "Maximum 2 active keys per type. Delete a key first.",
-                          ),
-                        ),
-                      ]),
+        Ok(existing_keys) -> {
+          let active_count = list.count(existing_keys, fn(k) { k.is_active })
+          case active_count >= 2 {
+            True -> {
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("error", json.string("Key Limit Reached")),
+                    #(
+                      "message",
+                      json.string(
+                        "Maximum 2 active keys per type. Delete a key first.",
+                      ),
                     ),
-                    409,
-                  )
-                }
-                False -> {
-                  // Continue with key creation
-                  create_and_store_key(business_id, req, request_id)
-                }
-              }
+                  ]),
+                ),
+                409,
+              )
             }
-            Error(_) -> {
-              // No existing keys or error checking - continue
-              create_and_store_key(business_id, req, request_id)
-            }
+            False -> create_and_store_key(business_id, req, request_id)
           }
         }
+        Error(_) -> create_and_store_key(business_id, req, request_id)
       }
     }
   }
@@ -822,88 +1226,6 @@ fn create_and_store_key(
   }
 }
 
-pub fn create_customer_key(req: Request, customer_id: String) -> Response {
-  use <- wisp.require_method(req, http.Post)
-  use business_id_from_auth <- with_auth(req)
-
-  // For admin requests, get business_id from body
-  case business_id_from_auth {
-    "admin_override" -> {
-      // Parse body to get business_id
-      use json_data <- wisp.require_json(req)
-
-      case
-        decode.run(
-          json_data,
-          decode.field("business_id", decode.string, decode.success),
-        )
-      {
-        Ok(bid) -> process_customer_key_creation(bid, customer_id)
-        Error(_) -> {
-          logging.log(
-            logging.Error,
-            "[KeyHandler] Admin request missing business_id in body",
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Bad Request")),
-              #(
-                "message",
-                json.string("business_id required in body for admin requests"),
-              ),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 400)
-        }
-      }
-    }
-    _ -> process_customer_key_creation(business_id_from_auth, customer_id)
-  }
-}
-
-fn process_customer_key_creation(
-  business_id: String,
-  customer_id: String,
-) -> Response {
-  logging.log(
-    logging.Info,
-    "[KeyHandler] Creating customer API key for: "
-      <> customer_id
-      <> " in business: "
-      <> business_id,
-  )
-
-  // Check if a key already exists for this customer
-  case supabase_client.get_integration_keys(business_id, Some("customer_api")) {
-    Ok(existing_keys) -> {
-      let has_existing =
-        list.any(existing_keys, fn(key) {
-          key.key_name == customer_id && key.is_active
-        })
-
-      case has_existing {
-        True -> {
-          logging.log(
-            logging.Warning,
-            "[KeyHandler] Customer already has an active API key: "
-              <> customer_id,
-          )
-          let error_json =
-            json.object([
-              #("error", json.string("Conflict")),
-              #(
-                "message",
-                json.string("Customer already has an active API key"),
-              ),
-            ])
-          wisp.json_response(json.to_string_tree(error_json), 409)
-        }
-        False -> generate_and_store_customer_key(business_id, customer_id)
-      }
-    }
-    Error(_) -> generate_and_store_customer_key(business_id, customer_id)
-  }
-}
-
 fn generate_and_store_customer_key(
   business_id: String,
   customer_id: String,
@@ -986,17 +1308,4 @@ fn generate_and_store_customer_key(
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
   }
-}
-
-pub fn list_customer_keys(req: Request, customer_id: String) -> Response {
-  use <- wisp.require_method(req, http.Get)
-  use business_id <- with_auth(req)
-
-  let success_json =
-    json.object([
-      #("message", json.string("List customer keys - TODO")),
-      #("business_id", json.string(business_id)),
-      #("customer_id", json.string(customer_id)),
-    ])
-  wisp.json_response(json.to_string_tree(success_json), 200)
 }

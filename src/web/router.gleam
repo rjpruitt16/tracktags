@@ -13,6 +13,7 @@ pub fn handle_request(req: Request) -> Response {
   use <- wisp.log_request(req)
   use <- wisp.rescue_crashes
   use req <- wisp.handle_head(req)
+
   case wisp.path_segments(req) {
     // Health check
     ["health"] ->
@@ -20,6 +21,7 @@ pub fn handle_request(req: Request) -> Response {
         Get -> health_check()
         _ -> wisp.method_not_allowed([Get])
       }
+
     // Admin APIs
     ["admin", "v1", "replay", business_id, event_id] ->
       case req.method {
@@ -38,6 +40,7 @@ pub fn handle_request(req: Request) -> Response {
         Get -> admin_handler.get_business_admin(req, business_id)
         _ -> wisp.method_not_allowed([Get])
       }
+
     ["admin", "webhooks", "failed"] ->
       case req.method {
         Get -> admin_handler.list_failed_webhooks(req)
@@ -55,9 +58,21 @@ pub fn handle_request(req: Request) -> Response {
         Get -> admin_handler.list_audit_logs(req)
         _ -> wisp.method_not_allowed([Get])
       }
+
     ["admin", "reconcile-platform"] ->
       case req.method {
         Post -> admin_handler.reconcile_platform(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
+    ["admin", "provision", "test"] -> admin_handler.provision_test(req)
+    ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
+    ["admin", "force-provision"] -> admin_handler.force_provision(req)
+
+    // Business management
+    ["api", "v1", "businesses"] ->
+      case req.method {
+        Post -> user_handler.create_business(req)
         _ -> wisp.method_not_allowed([Post])
       }
 
@@ -73,13 +88,111 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post])
       }
 
-    ["admin", "provision", "test"] -> admin_handler.provision_test(req)
-    ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
+    // Business key management
+    ["api", "v1", "businesses", business_id, "keys"] ->
+      case req.method {
+        Post -> key_handler.create_business_key(req, business_id)
+        Get -> key_handler.list_business_keys(req, business_id)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
 
-    ["admin", "force-provision"] -> admin_handler.force_provision(req)
+    ["api", "v1", "businesses", business_id, "keys", key_type, key_name] ->
+      case req.method {
+        Get ->
+          key_handler.get_business_key(req, business_id, key_type, key_name)
+        Put ->
+          key_handler.update_business_key(req, business_id, key_type, key_name)
+        Delete ->
+          key_handler.delete_business_key(req, business_id, key_type, key_name)
+        _ -> wisp.method_not_allowed([Get, Put, Delete])
+      }
+
+    // Customer management (OLD ROUTES - kept for backwards compatibility)
+    ["api", "v1", "customers"] ->
+      case req.method {
+        Post -> user_handler.create_customer(req)
+        Get -> user_handler.list_customers(req)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    ["api", "v1", "customers", customer_id] ->
+      case req.method {
+        Get -> user_handler.get_customer(req, customer_id)
+        Delete -> user_handler.delete_customer(req, customer_id)
+        _ -> wisp.method_not_allowed([Get, Delete])
+      }
+
     ["api", "v1", "customers", customer_id, "machines"] ->
-      user_handler.get_customer_machines(req, customer_id)
+      case req.method {
+        Get -> user_handler.get_customer_machines(req, customer_id)
+        _ -> wisp.method_not_allowed([Get])
+      }
 
+    // Customer management (NEW ROUTES - business scoped)
+    ["api", "v1", "businesses", _business_id, "customers"] ->
+      case req.method {
+        Post -> user_handler.create_customer(req)
+        Get -> user_handler.list_customers(req)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    ["api", "v1", "businesses", _business_id, "customers", customer_id] ->
+      case req.method {
+        Get -> user_handler.get_customer(req, customer_id)
+        Delete -> user_handler.delete_customer(req, customer_id)
+        _ -> wisp.method_not_allowed([Get, Delete])
+      }
+
+    [
+      "api",
+      "v1",
+      "businesses",
+      _business_id,
+      "customers",
+      customer_id,
+      "machines",
+    ] ->
+      case req.method {
+        Get -> user_handler.get_customer_machines(req, customer_id)
+        _ -> wisp.method_not_allowed([Get])
+      }
+
+    // Customer key management
+    ["api", "v1", "businesses", business_id, "customers", customer_id, "keys"] ->
+      case req.method {
+        Post -> key_handler.create_customer_key(req, business_id, customer_id)
+        Get -> key_handler.list_customer_keys(req, business_id, customer_id)
+        _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    [
+      "api",
+      "v1",
+      "businesses",
+      business_id,
+      "customers",
+      customer_id,
+      "keys",
+      key_name,
+    ] ->
+      case req.method {
+        Get ->
+          key_handler.get_business_key(
+            req,
+            business_id,
+            "customer_api",
+            key_name,
+          )
+        Delete ->
+          key_handler.delete_customer_key(
+            req,
+            business_id,
+            customer_id,
+            key_name,
+          )
+        _ -> wisp.method_not_allowed([Get, Delete])
+      }
+    // Stripe webhooks
     ["api", "v1", "webhooks", "stripe"] ->
       case req.method {
         Post -> stripe_handler.handle_stripe_webhook(req)
@@ -92,37 +205,7 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post])
       }
 
-    // Client CRUD API
-    ["api", "v1", "customers"] ->
-      case req.method {
-        Post -> user_handler.create_customer(req)
-        Get -> user_handler.list_customers(req)
-        _ -> wisp.method_not_allowed([Post, Get])
-      }
-
-    // Individual client operations
-    ["api", "v1", "customers", customer_id] ->
-      case req.method {
-        Get -> user_handler.get_customer(req, customer_id)
-        Delete -> user_handler.delete_customer(req, customer_id)
-        _ -> wisp.method_not_allowed([Get, Delete])
-      }
-
-    // Client key management
-    ["api", "v1", "customers", customer_id, "keys"] ->
-      case req.method {
-        Post -> key_handler.create_customer_key(req, customer_id)
-        Get -> key_handler.list_customer_keys(req, customer_id)
-        _ -> wisp.method_not_allowed([Post, Get])
-      }
-    // Add business endpoint
-    ["api", "v1", "businesses"] ->
-      case req.method {
-        Post -> user_handler.create_business(req)
-        _ -> wisp.method_not_allowed([Post])
-      }
-
-    // Metrics CRUD API
+    // Metrics API
     ["api", "v1", "metrics"] ->
       case req.method {
         Post -> metric_handler.create_metric(req)
@@ -130,7 +213,6 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
-    // Individual metric operations
     ["api", "v1", "metrics", metric_name] ->
       case req.method {
         Get -> metric_handler.get_metric(req, metric_name)
@@ -139,52 +221,29 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 
-    // key management - unified API
-    ["api", "v1", "keys"] ->
-      case req.method {
-        Post -> key_handler.create_key(req)
-        Get -> key_handler.list_key(req)
-        _ -> wisp.method_not_allowed([Post, Get])
-      }
-
-    // Individual key operations
-    ["api", "v1", "keys", key_type] ->
-      case req.method {
-        Get -> key_handler.get_key_by_type(req, key_type)
-        _ -> wisp.method_not_allowed([Get])
-      }
-
-    // Specific key by type and name
-    ["api", "v1", "keys", key_type, key_name] ->
-      case req.method {
-        Get -> key_handler.get_key(req, key_type, key_name)
-        Put -> key_handler.update_key(req, key_type, key_name)
-        Delete -> key_handler.delete_key(req, key_type, key_name)
-        _ -> wisp.method_not_allowed([Get, Put, Delete])
-      }
-
-    // Metric history/analytics
     ["api", "v1", "metrics", metric_name, "history"] ->
       case req.method {
         Get -> metric_handler.get_metric_history(req, metric_name)
         _ -> wisp.method_not_allowed([Get])
       }
+
+    // Plan limits API
     ["api", "v1", "plan_limits"] ->
       case req.method {
-        http.Get -> plan_limit_handler.list_plan_limits(req)
-        http.Post -> plan_limit_handler.create_plan_limit(req)
-        _ -> wisp.method_not_allowed([http.Get, http.Post])
-      }
-    ["api", "v1", "plan_limits", limit_id] ->
-      case req.method {
-        http.Get -> plan_limit_handler.get_plan_limit(req, limit_id)
-        http.Put -> plan_limit_handler.update_plan_limit(req, limit_id)
-        http.Delete -> plan_limit_handler.delete_plan_limit(req, limit_id)
-        _ -> wisp.method_not_allowed([http.Get, http.Put, http.Delete])
+        Get -> plan_limit_handler.list_plan_limits(req)
+        Post -> plan_limit_handler.create_plan_limit(req)
+        _ -> wisp.method_not_allowed([Get, Post])
       }
 
-    // 404 for everything else
-    // Add this route in your router
+    ["api", "v1", "plan_limits", limit_id] ->
+      case req.method {
+        Get -> plan_limit_handler.get_plan_limit(req, limit_id)
+        Put -> plan_limit_handler.update_plan_limit(req, limit_id)
+        Delete -> plan_limit_handler.delete_plan_limit(req, limit_id)
+        _ -> wisp.method_not_allowed([Get, Put, Delete])
+      }
+
+    // Proxy API
     ["api", "v1", "proxy"] ->
       case req.method {
         Post -> proxy_handler.check_and_forward(req)

@@ -14,8 +14,10 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
+import glixir
 import logging
 import storage/metric_store
+import types/application_types
 import types/business_types
 import types/customer_types.{type CustomerContext}
 import types/metric_types
@@ -131,13 +133,35 @@ pub fn validate_key_with_context(
   }
 }
 
+// Add this helper function at the top
+fn get_application_actor() -> Result(
+  process.Subject(application_types.ApplicationMessage),
+  String,
+) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.application_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Application actor not found")
+  }
+}
+
 pub fn deactivate_integration_key(
   business_id: String,
   key_type: String,
   key_name: String,
 ) -> Result(Nil, SupabaseError) {
-  let body = json.object([#("is_active", json.bool(False))]) |> json.to_string()
+  let composite_key = business_id <> "/" <> key_type <> "/" <> key_name
 
+  use integration_key <- result.try(get_integration_key_by_composite(
+    composite_key,
+  ))
+
+  let body = json.object([#("is_active", json.bool(False))]) |> json.to_string()
   let path =
     "/integration_keys?business_id=eq."
     <> business_id
@@ -146,23 +170,50 @@ pub fn deactivate_integration_key(
     <> "&key_name=eq."
     <> key_name
 
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Deactivating key at path: " <> path,
-  )
-
   use response <- result.try(make_request(http.Patch, path, Some(body)))
 
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Deactivate response: "
-      <> int.to_string(response.status)
-      <> " - "
-      <> response.body,
-  )
-
   case response.status {
-    200 | 204 -> Ok(Nil)
+    200 | 204 -> {
+      // CRITICAL: Unregister from auth cache via application actor
+      case get_application_actor() {
+        Ok(app_actor) -> {
+          let reply = process.new_subject()
+
+          case key_type {
+            "business" | "api" ->
+              process.send(
+                app_actor,
+                application_types.UnregisterBusinessKey(
+                  integration_key.key_hash,
+                  reply,
+                ),
+              )
+            "customer_api" ->
+              process.send(
+                app_actor,
+                application_types.UnregisterCustomerKey(
+                  integration_key.key_hash,
+                  reply,
+                ),
+              )
+            _ -> Nil
+          }
+
+          // Wait for response (optional - could be fire-and-forget)
+          let _ = process.receive(reply, 1000)
+          Nil
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] Could not unregister key - app actor not found",
+          )
+          Nil
+        }
+      }
+
+      Ok(Nil)
+    }
     _ -> Error(DatabaseError("Failed to deactivate key: " <> response.body))
   }
 }
@@ -2458,13 +2509,14 @@ pub fn get_integration_keys(
     None -> ""
   }
 
-  // ADD THIS LINE - only return active keys
   let active_filter = "&is_active=eq.true"
+
   let path =
     "/integration_keys?business_id=eq."
     <> business_id
     <> type_filter
     <> active_filter
+  // ✅ ADD THIS
 
   use response <- result.try(make_request(http.Get, path, None))
 

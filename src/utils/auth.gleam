@@ -351,3 +351,53 @@ fn ensure_customer_actor(
     Error(e) -> Error(e)
   }
 }
+
+/// Unregister a business API key from the cache
+pub fn unregister_business_api_key(api_key_hash: String) -> Result(Nil, String) {
+  let key = "apikey:" <> api_key_hash
+
+  case glixir.unregister_subject_string(business_api_keys_registry(), key) {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[Auth] Unregistered business key: "
+          <> string.slice(api_key_hash, 0, 10)
+          <> "...",
+      )
+      Ok(Nil)
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Warning,
+        "[Auth] Failed to unregister business key: " <> string.inspect(e),
+      )
+      // Don't fail - key might not have been registered
+      Ok(Nil)
+    }
+  }
+}
+
+/// Unregister a customer API key from the cache
+pub fn unregister_customer_api_key(api_key_hash: String) -> Result(Nil, String) {
+  let key = "apikey:" <> api_key_hash
+
+  case glixir.unregister_subject_string(customer_api_keys_registry(), key) {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[Auth] Unregistered customer key: "
+          <> string.slice(api_key_hash, 0, 10)
+          <> "...",
+      )
+      Ok(Nil)
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Warning,
+        "[Auth] Failed to unregister customer key: " <> string.inspect(e),
+      )
+      // Don't fail - key might not have been registered
+      Ok(Nil)
+    }
+  }
+}
