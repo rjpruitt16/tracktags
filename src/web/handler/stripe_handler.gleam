@@ -1172,7 +1172,7 @@ fn process_customer_stripe_event(
       case extract_subscription_data(event.data) {
         Ok(#(stripe_customer_id, price_id, status)) -> {
           case
-            supabase_client.update_customer_subscription(
+            supabase_client.update_business_subscription_by_stripe_customer(
               business_id,
               stripe_customer_id,
               status,

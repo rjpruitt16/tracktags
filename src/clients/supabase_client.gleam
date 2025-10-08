@@ -1,4 +1,5 @@
 // src/customers/supabase_client.gleam
+import birl
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -24,7 +25,7 @@ import types/metric_types
 import utils/crypto
 import utils/utils
 
-// ============================================================================
+//
 // TYPES
 // ============================================================================
 
@@ -1262,6 +1263,80 @@ pub fn create_business(
   }
 }
 
+fn timestamp_to_iso(timestamp: Int) -> String {
+  // Convert Unix timestamp to ISO8601 string
+  let datetime = birl.from_unix(timestamp)
+  birl.to_iso8601(datetime)
+}
+
+/// Update customer subscription (for admin override)
+pub fn update_customer_subscription(
+  business_id: String,
+  customer_id: String,
+  status: String,
+  price_id: String,
+  subscription_ends_at: Option(Int),
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating customer subscription: " <> customer_id,
+  )
+
+  let update_json = case subscription_ends_at {
+    Some(timestamp) ->
+      json.object([
+        #("subscription_status", json.string(status)),
+        #("stripe_price_id", json.string(price_id)),
+        #("subscription_ends_at", json.string(timestamp_to_iso(timestamp))),
+      ])
+    None ->
+      json.object([
+        #("subscription_status", json.string(status)),
+        #("stripe_price_id", json.string(price_id)),
+      ])
+  }
+
+  let url =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    url,
+    Some(json.to_string(update_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    404 -> Error(NotFound("Customer not found"))
+    _ -> Error(DatabaseError("Failed to update customer subscription"))
+  }
+}
+
+// For business's own Stripe webhooks
+pub fn update_business_subscription_by_stripe_customer(
+  business_id: String,
+  stripe_customer_id: String,
+  status: String,
+  price_id: String,
+) -> Result(response.Response(String), SupabaseError) {
+  // Update customers table WHERE business_id AND stripe_customer_id match
+  let update_json =
+    json.object([
+      #("stripe_subscription_status", json.string(status)),
+      #("stripe_price_id", json.string(price_id)),
+    ])
+
+  let url =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&stripe_customer_id=eq."
+    <> stripe_customer_id
+  make_request(http.Patch, url, Some(json.to_string(update_json)))
+}
+
 /// Update business subscription with optional override expiration
 pub fn update_business_subscription_with_override(
   stripe_customer_id: String,
@@ -1321,28 +1396,6 @@ pub fn update_business_subscription(
 
   let update_json = json.object(all_fields)
   let url = "/businesses?stripe_customer_id=eq." <> stripe_customer_id
-  make_request(http.Patch, url, Some(json.to_string(update_json)))
-}
-
-// For customer's own Stripe webhooks
-pub fn update_customer_subscription(
-  business_id: String,
-  stripe_customer_id: String,
-  status: String,
-  price_id: String,
-) -> Result(response.Response(String), SupabaseError) {
-  // Update customers table WHERE business_id AND stripe_customer_id match
-  let update_json =
-    json.object([
-      #("stripe_subscription_status", json.string(status)),
-      #("stripe_price_id", json.string(price_id)),
-    ])
-
-  let url =
-    "/customers?business_id=eq."
-    <> business_id
-    <> "&stripe_customer_id=eq."
-    <> stripe_customer_id
   make_request(http.Patch, url, Some(json.to_string(update_json)))
 }
 

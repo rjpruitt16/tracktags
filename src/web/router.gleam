@@ -69,6 +69,16 @@ pub fn handle_request(req: Request) -> Response {
     ["admin", "provision", "test"] -> admin_handler.provision_test(req)
     ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
     ["admin", "force-provision"] -> admin_handler.force_provision(req)
+    ["admin", "v1", "customers", business_id, customer_id, "override"] ->
+      case req.method {
+        Post ->
+          admin_handler.override_customer_subscription(
+            req,
+            business_id,
+            customer_id,
+          )
+        _ -> wisp.method_not_allowed([Post])
+      }
 
     // Business management
     ["api", "v1", "businesses"] ->

@@ -213,6 +213,111 @@ pub fn override_subscription_status(
   }
 }
 
+/// Override customer subscription status (admin only)
+pub fn override_customer_subscription(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Post)
+  use json_data <- wisp.require_json(req)
+
+  logging.log(
+    logging.Info,
+    "[AdminHandler] Overriding customer subscription: "
+      <> business_id
+      <> "/"
+      <> customer_id,
+  )
+
+  case parse_customer_override_request(json_data) {
+    Ok(#(status, price_id, expires_in_days)) -> {
+      // Calculate override expiration
+      let subscription_ends_at = case expires_in_days {
+        Some(days) -> Some(utils.current_timestamp() + { days * 86_400 })
+        None -> None
+      }
+
+      case
+        supabase_client.update_customer_subscription(
+          business_id,
+          customer_id,
+          status,
+          option.unwrap(price_id, "price_override"),
+          subscription_ends_at,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[AdminHandler] ✅ Customer subscription override successful",
+          )
+
+          let _ =
+            audit.log_action(
+              "override_customer_subscription",
+              "customer",
+              customer_id,
+              dict.from_list([
+                #("status", json.string(status)),
+                #("expires_in_days", case expires_in_days {
+                  Some(days) -> json.int(days)
+                  None -> json.null()
+                }),
+              ]),
+            )
+
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("status", json.string("success")),
+                #("customer_id", json.string(customer_id)),
+                #("subscription_status", json.string(status)),
+                #("message", json.string("Customer subscription updated")),
+              ]),
+            ),
+            200,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Update Failed")),
+                #(
+                  "message",
+                  json.string("Failed to update customer subscription"),
+                ),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
+    }
+    Error(error) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string(error)),
+          ]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+// Parser (reuse the same one)
+fn parse_customer_override_request(
+  data: Dynamic,
+) -> Result(#(String, Option(String), Option(Int)), String) {
+  parse_override_request(data)
+  // Same parser as business override
+}
+
 /// Get business details for admin dashboard
 pub fn get_business_admin(req: Request, business_id: String) -> Response {
   use <- with_admin_auth(req)
