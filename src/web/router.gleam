@@ -22,7 +22,32 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
-    // Admin APIs
+    // Admin webhooks
+    ["admin", "webhooks", "failed"] ->
+      case req.method {
+        Get -> admin_handler.list_failed_webhooks(req)
+        _ -> wisp.method_not_allowed([Get])
+      }
+
+    ["admin", "webhooks", "retry", event_id] ->
+      case req.method {
+        Post -> admin_handler.retry_webhook(req, event_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
+    ["admin", "audit-logs"] ->
+      case req.method {
+        Get -> admin_handler.list_audit_logs(req)
+        _ -> wisp.method_not_allowed([Get])
+      }
+
+    ["admin", "reconcile-platform"] ->
+      case req.method {
+        Post -> admin_handler.reconcile_platform(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
+    // Admin v1 APIs
     ["admin", "v1", "replay", business_id, event_id] ->
       case req.method {
         Post -> admin_handler.replay_webhook(req, business_id, event_id)
@@ -40,64 +65,6 @@ pub fn handle_request(req: Request) -> Response {
         Get -> admin_handler.get_business_admin(req, business_id)
         _ -> wisp.method_not_allowed([Get])
       }
-    ["admin", "webhooks", "failed"] ->
-      case req.method {
-        Get -> admin_handler.list_failed_webhooks(req)
-        _ -> wisp.method_not_allowed([Get])
-      }
-
-    ["admin", "webhooks", "retry", event_id] ->
-      case req.method {
-        Post -> admin_handler.retry_webhook(req, event_id)
-        _ -> wisp.method_not_allowed([Post])
-      }
-
-    ["admin", "audit-logs"] ->
-      case req.method {
-        Get -> admin_handler.list_audit_logs(req)
-        _ -> wisp.method_not_allowed([Get])
-      }
-    ["admin", "reconcile-platform"] ->
-      case req.method {
-        Post -> admin_handler.reconcile_platform(req)
-        _ -> wisp.method_not_allowed([Post])
-      }
-
-    ["api", "v1", "businesses", business_id] ->
-      case req.method {
-        Delete -> user_handler.delete_business(req, business_id)
-        _ -> wisp.method_not_allowed([Delete])
-      }
-
-    ["api", "v1", "businesses", business_id, "restore"] ->
-      case req.method {
-        Post -> user_handler.restore_business(req, business_id)
-        _ -> wisp.method_not_allowed([Post])
-      }
-
-    ["admin", "webhooks", "failed"] ->
-      case req.method {
-        Get -> admin_handler.list_failed_webhooks(req)
-        _ -> wisp.method_not_allowed([Get])
-      }
-
-    ["admin", "webhooks", "retry", event_id] ->
-      case req.method {
-        Post -> admin_handler.retry_webhook(req, event_id)
-        _ -> wisp.method_not_allowed([Post])
-      }
-
-    ["admin", "audit-logs"] ->
-      case req.method {
-        Get -> admin_handler.list_audit_logs(req)
-        _ -> wisp.method_not_allowed([Get])
-      }
-
-    ["admin", "reconcile-platform"] ->
-      case req.method {
-        Post -> admin_handler.reconcile_platform(req)
-        _ -> wisp.method_not_allowed([Post])
-      }
 
     ["admin", "provision", "test"] -> admin_handler.provision_test(req)
     ["admin", "terminate", "test"] -> admin_handler.terminate_test(req)
@@ -113,7 +80,8 @@ pub fn handle_request(req: Request) -> Response {
     ["api", "v1", "businesses", business_id] ->
       case req.method {
         Delete -> user_handler.delete_business(req, business_id)
-        _ -> wisp.method_not_allowed([Delete])
+        Put -> user_handler.update_business_info(req, business_id)
+        _ -> wisp.method_not_allowed([Delete, Put])
       }
 
     ["api", "v1", "businesses", business_id, "restore"] ->
@@ -226,6 +194,7 @@ pub fn handle_request(req: Request) -> Response {
           )
         _ -> wisp.method_not_allowed([Get, Delete])
       }
+
     // Stripe webhooks
     ["api", "v1", "webhooks", "stripe"] ->
       case req.method {

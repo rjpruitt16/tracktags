@@ -891,6 +891,40 @@ pub fn insert_audit_log(
   }
 }
 
+pub fn update_business_info(
+  business_id: String,
+  business_name: String,
+  email: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating business info: " <> business_id,
+  )
+
+  let update_json =
+    json.object([
+      #("business_name", json.string(business_name)),
+      #("email", json.string(email)),
+    ])
+
+  let url = "/businesses?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    url,
+    Some(json.to_string(update_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(logging.Info, "[SupabaseClient] ✅ Business info updated")
+      Ok(Nil)
+    }
+    404 -> Error(NotFound("Business not found: " <> business_id))
+    _ -> Error(DatabaseError("Failed to update business info"))
+  }
+}
+
 pub fn get_audit_logs(
   limit: Int,
   actor_id: Option(String),

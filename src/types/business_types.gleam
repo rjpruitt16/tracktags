@@ -69,38 +69,41 @@ pub fn lookup_business_subject(
 pub type Business {
   Business(
     business_id: String,
-    stripe_customer_id: Option(String),
-    stripe_subscription_id: Option(String),
     business_name: String,
     email: String,
     plan_type: String,
     subscription_status: String,
+    stripe_customer_id: Option(String),
+    stripe_subscription_id: Option(String),
+    stripe_price_id: Option(String),
     current_plan_id: Option(String),
     default_docker_image: Option(String),
     default_machine_size: Option(String),
     default_region: Option(String),
+    created_at: String,
+    subscription_ends_at: Option(String),
+    deleted_at: Option(String),
+    // ← ADD THIS
   )
 }
 
 pub fn business_decoder() -> decode.Decoder(Business) {
   use business_id <- decode.field("business_id", decode.string)
-  use stripe_customer_id <- decode.optional_field(
-    "stripe_customer_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use stripe_subscription_id <- decode.optional_field(
-    "stripe_subscription_id",
-    None,
-    decode.optional(decode.string),
-  )
   use business_name <- decode.field("business_name", decode.string)
   use email <- decode.field("email", decode.string)
   use plan_type <- decode.field("plan_type", decode.string)
-  use subscription_status <- decode.optional_field(
-    "subscription_status",
-    "active",
-    decode.string,
+  use subscription_status <- decode.field("subscription_status", decode.string)
+  use stripe_customer_id <- decode.field(
+    "stripe_customer_id",
+    decode.optional(decode.string),
+  )
+  use stripe_subscription_id <- decode.field(
+    "stripe_subscription_id",
+    decode.optional(decode.string),
+  )
+  use stripe_price_id <- decode.field(
+    "stripe_price_id",
+    decode.optional(decode.string),
   )
   use current_plan_id <- decode.optional_field(
     "current_plan_id",
@@ -122,19 +125,34 @@ pub fn business_decoder() -> decode.Decoder(Business) {
     Some("iad"),
     decode.optional(decode.string),
   )
+  use created_at <- decode.field("created_at", decode.string)
+  use subscription_ends_at <- decode.field(
+    "subscription_ends_at",
+    decode.optional(decode.string),
+  )
+  use deleted_at <- decode.field(
+    // ← ADD THIS
+    "deleted_at",
+    decode.optional(decode.string),
+  )
 
   decode.success(Business(
     business_id: business_id,
-    stripe_customer_id: stripe_customer_id,
-    stripe_subscription_id: stripe_subscription_id,
     business_name: business_name,
     email: email,
     plan_type: plan_type,
     subscription_status: subscription_status,
+    stripe_customer_id: stripe_customer_id,
+    stripe_subscription_id: stripe_subscription_id,
+    stripe_price_id: stripe_price_id,
     current_plan_id: current_plan_id,
     default_docker_image: default_docker_image,
     default_machine_size: default_machine_size,
     default_region: default_region,
+    created_at: created_at,
+    subscription_ends_at: subscription_ends_at,
+    deleted_at: deleted_at,
+    // ← ADD THIS
   ))
 }
 

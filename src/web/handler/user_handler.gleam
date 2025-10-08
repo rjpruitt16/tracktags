@@ -875,3 +875,76 @@ pub fn restore_business(req: Request, business_id: String) -> Response {
     }
   })
 }
+
+pub fn update_business_info(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Put)
+
+  auth.with_auth(req, fn(_auth_result, _api_key, is_admin) {
+    case is_admin {
+      False -> {
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Forbidden")),
+              #("message", json.string("Admin authentication required")),
+            ]),
+          ),
+          403,
+        )
+      }
+      True -> {
+        use json_data <- wisp.require_json(req)
+
+        let decoder = {
+          use business_name <- decode.field("business_name", decode.string)
+          use email <- decode.field("email", decode.string)
+          decode.success(#(business_name, email))
+        }
+
+        case decode.run(json_data, decoder) {
+          Ok(#(business_name, email)) -> {
+            case
+              supabase_client.update_business_info(
+                business_id,
+                business_name,
+                email,
+              )
+            {
+              Ok(_) -> {
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("success", json.bool(True)),
+                      #("message", json.string("Business updated successfully")),
+                    ]),
+                  ),
+                  200,
+                )
+              }
+              Error(_) -> {
+                wisp.json_response(
+                  json.to_string_tree(
+                    json.object([
+                      #("error", json.string("Failed to update business")),
+                    ]),
+                  ),
+                  500,
+                )
+              }
+            }
+          }
+          Error(_) -> {
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("error", json.string("Invalid request")),
+                ]),
+              ),
+              400,
+            )
+          }
+        }
+      }
+    }
+  })
+}

@@ -229,55 +229,94 @@ fn process_webhook_with_dedup(body: String, signature: String) -> Response {
 fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Ok(stripe_customer_id) -> {
-      case supabase_client.get_customer_by_stripe_customer(stripe_customer_id) {
-        Ok(customer) -> {
-          // 1. Update subscription tracking columns
-          let next_period_end = utils.current_timestamp() + 2_592_000
-          // 30 days
-          let _ =
-            supabase_client.update_customer_subscription_period(
-              customer.business_id,
-              customer.customer_id,
-              utils.current_timestamp(),
-              // last_invoice_date
-              next_period_end,
-              // subscription_ends_at
-            )
-
-          // 2. Reset billing metrics in-memory
+      // Check if this is a business subscription (platform-level)
+      case supabase_client.get_business_by_stripe_customer(stripe_customer_id) {
+        Ok(_business) -> {
+          // This is a BUSINESS subscription - update business.subscription_ends_at
           case
-            lookup_customer_actor(customer.business_id, customer.customer_id)
-          {
-            Ok(customer_subject) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] 🔄 Sending reset to customer actor",
-              )
-              process.send(customer_subject, customer_types.ResetStripeMetrics)
-            }
-            Error(_) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] Customer actor offline - will reset on spawn",
-              )
-            }
-          }
-
-          // 3. Fallback: Reset in database
-          case
-            supabase_client.reset_customer_stripe_billing_metrics(
-              customer.business_id,
-              customer.customer_id,
+            supabase_client.update_business_subscription(
+              stripe_customer_id,
+              "active",
+              option.unwrap(event.data.price_id, "unknown"),
+              event.data.current_period_end,
+              // ← Sets subscription_ends_at
             )
           {
             Ok(_) ->
-              Success("Billing cycle reset for: " <> customer.customer_id)
+              Success(
+                "Business subscription renewed for: " <> stripe_customer_id,
+              )
             Error(error) ->
-              ProcessingError("Reset failed: " <> string.inspect(error))
+              ProcessingError(
+                "Failed to update business: " <> string.inspect(error),
+              )
           }
         }
-        Error(_) ->
-          Success("No metered billing customer for: " <> stripe_customer_id)
+        Error(_) -> {
+          // Not a business - check if it's a customer subscription
+          case
+            supabase_client.get_customer_by_stripe_customer(stripe_customer_id)
+          {
+            Ok(customer) -> {
+              // This is a CUSTOMER subscription under a business
+              let next_period_end = utils.current_timestamp() + 2_592_000
+              // 30 days
+              let _ =
+                supabase_client.update_customer_subscription_period(
+                  customer.business_id,
+                  customer.customer_id,
+                  utils.current_timestamp(),
+                  // last_invoice_date
+                  next_period_end,
+                  // subscription_ends_at
+                )
+
+              // Reset billing metrics in-memory
+              case
+                lookup_customer_actor(
+                  customer.business_id,
+                  customer.customer_id,
+                )
+              {
+                Ok(customer_subject) -> {
+                  logging.log(
+                    logging.Info,
+                    "[StripeHandler] 🔄 Sending reset to customer actor",
+                  )
+                  process.send(
+                    customer_subject,
+                    customer_types.ResetStripeMetrics,
+                  )
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[StripeHandler] Customer actor offline - will reset on spawn",
+                  )
+                }
+              }
+
+              // Fallback: Reset in database
+              case
+                supabase_client.reset_customer_stripe_billing_metrics(
+                  customer.business_id,
+                  customer.customer_id,
+                )
+              {
+                Ok(_) ->
+                  Success(
+                    "Billing cycle reset for customer: " <> customer.customer_id,
+                  )
+                Error(error) ->
+                  ProcessingError("Reset failed: " <> string.inspect(error))
+              }
+            }
+            Error(_) ->
+              Success(
+                "No matching business or customer for: " <> stripe_customer_id,
+              )
+          }
+        }
       }
     }
     Error(error) -> ProcessingError("Failed to extract customer: " <> error)
@@ -606,10 +645,8 @@ fn get_plan_machine_count(price_id: Option(String)) -> Result(Int, String) {
 fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
   case extract_subscription_data(event.data) {
     Ok(#(stripe_customer_id, price_id, status)) -> {
-      // Check if this customer already exists
       case supabase_client.get_business_by_stripe_customer(stripe_customer_id) {
         Ok(_existing_business) -> {
-          // Customer exists, just update subscription
           case
             supabase_client.update_business_subscription(
               stripe_customer_id,
@@ -619,7 +656,6 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
             )
           {
             Ok(_) -> {
-              // Load and apply plan limits for this price_id
               apply_plan_limits_for_price(stripe_customer_id, price_id)
               Success("Subscription updated for existing customer")
             }
@@ -627,12 +663,10 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
           }
         }
         Error(_) -> {
-          // NEW CUSTOMER - need to map them using metadata!
           case event.data.metadata {
             Some(metadata) -> {
               case dict.get(metadata, "business_id") {
                 Ok(business_id) -> {
-                  // First, set the stripe_customer_id on the business
                   case
                     supabase_client.set_stripe_customer_id(
                       business_id,
@@ -640,7 +674,6 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
                     )
                   {
                     Ok(_) -> {
-                      // Now update subscription details
                       case
                         supabase_client.update_business_subscription(
                           stripe_customer_id,
@@ -650,7 +683,6 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
                         )
                       {
                         Ok(_) -> {
-                          // Load and apply plan limits
                           apply_plan_limits_for_price(
                             stripe_customer_id,
                             price_id,
@@ -682,6 +714,25 @@ fn handle_subscription_created(event: StripeEvent) -> WebhookResult {
               )
           }
         }
+      }
+    }
+    Error(error) -> ProcessingError(error)
+  }
+}
+
+fn handle_subscription_updated(event: StripeEvent) -> WebhookResult {
+  case extract_subscription_data(event.data) {
+    Ok(#(stripe_customer_id, price_id, status)) -> {
+      case
+        supabase_client.update_business_subscription(
+          stripe_customer_id,
+          status,
+          price_id,
+          event.data.current_period_end,
+        )
+      {
+        Ok(_) -> Success("Subscription updated")
+        Error(e) -> ProcessingError(string.inspect(e))
       }
     }
     Error(error) -> ProcessingError(error)
@@ -742,27 +793,6 @@ fn apply_plan_limits_for_price(
       )
       Nil
     }
-  }
-}
-
-/// Handle subscription update - adjust limits and features
-fn handle_subscription_updated(event: StripeEvent) -> WebhookResult {
-  case extract_subscription_data(event.data) {
-    // Use correct function!
-    Ok(#(stripe_customer_id, price_id, status)) -> {
-      case
-        supabase_client.update_business_subscription(
-          stripe_customer_id,
-          status,
-          price_id,
-          event.data.current_period_end,
-        )
-      {
-        Ok(_) -> Success("Subscription updated")
-        Error(e) -> ProcessingError(string.inspect(e))
-      }
-    }
-    Error(error) -> ProcessingError(error)
   }
 }
 
