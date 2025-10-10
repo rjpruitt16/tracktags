@@ -749,72 +749,35 @@ pub fn delete_business(req: Request, business_id: String) -> Response {
         )
       }
       True -> {
-        use json_data <- wisp.require_json(req)
-
-        let decoder = {
-          use reason <- decode.optional_field(
-            "reason",
-            None,
-            decode.optional(decode.string),
-          )
-          use user_id <- decode.optional_field(
-            "user_id",
-            None,
-            decode.optional(decode.string),
-          )
-          decode.success(#(reason, user_id))
-        }
-
-        case decode.run(json_data, decoder) {
-          Ok(#(reason, user_id)) -> {
-            case
-              supabase_client.soft_delete_business(business_id, user_id, reason)
-            {
-              Ok(message) -> {
-                // In delete_business - after successful delete (around line 820)
-                let _ =
-                  audit.log_action(
-                    "delete_business",
-                    "business",
-                    business_id,
-                    dict.from_list([
-                      #("reason", case reason {
-                        Some(r) -> json.string(r)
-                        None -> json.string("No reason provided")
-                      }),
-                    ]),
-                  )
-                wisp.json_response(
-                  json.to_string_tree(
-                    json.object([
-                      #("success", json.bool(True)),
-                      #("message", json.string(message)),
-                      #("business_id", json.string(business_id)),
-                    ]),
-                  ),
-                  200,
-                )
-              }
-              Error(_) -> {
-                wisp.json_response(
-                  json.to_string_tree(
-                    json.object([
-                      #("error", json.string("Failed to delete business")),
-                    ]),
-                  ),
-                  500,
-                )
-              }
-            }
+        // Simple version - no JSON body required
+        case supabase_client.soft_delete_business(business_id, None, None) {
+          Ok(message) -> {
+            let _ =
+              audit.log_action(
+                "delete_business",
+                "business",
+                business_id,
+                dict.new(),
+              )
+            wisp.json_response(
+              json.to_string_tree(
+                json.object([
+                  #("success", json.bool(True)),
+                  #("message", json.string(message)),
+                  #("business_id", json.string(business_id)),
+                ]),
+              ),
+              200,
+            )
           }
           Error(_) -> {
             wisp.json_response(
               json.to_string_tree(
                 json.object([
-                  #("error", json.string("Invalid request")),
+                  #("error", json.string("Failed to delete business")),
                 ]),
               ),
-              400,
+              500,
             )
           }
         }

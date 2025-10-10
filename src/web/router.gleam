@@ -3,7 +3,7 @@ import gleam/http.{Delete, Get, Post, Put}
 import web/handler/admin_handler
 import web/handler/key_handler
 import web/handler/metric_handler
-import web/handler/plan_limit_handler
+import web/handler/plan_handler
 import web/handler/proxy_handler
 import web/handler/stripe_handler
 import web/handler/user_handler
@@ -240,19 +240,32 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Get])
       }
 
+    // The routes stay the same - they already call plan_handler functions:
+    ["api", "v1", "plans"] ->
+      case req.method {
+        http.Post -> plan_handler.create_plan(req)
+        http.Get -> plan_handler.list_plans(req)
+        _ -> wisp.method_not_allowed([http.Post, http.Get])
+      }
+
+    ["api", "v1", "plans", plan_id] ->
+      case req.method {
+        http.Delete -> plan_handler.delete_plan(req, plan_id)
+        _ -> wisp.method_not_allowed([http.Delete])
+      }
     // Plan limits API
     ["api", "v1", "plan_limits"] ->
       case req.method {
-        Get -> plan_limit_handler.list_plan_limits(req)
-        Post -> plan_limit_handler.create_plan_limit(req)
+        Get -> plan_handler.list_plan_limits(req)
+        Post -> plan_handler.create_plan_limit(req)
         _ -> wisp.method_not_allowed([Get, Post])
       }
 
     ["api", "v1", "plan_limits", limit_id] ->
       case req.method {
-        Get -> plan_limit_handler.get_plan_limit(req, limit_id)
-        Put -> plan_limit_handler.update_plan_limit(req, limit_id)
-        Delete -> plan_limit_handler.delete_plan_limit(req, limit_id)
+        Get -> plan_handler.get_plan_limit(req, limit_id)
+        Put -> plan_handler.update_plan_limit(req, limit_id)
+        Delete -> plan_handler.delete_plan_limit(req, limit_id)
         _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 

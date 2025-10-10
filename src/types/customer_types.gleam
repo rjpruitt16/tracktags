@@ -51,7 +51,6 @@ pub type PlanLimit {
     id: String,
     business_id: Option(String),
     plan_id: Option(String),
-    customer_id: Option(String),
     metric_name: String,
     limit_value: Float,
     limit_period: String,

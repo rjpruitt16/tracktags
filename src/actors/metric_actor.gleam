@@ -948,7 +948,7 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
               business_id: business_id,
               customer_id: customer_id,
               metric_name: state.default_metric.metric_name,
-              aggregated_value: diff,
+              aggregated_value: current_value,
               operation_count: 1,
               metric_type: metric_types.metric_type_to_string(state.metric_type),
               window_start: utils.current_timestamp(),
@@ -967,16 +967,14 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
             Ok(_) -> {
               logging.log(
                 logging.Info,
-                "[MetricActor] ✅ Sent diff to SupabaseActor: "
-                  <> float.to_string(diff),
+                "[MetricActor] ✅ Sent current value to SupabaseActor: "
+                  <> float.to_string(current_value),
               )
               current_value
-              // ✅ Update to current value on success
             }
             Error(e) -> {
               logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
               state.last_flushed_value
-              // Keep old value on failure
             }
           }
         }
@@ -1109,7 +1107,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
           // Check if we should flush immediately (same interval) or batch for later
           let supabase_batch_interval =
             metric_types.get_supabase_batch_interval(state.metadata)
-          let current_tick_interval = "tick_" <> state.tick_type
+          let current_tick_interval = state.tick_type
 
           logging.log(
             logging.Info,
@@ -1132,7 +1130,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
                   business_id,
                   customer_id,
                   state.default_metric.metric_name,
-                  float.to_string(diff),
+                  float.to_string(current_value),
                   metric_types.metric_type_to_string(state.metric_type),
                   scope,
                   None,
@@ -1171,7 +1169,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
                   business_id: business_id,
                   customer_id: customer_id,
                   metric_name: state.default_metric.metric_name,
-                  aggregated_value: diff,
+                  aggregated_value: current_value,
                   operation_count: 1,
                   metric_type: metric_types.metric_type_to_string(
                     state.metric_type,

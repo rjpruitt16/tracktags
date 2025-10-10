@@ -107,6 +107,17 @@ pub type ValidationResult {
   InvalidKey
 }
 
+pub type Plan {
+  Plan(
+    id: String,
+    business_id: String,
+    plan_name: String,
+    stripe_price_id: option.Option(String),
+    plan_status: String,
+    created_at: String,
+  )
+}
+
 pub fn validate_key_with_context(
   api_key: String,
 ) -> Result(ValidationResult, SupabaseError) {
@@ -337,6 +348,29 @@ fn customer_context_decoder() -> decode.Decoder(customer_types.CustomerContext) 
     customer: customer,
     machines: machines,
     plan_limits: limits,
+  ))
+}
+
+// Add the decoder to the JSON DECODERS section (around line 250):
+fn plan_decoder() -> decode.Decoder(Plan) {
+  use id <- decode.field("id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use plan_name <- decode.field("plan_name", decode.string)
+  use stripe_price_id <- decode.optional_field(
+    "stripe_price_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use plan_status <- decode.field("plan_status", decode.string)
+  use created_at <- decode.field("created_at", decode.string)
+
+  decode.success(Plan(
+    id: id,
+    business_id: business_id,
+    plan_name: plan_name,
+    stripe_price_id: stripe_price_id,
+    plan_status: plan_status,
+    created_at: created_at,
   ))
 }
 
@@ -600,6 +634,76 @@ pub fn get_customer_free_limits(
       }
     }
     _ -> Error(DatabaseError("Failed to fetch customer plans"))
+  }
+}
+
+// Create a new plan
+pub fn create_plan(
+  business_id: String,
+  plan_name: String,
+  stripe_price_id: option.Option(String),
+) -> Result(Plan, SupabaseError) {
+  let body =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("plan_name", json.string(plan_name)),
+      #("stripe_price_id", case stripe_price_id {
+        Some(id) -> json.string(id)
+        None -> json.null()
+      }),
+      #("plan_status", json.string("active")),
+    ])
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/plans",
+    Some(json.to_string(body)),
+  ))
+
+  case response.status {
+    201 | 200 -> {
+      case json.parse(response.body, decode.list(plan_decoder())) {
+        Ok([plan, ..]) -> Ok(plan)
+        Ok([]) -> Error(DatabaseError("No plan returned"))
+        Error(_) -> Error(ParseError("Invalid plan response"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to create plan"))
+  }
+}
+
+// Get all plans for a business
+pub fn get_plans_for_business(
+  business_id: String,
+) -> Result(List(Plan), SupabaseError) {
+  let path = "/plans?business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_decoder())) {
+        Ok(plans) -> Ok(plans)
+        Error(_) -> Error(ParseError("Invalid plans response"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch plans"))
+  }
+}
+
+// Delete a plan
+pub fn delete_plan(
+  business_id: String,
+  plan_id: String,
+) -> Result(Nil, SupabaseError) {
+  let path = "/plans?id=eq." <> plan_id <> "&business_id=eq." <> business_id
+
+  use response <- result.try(make_request(http.Delete, path, None))
+
+  case response.status {
+    200 | 204 -> Ok(Nil)
+    404 -> Error(NotFound("Plan not found"))
+    _ -> Error(DatabaseError("Failed to delete plan"))
   }
 }
 
@@ -1665,8 +1769,6 @@ fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
     decode.string,
   )
 
-  use customer_id <- decode.field("customer_id", decode.optional(decode.string))
-
   decode.success(customer_types.PlanLimit(
     id: id,
     business_id: business_id,
@@ -1679,7 +1781,6 @@ fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
     webhook_urls: webhook_urls,
     created_at: created_at,
     metric_type: metric_type,
-    customer_id: customer_id,
   ))
 }
 

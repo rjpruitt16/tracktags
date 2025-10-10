@@ -25,9 +25,9 @@ test: unit-test
 docker-build: $(DOCKER_BUILD_STAMP)
 
 $(DOCKER_BUILD_STAMP): Dockerfile $(shell find src -type f -name "*.gleam") gleam.toml manifest.toml
+	@echo "🔨 Building Docker image..."
 	docker build -t tracktags .
 	@touch $(DOCKER_BUILD_STAMP)
-
 
 docker-up: docker-build
 	@echo "Cleaning up old containers..."
@@ -39,25 +39,52 @@ docker-up: docker-build
 	@docker ps | grep tracktags
 	@curl -f http://localhost:8080/health || docker logs tracktags-tracktags-1 | tail -20
 
-test-docker:
-	@if [ "$(REBUILD)" = "true" ]; then rm -f $(DOCKER_BUILD_STAMP); fi
-	@$(MAKE) docker-up
-	@echo "Running tests against Docker environment..."
-	@sleep 5
-	@echo "Using ADMIN_SECRET_KEY: $${ADMIN_SECRET_KEY}"
-	hurl --test --retry 3 --retry-interval 5000 --very-verbose \
-		--variable ADMIN_SECRET_KEY=$${ADMIN_SECRET_KEY} \
-		--variable TRACKTAGS_URL=http://localhost:8080 \
-		--variable PROXY_TARGET_URL=http://webhook:9090 \
+# Run a specific integration test by path
+# Usage: make test-single FILE=test/integration/hurl/test_reset_metrics.hurl
+test-single:
+	@if [ -z "$(FILE)" ]; then \
+		echo "Error: FILE variable is required"; \
+		echo "Usage: make test-single FILE=test/integration/hurl/test_reset_metrics.hurl"; \
+		exit 1; \
+	fi
+	@if [ ! -f "$(FILE)" ]; then \
+		echo "Error: File not found: $(FILE)"; \
+		exit 1; \
+	fi
+	@echo "Running test: $(FILE)"
+	@docker compose -f docker-compose.test.yml up -d
+	@sleep 2
+	hurl --test --verbose \
+		--variable ADMIN_SECRET_KEY=$(ADMIN_SECRET_KEY) \
+                --variable TRACKTAGS_URL=http://localhost:8080 \
+                --variable SUPABASE_URL=$(SUPABASE_URL) \
+		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
+                --variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \
-		test/integration/*.hurl || \
+		$(FILE) || \
 		(echo "Test failed, showing container logs:"; \
 		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
 		 exit 1)
-	@bash test/integration/cleanup_test_data.sh
-	@make docker-down
 
-
+# Run all integration tests
+test-docker:
+	@echo "Starting Docker services..."
+	@docker compose -f docker-compose.test.yml up -d
+	@sleep 2
+	@echo "Running integration tests..."
+	hurl --test --retry 3 --retry-interval 5000 \
+		--variable ADMIN_SECRET_KEY=$(ADMIN_SECRET_KEY) \
+		--variable TRACKTAGS_URL=http://localhost:8080 \
+		--variable SUPABASE_URL=$(SUPABASE_URL) \
+		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
+		--variable PROXY_TARGET_URL=http://webhook:9090 \
+		--variable test_id=$$(date +%s) \
+		test/integration/hurl/*.hurl || \
+		(echo "Test failed, showing container logs:"; \
+		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
+		 exit 1)
+	@echo "Stopping Docker services..."
+	@docker compose -f docker-compose.test.yml down
 docker-down:
 	docker compose -f docker-compose.test.yml down
 	@docker rm -f tracktags webhook 2>/dev/null || true

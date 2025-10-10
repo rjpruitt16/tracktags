@@ -793,7 +793,9 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
 }
 
 pub fn delete_metric(req: Request, metric_name: String) -> Response {
-  let request_id = utils.generate_request_id()
+  use <- wisp.require_method(req, http.Delete)
+
+  let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
     "[MetricHandler] 🔍 DELETE REQUEST START - ID: "
@@ -802,57 +804,68 @@ pub fn delete_metric(req: Request, metric_name: String) -> Response {
       <> metric_name,
   )
 
-  use <- wisp.require_method(req, http.Delete)
-  use key_validation <- with_auth_typed(req)
+  use business_id <- with_auth(req)
 
-  case key_validation {
-    supabase_client.CustomerKey(_, _) -> {
+  // Parse query params for scope
+  let query = wisp.get_query(req)
+  let scope = case list.key_find(query, "scope") {
+    Ok(s) -> s
+    Error(_) -> "business"
+  }
+  let customer_id = case list.key_find(query, "customer_id") {
+    Ok(cid) -> Some(cid)
+    Error(_) -> None
+  }
+
+  // Construct proper registry key based on scope
+  let registry_key = case scope, customer_id {
+    "customer", Some(cid) -> business_id <> ":" <> cid <> "_" <> metric_name
+    _, _ -> business_id <> "_" <> metric_name
+  }
+
+  logging.log(
+    logging.Info,
+    "[MetricHandler] 🔍 Deleting metric with registry key: " <> registry_key,
+  )
+
+  case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
+    Ok(metric_subject) -> {
+      process.send(metric_subject, metric_types.Shutdown)
+
+      // Give it a moment to shut down
+      process.sleep(100)
+
+      logging.log(
+        logging.Info,
+        "[MetricHandler] ✅ Deleted metric: " <> metric_name,
+      )
+
       wisp.json_response(
         json.to_string_tree(
           json.object([
-            #("error", json.string("Forbidden")),
-            #("message", json.string("Customers cannot delete metrics")),
+            #("status", json.string("deleted")),
+            #("metric_name", json.string(metric_name)),
+            #("business_id", json.string(business_id)),
           ]),
         ),
-        403,
+        200,
       )
     }
+    Error(_) -> {
+      logging.log(
+        logging.Warning,
+        "[MetricHandler] Delete failed - metric not found: " <> metric_name,
+      )
 
-    supabase_client.BusinessKey(business_id) -> {
-      case metric_actor.lookup_metric_subject(business_id, metric_name) {
-        Ok(metric_subject) -> {
-          process.send(metric_subject, metric_types.Shutdown)
-          logging.log(
-            logging.Info,
-            "[MetricHandler] ✅ Deleted metric: " <> metric_name,
-          )
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("message", json.string("Metric deleted successfully")),
-                #("metric_name", json.string(metric_name)),
-                #("business_id", json.string(business_id)),
-              ]),
-            ),
-            200,
-          )
-        }
-        Error(_) -> {
-          logging.log(
-            logging.Warning,
-            "[MetricHandler] Delete failed - metric not found: " <> metric_name,
-          )
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Not Found")),
-                #("message", json.string("Metric not found: " <> metric_name)),
-              ]),
-            ),
-            404,
-          )
-        }
-      }
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Not Found")),
+            #("message", json.string("Metric not found: " <> metric_name)),
+          ]),
+        ),
+        404,
+      )
     }
   }
 }
