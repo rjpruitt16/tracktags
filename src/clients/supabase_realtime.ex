@@ -92,7 +92,8 @@ defmodule SupabaseRealtime do
       {"customers", ["INSERT", "UPDATE", "DELETE"]},
       {"customer_machines", ["INSERT", "UPDATE", "DELETE"]},
       {"provisioning_queue", ["INSERT", "UPDATE"]},
-      {"plan_limits", ["UPDATE"]}
+      {"plan_limits", ["UPDATE"]},
+      {"metrics", ["INSERT", "UPDATE"]}
     ]
 
     Enum.each(tables, fn {table, events} ->
@@ -193,6 +194,13 @@ defmodule SupabaseRealtime do
             String.downcase(event_type),
             Jason.encode!(record),
             Jason.encode!(Map.get(payload["data"], "old_record", %{}))
+          )
+
+          # Broadcast via Phoenix PubSub
+          Phoenix.PubSub.broadcast(
+            LiveTags.PubSub,
+            "business:#{record["business_id"]}:metrics",
+            {:metric_updated, record}
           )
 
           Logger.info("[SupabaseRealtime] Successfully published to realtime actor")

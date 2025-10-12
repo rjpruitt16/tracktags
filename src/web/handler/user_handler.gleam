@@ -491,6 +491,7 @@ fn process_create_customer(
       req.customer_id,
       req.name,
       req.plan_id,
+      option.None,
     )
   {
     Ok(_) -> {
@@ -910,4 +911,96 @@ pub fn update_business_info(req: Request, business_id: String) -> Response {
       }
     }
   })
+}
+
+pub fn link_user_to_customer(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _auth_business_id <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let decoder = {
+    use user_id <- decode.field("user_id", decode.string)
+    decode.success(user_id)
+  }
+
+  case decode.run(json_data, decoder) {
+    Ok(user_id) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerHandler] Linking user "
+          <> user_id
+          <> " to customer "
+          <> customer_id,
+      )
+
+      case
+        supabase_client.link_user_to_customer(business_id, customer_id, user_id)
+      {
+        Ok(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("success", json.bool(True)),
+                #("message", json.string("User linked to customer")),
+              ]),
+            ),
+            200,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Failed to link user")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Invalid request"))]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+pub fn unlink_user_from_customer(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _auth_business_id <- with_auth(req)
+
+  case supabase_client.unlink_user_from_customer(business_id, customer_id) {
+    Ok(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("success", json.bool(True)),
+            #("message", json.string("User unlinked from customer")),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Failed to unlink user"))]),
+        ),
+        500,
+      )
+    }
+  }
 }

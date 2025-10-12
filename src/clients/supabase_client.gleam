@@ -3121,6 +3121,114 @@ pub fn get_latest_metric_value(
 // CLIENT MANAGEMENT CRUD
 // ============================================================================
 
+/// Link a user_id to a customer (for social auth)
+pub fn link_user_to_customer(
+  business_id: String,
+  customer_id: String,
+  user_id: String,
+) -> Result(customer_types.Customer, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Linking user "
+      <> user_id
+      <> " to customer: "
+      <> customer_id,
+  )
+
+  let update_data =
+    json.object([
+      #("user_id", json.string(user_id)),
+      #("updated_at", json.string(int.to_string(utils.current_timestamp()))),
+    ])
+
+  let path =
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok([]) -> Error(NotFound("Customer not found or not owned by business"))
+        Ok([updated_customer, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Linked user to customer: "
+              <> updated_customer.customer_id,
+          )
+          Ok(updated_customer)
+        }
+        Error(_) -> Error(ParseError("Invalid customer response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to link user to customer"))
+  }
+}
+
+/// Unlink a user_id from a customer
+pub fn unlink_user_from_customer(
+  business_id: String,
+  customer_id: String,
+) -> Result(customer_types.Customer, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Unlinking user from customer: " <> customer_id,
+  )
+
+  let update_data =
+    json.object([
+      #("user_id", json.null()),
+      #("updated_at", json.string(int.to_string(utils.current_timestamp()))),
+    ])
+
+  let path =
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok([]) -> Error(NotFound("Customer not found or not owned by business"))
+        Ok([updated_customer, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Unlinked user from customer: "
+              <> updated_customer.customer_id,
+          )
+          Ok(updated_customer)
+        }
+        Error(_) -> Error(ParseError("Invalid customer response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to unlink user from customer"))
+  }
+}
+
 /// Get all customers for a business
 pub fn get_business_customers(
   business_id: String,
@@ -3420,7 +3528,9 @@ pub fn create_customer(
   customer_id: String,
   customer_name: String,
   plan_id: String,
-) -> Result(customer_types.Customer, SupabaseError) {
+  user_id: option.Option(String),
+  // ← ADD THIS
+) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
     "[SupabaseClient] Creating customer: "
@@ -3431,57 +3541,45 @@ pub fn create_customer(
       <> plan_id,
   )
 
-  let client_data =
-    json.object([
-      #("customer_id", json.string(customer_id)),
-      #("business_id", json.string(business_id)),
-      #("plan_id", case plan_id {
-        "" -> json.null()
-        pid -> json.string(pid)
-      }),
-      #("customer_name", json.string(customer_name)),
-    ])
+  let base_fields = [
+    #("business_id", json.string(business_id)),
+    #("customer_id", json.string(customer_id)),
+    #("customer_name", json.string(customer_name)),
+  ]
+
+  // Add plan_id if not empty
+  let with_plan = case plan_id {
+    "" -> base_fields
+    _ -> [#("plan_id", json.string(plan_id)), ..base_fields]
+  }
+
+  // Add user_id if provided
+  let final_fields = case user_id {
+    option.Some(uid) -> [#("user_id", json.string(uid)), ..with_plan]
+    option.None -> with_plan
+  }
+
+  let body = json.object(final_fields)
 
   use response <- result.try(make_request(
     http.Post,
     "/customers",
-    Some(json.to_string(client_data)),
+    Some(json.to_string(body)),
   ))
 
   case response.status {
     201 -> {
-      case
-        json.parse(
-          response.body,
-          decode.list(customer_types.customer_decoder()),
-        )
-      {
-        Ok([new_customer, ..]) -> {
-          logging.log(
-            logging.Info,
-            "[SupabaseClient] ✅ Client created successfully: "
-              <> new_customer.customer_id,
-          )
-          Ok(new_customer)
-        }
-        Ok([]) -> Error(ParseError("No client returned from server"))
-        Error(_) -> Error(ParseError("Invalid client response format"))
-      }
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Customer created: " <> customer_id,
+      )
+      Ok(Nil)
     }
     409 -> Error(DatabaseError("Client already exists"))
-    status -> {
-      // Log the actual status and response body
-      logging.log(
-        logging.Error,
-        "[SupabaseClient] Customer creation failed with status: "
-          <> int.to_string(status)
-          <> " body: "
-          <> response.body,
-      )
+    _ ->
       Error(DatabaseError(
-        "Failed to create client - status: " <> int.to_string(status),
+        "Failed to create customer: " <> int.to_string(response.status),
       ))
-    }
   }
 }
 

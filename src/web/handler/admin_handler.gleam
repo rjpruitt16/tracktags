@@ -384,7 +384,7 @@ pub fn provision_test(req: Request) -> Response {
       test_customer_id,
       "Test Customer",
       "",
-      // The create_customer function will handle empty string -> null conversion
+      option.None,
     )
 
   // Now create the provisioning task
