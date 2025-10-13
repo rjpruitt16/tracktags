@@ -148,6 +148,12 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post, Get])
       }
 
+    ["api", "v1", "businesses", business_id, "customers", "get-or-create"] ->
+      case req.method {
+        Post -> user_handler.get_or_create_customer_for_user(req, business_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
     ["api", "v1", "businesses", _business_id, "customers", customer_id] ->
       case req.method {
         Get -> user_handler.get_customer(req, customer_id)
@@ -203,6 +209,38 @@ pub fn handle_request(req: Request) -> Response {
             key_name,
           )
         _ -> wisp.method_not_allowed([Get, Delete])
+      }
+
+    // Link user to customer
+    [
+      "api",
+      "v1",
+      "businesses",
+      business_id,
+      "customers",
+      customer_id,
+      "link-user",
+    ] ->
+      case req.method {
+        Post ->
+          user_handler.link_user_to_customer(req, business_id, customer_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
+    // Unlink user from customer  
+    [
+      "api",
+      "v1",
+      "businesses",
+      business_id,
+      "customers",
+      customer_id,
+      "unlink-user",
+    ] ->
+      case req.method {
+        Post ->
+          user_handler.unlink_user_from_customer(req, business_id, customer_id)
+        _ -> wisp.method_not_allowed([Post])
       }
 
     // Stripe webhooks

@@ -571,6 +571,47 @@ pub fn validate_api_key_with_retry(
 // ============================================================================
 // SUBSCRIPTION CANCELLATION - Customer Controlled
 // ============================================================================
+/// Get customer by user_id
+pub fn get_customer_by_user_id(
+  user_id: String,
+  business_id: String,
+) -> Result(customer_types.Customer, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting customer by user_id: " <> user_id,
+  )
+
+  let path =
+    "/customers?user_id=eq."
+    <> user_id
+    <> "&business_id=eq."
+    <> business_id
+    <> "&deleted_at=is.null"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok([]) -> Error(NotFound("Customer not found"))
+        Ok([customer, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Retrieved customer: " <> customer.customer_id,
+          )
+          Ok(customer)
+        }
+        Error(_) -> Error(ParseError("Invalid customer format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch customer"))
+  }
+}
 
 /// Get customer's configured free plan limits
 pub fn get_customer_free_limits(
@@ -3529,7 +3570,6 @@ pub fn create_customer(
   customer_name: String,
   plan_id: String,
   user_id: option.Option(String),
-  // ← ADD THIS
 ) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,

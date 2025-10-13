@@ -4,6 +4,7 @@ import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -1000,6 +1001,92 @@ pub fn unlink_user_from_customer(
           json.object([#("error", json.string("Failed to unlink user"))]),
         ),
         500,
+      )
+    }
+  }
+}
+
+/// Get or create customer for a user (used for auto-join)
+pub fn get_or_create_customer_for_user(
+  req: Request,
+  business_id: String,
+) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _auth_business_id <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let decoder = {
+    use user_id <- decode.field("user_id", decode.string)
+    use user_email <- decode.field("user_email", decode.string)
+    decode.success(#(user_id, user_email))
+  }
+
+  case decode.run(json_data, decoder) {
+    Ok(#(user_id, user_email)) -> {
+      // Try to get existing customer by user_id first
+      case supabase_client.get_customer_by_user_id(user_id, business_id) {
+        // ✅ SIMPLER
+        Ok(existing_customer) -> {
+          // Customer already exists
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("customer_id", json.string(existing_customer.customer_id)),
+                #("already_linked", json.bool(True)),
+              ]),
+            ),
+            200,
+          )
+        }
+        Error(_) -> {
+          // Create new customer
+          let customer_id =
+            "cust_" <> string.replace(utils.generate_uuid(), "-", "")
+
+          case
+            supabase_client.create_customer(
+              business_id,
+              customer_id,
+              user_email,
+              "",
+              option.Some(user_id),
+            )
+          {
+            Ok(_) -> {
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("customer_id", json.string(customer_id)),
+                    #("created_new", json.bool(True)),
+                  ]),
+                ),
+                201,
+              )
+            }
+            Error(err) -> {
+              logging.log(
+                logging.Error,
+                "[UserHandler] Failed to create: " <> string.inspect(err),
+              )
+              wisp.json_response(
+                json.to_string_tree(
+                  json.object([
+                    #("error", json.string("Failed to create customer")),
+                  ]),
+                ),
+                500,
+              )
+            }
+          }
+        }
+      }
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([#("error", json.string("Invalid request"))]),
+        ),
+        400,
       )
     }
   }
