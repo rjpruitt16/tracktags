@@ -8,6 +8,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
@@ -68,9 +69,14 @@ pub fn lookup_business_subject(
 }
 
 pub fn dict_to_string(tags: Dict(String, String)) -> String {
-  dict.fold(tags, "", fn(accumulator, key, value) {
-    string.append(accumulator, "key: " <> key <> " value: " <> value)
-  })
+  json.object(
+    dict.to_list(tags)
+    |> list.map(fn(pair) {
+      let #(k, v) = pair
+      #(k, json.string(v))
+    }),
+  )
+  |> json.to_string
 }
 
 fn handle_message(

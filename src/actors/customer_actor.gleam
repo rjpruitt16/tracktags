@@ -55,9 +55,14 @@ pub type State {
 }
 
 pub fn dict_to_string(tags: Dict(String, String)) -> String {
-  dict.fold(tags, "", fn(accumulator, key, value) {
-    string.append(accumulator, "key: " <> key <> " value: " <> value)
-  })
+  json.object(
+    dict.to_list(tags)
+    |> list.map(fn(pair) {
+      let #(k, v) = pair
+      #(k, json.string(v))
+    }),
+  )
+  |> json.to_string
 }
 
 // ============================================================================

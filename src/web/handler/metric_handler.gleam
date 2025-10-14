@@ -990,9 +990,7 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
 
 fn process_update_metric(
   lookup_key: String,
-  // ✅ NEW: Accept lookup_key parameter
   business_id: String,
-  // Keep for response JSON
   metric_name: String,
   new_value: Float,
 ) -> Response {

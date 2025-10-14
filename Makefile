@@ -81,7 +81,7 @@ test-docker:
 		--variable test_id=$$(date +%s) \
 		test/integration/hurl/*.hurl || \
 		(echo "Test failed, showing container logs:"; \
-		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
+		 docker compose -f docker-compose.test.yml logs --tail=200 tracktags; \
 		 exit 1)
 	@echo "Stopping Docker services..."
 	@docker compose -f docker-compose.test.yml down

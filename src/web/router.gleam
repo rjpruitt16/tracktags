@@ -1,5 +1,6 @@
 // src/web/router.gleam
 import gleam/http.{Delete, Get, Post, Put}
+import logging
 import web/handler/admin_handler
 import web/handler/key_handler
 import web/handler/metric_handler
@@ -267,7 +268,13 @@ pub fn handle_request(req: Request) -> Response {
     ["api", "v1", "metrics", metric_name] ->
       case req.method {
         Get -> metric_handler.get_metric(req, metric_name)
-        Put -> metric_handler.update_metric(req, metric_name)
+        Put -> {
+          logging.log(
+            logging.Error,
+            "🔥 ROUTER: Dispatching PUT to update_metric for: " <> metric_name,
+          )
+          metric_handler.update_metric(req, metric_name)
+        }
         Delete -> metric_handler.delete_metric(req, metric_name)
         _ -> wisp.method_not_allowed([Get, Put, Delete])
       }

@@ -2938,6 +2938,57 @@ pub fn store_integration_key_with_hash(
 // METRICS STORAGE
 // ============================================================================
 
+pub fn increment_checkpoint_atomic(
+  business_id: String,
+  customer_id: Option(String),
+  metric_name: String,
+  delta: Float,
+  scope: String,
+  tags: Dict(String, String),
+  // ✅ ADD THIS
+) -> Result(Float, SupabaseError) {
+  // Convert tags dict to JSON
+  let tags_json =
+    json.object(
+      dict.to_list(tags)
+      |> list.map(fn(pair) {
+        let #(k, v) = pair
+        #(k, json.string(v))
+      }),
+    )
+
+  let body =
+    json.object([
+      #("p_business_id", json.string(business_id)),
+      #("p_customer_id", case customer_id {
+        Some(cid) -> json.string(cid)
+        None -> json.null()
+      }),
+      #("p_metric_name", json.string(metric_name)),
+      #("p_delta", json.float(delta)),
+      #("p_scope", json.string(scope)),
+      #("p_tags", tags_json),
+      // ✅ ADD THIS
+    ])
+    |> json.to_string()
+
+  use response <- result.try(make_request(
+    http.Post,
+    "/rpc/increment_checkpoint_metric",
+    Some(body),
+  ))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.float) {
+        Ok(new_value) -> Ok(new_value)
+        Error(_) -> Error(ParseError("Invalid increment response"))
+      }
+    }
+    _ -> Error(ParseError("Increment RPC failed"))
+  }
+}
+
 /// Store metric data for persistence/billing
 pub fn store_metric(
   business_id: String,

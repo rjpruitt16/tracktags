@@ -547,63 +547,135 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
     }
 
     metric_types.RecordMetric(metric) -> {
-      // If this metric is breached and the action is "disabled", drop the write.
+      logging.log(
+        logging.Info,
+        "[MetricActor] 🔍 RecordMetric received: "
+          <> metric.metric_name
+          <> " value="
+          <> float.to_string(metric.value)
+          <> " type="
+          <> metric_types.metric_type_to_string(state.metric_type),
+      )
+      // If breached and action is disabled, drop the write
       case state.is_breached && state.breach_action == "disabled" {
         True -> actor.continue(state)
-
         False -> {
-          // Store in ETS instead of just state
-          case
-            metric_store.add_value(
-              state.default_metric.account_id,
-              state.default_metric.metric_name,
-              metric.value,
-            )
-          {
-            Ok(new_value) -> {
-              logging.log(
-                logging.Info,
-                "[MetricActor] Value updated: " <> float.to_string(new_value),
-              )
+          // Determine if we should use atomic Supabase or ETS
+          case state.metric_type {
+            // Checkpoint and StripeBilling need atomic updates across servers
+            metric_types.Checkpoint | metric_types.StripeBilling -> {
+              let #(business_id, customer_id, scope) =
+                metric_types.parse_account_id(state.default_metric.account_id)
 
-              // Update current_metric state to match store
-              let updated_current_metric =
-                metric_types.Metric(
-                  ..state.current_metric,
-                  value: new_value,
-                  timestamp: utils.current_timestamp(),
+              case
+                supabase_client.increment_checkpoint_atomic(
+                  business_id,
+                  customer_id,
+                  state.default_metric.metric_name,
+                  metric.value,
+                  scope,
+                  metric.tags,
                 )
-
-              // Check for plan limit breach
-              let new_breach_state = check_plan_breach(new_value, state)
-              let next_state =
-                State(
-                  ..state,
-                  is_breached: new_breach_state,
-                  current_metric: updated_current_metric,
-                )
-
-              case new_breach_state != state.is_breached {
-                True ->
+              {
+                Ok(new_value) -> {
                   logging.log(
-                    logging.Warning,
-                    "[MetricActor] 🚨 BREACH STATE CHANGED: "
-                      <> string.inspect(new_breach_state)
-                      <> " action="
-                      <> next_state.breach_action,
+                    logging.Info,
+                    "[MetricActor] ✅ Atomic increment: "
+                      <> state.default_metric.metric_name
+                      <> " = "
+                      <> float.to_string(new_value),
                   )
-                False -> Nil
-              }
 
-              actor.continue(next_state)
+                  // Update ETS cache to match Supabase
+                  let _ =
+                    metric_store.reset_metric(
+                      state.default_metric.account_id,
+                      state.default_metric.metric_name,
+                      new_value,
+                    )
+
+                  // Update state
+                  let updated_current_metric =
+                    metric_types.Metric(
+                      ..state.current_metric,
+                      value: new_value,
+                      timestamp: utils.current_timestamp(),
+                    )
+
+                  let new_breach_state = check_plan_breach(new_value, state)
+
+                  actor.continue(
+                    State(
+                      ..state,
+                      is_breached: new_breach_state,
+                      current_metric: updated_current_metric,
+                    ),
+                  )
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Error,
+                    "[MetricActor] ❌ Atomic increment failed: "
+                      <> string.inspect(e),
+                  )
+                  actor.continue(state)
+                }
+              }
             }
 
-            Error(e) -> {
-              logging.log(
-                logging.Error,
-                "[MetricActor] Store error: " <> string.inspect(e),
-              )
-              actor.continue(state)
+            // Reset metrics use ETS only (existing behavior)
+            metric_types.Reset -> {
+              case
+                metric_store.add_value(
+                  state.default_metric.account_id,
+                  state.default_metric.metric_name,
+                  metric.value,
+                )
+              {
+                Ok(new_value) -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] Value updated: "
+                      <> float.to_string(new_value),
+                  )
+
+                  let updated_current_metric =
+                    metric_types.Metric(
+                      ..state.current_metric,
+                      value: new_value,
+                      timestamp: utils.current_timestamp(),
+                    )
+
+                  let new_breach_state = check_plan_breach(new_value, state)
+                  let next_state =
+                    State(
+                      ..state,
+                      is_breached: new_breach_state,
+                      current_metric: updated_current_metric,
+                    )
+
+                  case new_breach_state != state.is_breached {
+                    True ->
+                      logging.log(
+                        logging.Warning,
+                        "[MetricActor] 🚨 BREACH STATE CHANGED: "
+                          <> string.inspect(new_breach_state)
+                          <> " action="
+                          <> next_state.breach_action,
+                      )
+                    False -> Nil
+                  }
+
+                  actor.continue(next_state)
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Error,
+                    "[MetricActor] Store error: " <> string.inspect(e),
+                  )
+                  actor.continue(state)
+                }
+              }
             }
           }
         }
@@ -1073,150 +1145,164 @@ fn flush_metrics_and_get_state(state: State) -> State {
       <> float.to_string(diff),
   )
 
-  // Determine new last_flushed_value based on whether we send to Supabase
-  let new_last_flushed_value = case
-    metric_types.should_send_to_supabase(state.metric_type, state.metadata)
-  {
-    True -> {
-      case diff {
-        0.0 -> {
-          logging.log(
-            logging.Info,
-            "[MetricActor] 📊 No change since last flush, skipping Supabase",
-          )
-          state.last_flushed_value
-        }
-        _ -> {
-          // Parse the account_id to determine business_id, customer_id, and scope
-          let #(business_id, customer_id, scope) =
-            metric_types.parse_account_id(state.default_metric.account_id)
+  // Determine new last_flushed_value based on metric type
+  let new_last_flushed_value = case state.metric_type {
+    // Checkpoint and StripeBilling write to Supabase immediately via atomic increment
+    // So flush doesn't need to write again - just update our tracking
+    metric_types.Checkpoint | metric_types.StripeBilling -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] ✅ Checkpoint/StripeBilling already written atomically, updating flush marker",
+      )
+      current_value
+    }
 
-          logging.log(
-            logging.Info,
-            "[MetricActor] 🔍 PARSED account_id='"
-              <> state.default_metric.account_id
-              <> "' -> business='"
-              <> business_id
-              <> "', customer='"
-              <> string.inspect(customer_id)
-              <> "', scope='"
-              <> scope
-              <> "'",
-          )
-
-          // Check if we should flush immediately (same interval) or batch for later
-          let supabase_batch_interval =
-            metric_types.get_supabase_batch_interval(state.metadata)
-          let current_tick_interval = state.tick_type
-
-          logging.log(
-            logging.Info,
-            "[MetricActor] 🔍 Comparing intervals: supabase="
-              <> supabase_batch_interval
-              <> ", current="
-              <> current_tick_interval,
-          )
-
-          case supabase_batch_interval == current_tick_interval {
-            True -> {
-              // Same interval - flush immediately to avoid race condition
+    // Reset metrics need to flush to Supabase (if configured)
+    metric_types.Reset -> {
+      case
+        metric_types.should_send_to_supabase(state.metric_type, state.metadata)
+      {
+        True -> {
+          case diff {
+            0.0 -> {
               logging.log(
                 logging.Info,
-                "[MetricActor] 🚀 Same interval flush (immediate): "
-                  <> supabase_batch_interval,
+                "[MetricActor] 📊 No change since last flush, skipping Supabase",
               )
-              case
-                supabase_client.store_metric(
-                  business_id,
-                  customer_id,
-                  state.default_metric.metric_name,
-                  float.to_string(current_value),
-                  metric_types.metric_type_to_string(state.metric_type),
-                  scope,
-                  None,
-                  None,
-                  None,
-                  None,
-                  None,
-                )
-              {
-                Ok(_) -> {
-                  logging.log(
-                    logging.Info,
-                    "[MetricActor] ✅ Direct flush to Supabase: "
-                      <> float.to_string(diff),
-                  )
-                  current_value
-                }
-                Error(e) -> {
-                  logging.log(
-                    logging.Warning,
-                    "[MetricActor] ⚠️ Direct flush failed: " <> string.inspect(e),
-                  )
-                  state.last_flushed_value
-                }
-              }
+              state.last_flushed_value
             }
-            False -> {
-              // Different interval - use batch system
+            _ -> {
+              let #(business_id, customer_id, scope) =
+                metric_types.parse_account_id(state.default_metric.account_id)
+
               logging.log(
                 logging.Info,
-                "[MetricActor] 📦 Batching for later flush: "
-                  <> supabase_batch_interval,
+                "[MetricActor] 🔍 PARSED account_id='"
+                  <> state.default_metric.account_id
+                  <> "' -> business='"
+                  <> business_id
+                  <> "', customer='"
+                  <> string.inspect(customer_id)
+                  <> "', scope='"
+                  <> scope
+                  <> "'",
               )
-              let batch =
-                metric_types.MetricBatch(
-                  business_id: business_id,
-                  customer_id: customer_id,
-                  metric_name: state.default_metric.metric_name,
-                  aggregated_value: current_value,
-                  operation_count: 1,
-                  metric_type: metric_types.metric_type_to_string(
-                    state.metric_type,
-                  ),
-                  window_start: utils.current_timestamp(),
-                  window_end: utils.current_timestamp(),
-                  flush_interval: supabase_batch_interval,
-                  scope: scope,
-                  adapters: None,
-                  metric_mode: metric_types.Simple(
-                    convert_metric_store_operation_to_simple(
-                      state.metric_operation,
-                    ),
-                  ),
-                )
-              case supabase_actor.send_metric_batch(batch) {
-                Ok(_) -> {
+
+              let supabase_batch_interval =
+                metric_types.get_supabase_batch_interval(state.metadata)
+              let current_tick_interval = state.tick_type
+
+              logging.log(
+                logging.Info,
+                "[MetricActor] 🔍 Comparing intervals: supabase="
+                  <> supabase_batch_interval
+                  <> ", current="
+                  <> current_tick_interval,
+              )
+
+              case supabase_batch_interval == current_tick_interval {
+                True -> {
                   logging.log(
                     logging.Info,
-                    "[MetricActor] ✅ Sent diff to SupabaseActor: "
-                      <> float.to_string(diff),
+                    "[MetricActor] 🚀 Same interval flush (immediate): "
+                      <> supabase_batch_interval,
                   )
-                  current_value
+                  case
+                    supabase_client.store_metric(
+                      business_id,
+                      customer_id,
+                      state.default_metric.metric_name,
+                      float.to_string(current_value),
+                      metric_types.metric_type_to_string(state.metric_type),
+                      scope,
+                      None,
+                      None,
+                      None,
+                      None,
+                      None,
+                    )
+                  {
+                    Ok(_) -> {
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] ✅ Direct flush to Supabase: "
+                          <> float.to_string(diff),
+                      )
+                      current_value
+                    }
+                    Error(e) -> {
+                      logging.log(
+                        logging.Warning,
+                        "[MetricActor] ⚠️ Direct flush failed: "
+                          <> string.inspect(e),
+                      )
+                      state.last_flushed_value
+                    }
+                  }
                 }
-                Error(e) -> {
-                  logging.log(logging.Warning, "[MetricActor] ⚠️ Failed: " <> e)
-                  state.last_flushed_value
+                False -> {
+                  logging.log(
+                    logging.Info,
+                    "[MetricActor] 📦 Batching for later flush: "
+                      <> supabase_batch_interval,
+                  )
+                  let batch =
+                    metric_types.MetricBatch(
+                      business_id: business_id,
+                      customer_id: customer_id,
+                      metric_name: state.default_metric.metric_name,
+                      aggregated_value: current_value,
+                      operation_count: 1,
+                      metric_type: metric_types.metric_type_to_string(
+                        state.metric_type,
+                      ),
+                      window_start: utils.current_timestamp(),
+                      window_end: utils.current_timestamp(),
+                      flush_interval: supabase_batch_interval,
+                      scope: scope,
+                      adapters: None,
+                      metric_mode: metric_types.Simple(
+                        convert_metric_store_operation_to_simple(
+                          state.metric_operation,
+                        ),
+                      ),
+                    )
+                  case supabase_actor.send_metric_batch(batch) {
+                    Ok(_) -> {
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] ✅ Sent diff to SupabaseActor: "
+                          <> float.to_string(diff),
+                      )
+                      current_value
+                    }
+                    Error(e) -> {
+                      logging.log(
+                        logging.Warning,
+                        "[MetricActor] ⚠️ Failed: " <> e,
+                      )
+                      state.last_flushed_value
+                    }
+                  }
                 }
               }
             }
           }
         }
+        False -> {
+          logging.log(
+            logging.Debug,
+            "[MetricActor] Skipping Supabase for this metric type",
+          )
+          state.last_flushed_value
+        }
       }
-    }
-    False -> {
-      logging.log(
-        logging.Debug,
-        "[MetricActor] Skipping Supabase for this metric type",
-      )
-      state.last_flushed_value
     }
   }
 
   // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
     metric_types.Checkpoint | metric_types.StripeBilling -> {
-      // Both accumulate until explicitly reset
       logging.log(
         logging.Info,
         "[MetricActor] ✅ Accumulating metric (keeping current value)",
@@ -1240,7 +1326,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
       }
     }
   }
-  // ✅ Return the updated state
+
   State(
     ..state,
     current_metric: state.default_metric,
