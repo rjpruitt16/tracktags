@@ -496,7 +496,6 @@ pub fn delete_business_key(
   }
 }
 
-/// CREATE - POST /api/v1/businesses/{business_id}/customers/{customer_id}/keys
 pub fn create_customer_key(
   req: Request,
   business_id: String,
@@ -530,25 +529,30 @@ pub fn create_customer_key(
 
   case result {
     Ok(_key_body) -> {
-      // Check if key already exists
+      // Check if THIS CUSTOMER has reached key limit (2 active keys)
       case
         supabase_client.get_integration_keys(business_id, Some("customer_api"))
       {
         Ok(existing_keys) -> {
-          let has_existing =
-            list.any(existing_keys, fn(key) {
-              key.key_name == customer_id && key.is_active
+          // IMPORTANT: Filter by customer_id (key_name starts with customer_id)
+          let customer_active_keys =
+            list.filter(existing_keys, fn(key) {
+              string.starts_with(key.key_name, customer_id) && key.is_active
             })
 
-          case has_existing {
+          let active_count = list.length(customer_active_keys)
+
+          case active_count >= 2 {
             True -> {
               wisp.json_response(
                 json.to_string_tree(
                   json.object([
-                    #("error", json.string("Conflict")),
+                    #("error", json.string("Key Limit Reached")),
                     #(
                       "message",
-                      json.string("Customer already has an active API key"),
+                      json.string(
+                        "Maximum 2 active keys per customer. Delete a key first.",
+                      ),
                     ),
                   ]),
                 ),
@@ -561,6 +565,7 @@ pub fn create_customer_key(
         Error(_) -> generate_and_store_customer_key(business_id, customer_id)
       }
     }
+    // ADD THIS ERROR HANDLER:
     Error(decode_errors) -> {
       wisp.json_response(
         json.to_string_tree(
@@ -624,8 +629,8 @@ pub fn delete_customer_key(
   use <- wisp.require_method(req, http.Delete)
   use _ <- with_auth(req)
 
-  // Validate that the key_name matches the customer_id (security check)
-  case key_name == customer_id {
+  // Validate that the key_name STARTS WITH the customer_id (security check)
+  case string.starts_with(key_name, customer_id) {
     False -> {
       logging.log(
         logging.Warning,
@@ -649,14 +654,14 @@ pub fn delete_customer_key(
         supabase_client.deactivate_integration_key(
           business_id,
           "customer_api",
-          customer_id,
-          // Use customer_id as the key_name
+          key_name,
+          // Use the full key_name with timestamp
         )
       {
         Ok(_) -> {
           logging.log(
             logging.Info,
-            "[KeyHandler] ✅ Deleted customer key for: " <> customer_id,
+            "[KeyHandler] ✅ Deleted customer key: " <> key_name,
           )
           wisp.ok() |> wisp.string_body("Key deleted")
         }
@@ -1230,6 +1235,10 @@ fn generate_and_store_customer_key(
   business_id: String,
   customer_id: String,
 ) -> Response {
+  // Generate unique key_name by adding timestamp
+  let timestamp = utils.generate_random()
+  let key_name = customer_id <> "_" <> timestamp
+
   // Generate the new key
   let plain_customer_key = utils.create_customer_key(customer_id)
 
@@ -1240,7 +1249,9 @@ fn generate_and_store_customer_key(
     logging.Info,
     "[KeyHandler] Generated key for customer: "
       <> customer_id
-      <> " (hash: "
+      <> " (key_name: "
+      <> key_name
+      <> ", hash: "
       <> string.slice(key_hash, 0, 10)
       <> "...)",
   )
@@ -1248,12 +1259,13 @@ fn generate_and_store_customer_key(
   // Encrypt the key for storage
   case crypto.encrypt_to_json(plain_customer_key) {
     Ok(encrypted_key) -> {
-      // Store with both encrypted key and hash
+      // Store with unique key_name
       case
         supabase_client.store_integration_key_with_hash(
           business_id,
           "customer_api",
-          customer_id,
+          key_name,
+          // Changed: now includes timestamp
           encrypted_key,
           key_hash,
           None,
@@ -1262,16 +1274,16 @@ fn generate_and_store_customer_key(
         Ok(stored_key) -> {
           logging.log(
             logging.Info,
-            "[KeyHandler] ✅ Customer key created with hash: " <> stored_key.id,
+            "[KeyHandler] ✅ Customer key created: " <> stored_key.id,
           )
 
-          // Return the PLAIN key to the user (only time they'll see it)
           let success_json =
             json.object([
               #("status", json.string("created")),
               #("api_key", json.string(plain_customer_key)),
               #("customer_id", json.string(customer_id)),
               #("key_id", json.string(stored_key.id)),
+              #("key_name", json.string(key_name)),
               #(
                 "warning",
                 json.string(

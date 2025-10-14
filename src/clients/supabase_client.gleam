@@ -2908,8 +2908,19 @@ pub fn store_integration_key_with_hash(
     ])
     |> json.to_string()
 
+  logging.log(logging.Info, "[SupabaseClient] 🔍 INSERT BODY: " <> body)
+
   let path = "/integration_keys"
   use response <- result.try(make_request(http.Post, path, Some(body)))
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 📥 RESPONSE STATUS: " <> int.to_string(response.status),
+  )
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 📥 RESPONSE BODY: " <> response.body,
+  )
 
   case response.status {
     201 | 200 -> {
