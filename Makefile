@@ -29,6 +29,15 @@ $(DOCKER_BUILD_STAMP): Dockerfile $(shell find src -type f -name "*.gleam") glea
 	docker build -t tracktags .
 	@touch $(DOCKER_BUILD_STAMP)
 
+# Force rebuild and restart containers
+docker-rebuild:
+	@echo "🔨 Forcing complete rebuild..."
+	docker compose -f docker-compose.test.yml down -v
+	docker rmi tracktags-tracktags:latest 2>/dev/null || true
+	docker compose -f docker-compose.test.yml build --no-cache --pull
+	docker compose -f docker-compose.test.yml up -d
+	@echo "✅ Rebuild complete!"
+
 docker-up: docker-build
 	@echo "Cleaning up old containers..."
 	@docker compose -f docker-compose.test.yml down 2>/dev/null || true
@@ -56,7 +65,7 @@ test-single:
 	@sleep 2
 	hurl --test --verbose \
 		--variable ADMIN_SECRET_KEY=$(ADMIN_SECRET_KEY) \
-                --variable TRACKTAGS_URL=http://localhost:8080 \
+                --variable TRACKTAGS_URL=http://localhost:8888 \
                 --variable SUPABASE_URL=$(SUPABASE_URL) \
 		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
                 --variable PROXY_TARGET_URL=http://webhook:9090 \
@@ -74,7 +83,7 @@ test-docker:
 	@echo "Running integration tests..."
 	hurl --test --retry 3 --retry-interval 5000 \
 		--variable ADMIN_SECRET_KEY=$(ADMIN_SECRET_KEY) \
-		--variable TRACKTAGS_URL=http://localhost:8080 \
+		--variable TRACKTAGS_URL=http://localhost:8888 \
 		--variable SUPABASE_URL=$(SUPABASE_URL) \
 		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
 		--variable PROXY_TARGET_URL=http://webhook:9090 \

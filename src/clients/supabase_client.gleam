@@ -515,15 +515,19 @@ pub fn validate_api_key_with_retry(
               Ok(BusinessKey(integration_key.business_id))
             }
             "customer_api" -> {
+              let customer_id =
+                integration_key.key_name
+                |> string.split("_")
+                |> list.reverse()
+                |> list.drop(1)
+                |> list.reverse()
+                |> string.join("_")
+
               logging.log(
                 logging.Info,
-                "[SupabaseClient] Customer key validated for: "
-                  <> integration_key.key_name,
+                "[SupabaseClient] Customer key validated for: " <> customer_id,
               )
-              Ok(CustomerKey(
-                integration_key.business_id,
-                integration_key.key_name,
-              ))
+              Ok(CustomerKey(integration_key.business_id, customer_id))
             }
             _ -> {
               case retries > 0 {
@@ -2535,21 +2539,37 @@ pub fn get_customer_full_context(
       #("p_customer_id", json.string(customer_id)),
     ])
     |> json.to_string()
-
   use response <- result.try(make_request(
     http.Post,
     "/rpc/get_customer_context",
     Some(body),
   ))
-
   case response.status {
     200 -> {
-      case json.parse(response.body, customer_context_decoder()) {
-        Ok(context) -> Ok(context)
-        Error(_) -> Error(ParseError("Invalid context format"))
+      // First check if response contains an error
+      case string.contains(response.body, "\"error\"") {
+        True -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] Customer context error: " <> response.body,
+          )
+          Error(NotFound("Customer not found"))
+        }
+        False -> {
+          case json.parse(response.body, customer_context_decoder()) {
+            Ok(context) -> Ok(context)
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[SupabaseClient] Failed to parse customer context: "
+                  <> response.body,
+              )
+              Error(ParseError("Invalid context format"))
+            }
+          }
+        }
       }
     }
-    404 -> Error(NotFound("Customer not found"))
     _ -> Error(DatabaseError("Failed to get customer context"))
   }
 }
@@ -2945,7 +2965,6 @@ pub fn increment_checkpoint_atomic(
   delta: Float,
   scope: String,
   tags: Dict(String, String),
-  // ✅ ADD THIS
 ) -> Result(Float, SupabaseError) {
   // Convert tags dict to JSON
   let tags_json =
@@ -2956,7 +2975,6 @@ pub fn increment_checkpoint_atomic(
         #(k, json.string(v))
       }),
     )
-
   let body =
     json.object([
       #("p_business_id", json.string(business_id)),
@@ -2968,24 +2986,46 @@ pub fn increment_checkpoint_atomic(
       #("p_delta", json.float(delta)),
       #("p_scope", json.string(scope)),
       #("p_tags", tags_json),
-      // ✅ ADD THIS
     ])
     |> json.to_string()
-
   use response <- result.try(make_request(
     http.Post,
     "/rpc/increment_checkpoint_metric",
     Some(body),
   ))
-
   case response.status {
     200 -> {
-      case json.parse(response.body, decode.float) {
-        Ok(new_value) -> Ok(new_value)
-        Error(_) -> Error(ParseError("Invalid increment response"))
+      // Supabase RPC returns a plain number (may be int or float format)
+      let trimmed = string.trim(response.body)
+      case float.parse(trimmed) {
+        Ok(new_value) -> {
+          logging.log(
+            logging.Info,
+            "✅ Atomic increment success: " <> float.to_string(new_value),
+          )
+          Ok(new_value)
+        }
+        Error(_) -> {
+          // Try parsing as int and converting to float
+          case int.parse(trimmed) {
+            Ok(int_value) -> {
+              let new_value = int.to_float(int_value)
+              logging.log(
+                logging.Info,
+                "✅ Atomic increment success: " <> float.to_string(new_value),
+              )
+              Ok(new_value)
+            }
+            Error(_) ->
+              Error(ParseError("Invalid increment response: " <> response.body))
+          }
+        }
       }
     }
-    _ -> Error(ParseError("Increment RPC failed"))
+    _ ->
+      Error(ParseError(
+        "Increment RPC failed: " <> int.to_string(response.status),
+      ))
   }
 }
 

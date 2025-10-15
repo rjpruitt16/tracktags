@@ -54,4 +54,13 @@ curl -X DELETE \
   -H "Prefer: return=minimal" \
   -s
 
+# Delete test metrics
+echo "Deleting test metrics..."
+curl -X DELETE \
+  "${SUPABASE_URL}/rest/v1/metrics?metric_name=like.%1760%" \
+  -H "apikey: ${SUPABASE_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_KEY}" \
+  -H "Prefer: return=minimal" \
+  -s
+
 echo "✅ Test data cleanup completed"

@@ -89,9 +89,9 @@ Content-Type: application/json
 }
 HTTP 201
 
-# Step 8: Verify metric exists with retries
+# Step 8: Verify metric exists with retries (use business key, not customer key)
 GET {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
-Authorization: Bearer {{customer_key}}
+Authorization: Bearer {{business_key}}
 [Options]
 retry: 15
 retry-interval: 2000
@@ -110,6 +110,9 @@ jsonpath "$.error" == "Forbidden"
 POST {{TRACKTAGS_URL}}/api/v1/proxy
 Authorization: Bearer {{customer_key}}
 Content-Type: application/json
+[Options]
+retry: 10
+retry-interval: 500
 {
   "scope": "customer",
   "metric_name": "api_calls",
@@ -148,6 +151,7 @@ HTTP 200
 POST {{TRACKTAGS_URL}}/api/v1/proxy
 Authorization: Bearer {{customer_key}}
 Content-Type: application/json
+
 {
   "scope": "customer",
   "metric_name": "api_calls", 

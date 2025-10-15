@@ -74,7 +74,7 @@ Authorization: Bearer {{business_key}}
 Content-Type: application/json
 [Options]
 retry: 10
-retry-interval: 500
+retry-interval: 2000
 {
   "value": 50.0
 }
