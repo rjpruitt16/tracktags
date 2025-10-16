@@ -1381,16 +1381,16 @@ pub fn handle_plan_change(registry_key: String, message: String) -> Nil {
 
   case json.parse(message, plan_decoder) {
     Ok(#(_customer_id, plan_id, stripe_price_id)) -> {
-      // Parse: "biz_ID:cust_TIMESTAMP_METRIC_NAME"
+      // Parse: "biz_ID:cust_TYPE_TIMESTAMP_METRIC_NAME"
       case string.split(registry_key, ":") {
         [business_id, customer_part] -> {
-          // customer_part = "cust_1760593448_api_calls"
+          // customer_part = "cust_paid_1760595950_api_calls"
           let parts = string.split(customer_part, "_")
           case parts {
-            ["cust", timestamp, ..metric_parts] -> {
+            ["cust", id_type, timestamp, ..metric_parts] -> {
               let metric_name = string.join(metric_parts, "_")
-              let account_id = business_id <> ":cust_" <> timestamp
-
+              let customer_id = "cust_" <> id_type <> "_" <> timestamp
+              let account_id = business_id <> ":" <> customer_id
               case lookup_metric_subject(account_id, metric_name) {
                 Ok(metric_subject) -> {
                   // Fetch new limits based on plan_id or stripe_price_id

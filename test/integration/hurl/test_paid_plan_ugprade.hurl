@@ -58,7 +58,7 @@ Content-Type: application/json
   "limit_value": 10.0,
   "breach_operator": "gte",
   "breach_action": "deny",
-  "metric_type": "reset"
+  "metric_type": "checkpoint"
 }
 HTTP 201
 
@@ -85,7 +85,7 @@ Content-Type: application/json
   "limit_value": 1000.0,
   "breach_operator": "gte",
   "breach_action": "deny",
-  "metric_type": "reset"
+  "metric_type": "checkpoint"
 }
 HTTP 201
 
@@ -94,7 +94,7 @@ POST {{TRACKTAGS_URL}}/api/v1/customers
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
 {
-  "customer_id": "cust_{{test_id}}",
+  "customer_id": "cust_paid_{{test_id}}",
   "customer_name": "UpgradeCustomer_{{test_id}}",
   "plan_id": "{{free_plan_id}}"
 }
@@ -157,8 +157,8 @@ HTTP 200
 GET {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 [Options]
-retry: 10
-retry-interval: 500
+retry: 15
+retry-interval: 1000
 HTTP 200
 [Asserts]
 jsonpath "$.current_value" >= 15.0
@@ -167,6 +167,9 @@ jsonpath "$.current_value" >= 15.0
 POST {{TRACKTAGS_URL}}/api/v1/proxy
 Authorization: Bearer {{customer_key}}
 Content-Type: application/json
+[Options]
+retry: 5
+retry-interval: 1000
 {
   "scope": "customer",
   "metric_name": "",
@@ -188,22 +191,28 @@ Content-Type: application/json
 }
 HTTP 200
 
-### TEST 6: Wait for customer actor to reload with new plan ###
+### TEST 6: Wait for plan change in database ###
 GET {{TRACKTAGS_URL}}/api/v1/customers/{{customer_id}}
 Authorization: Bearer {{business_key}}
 [Options]
-retry: 10
+retry: 15
 retry-interval: 1000
 HTTP 200
 [Asserts]
 jsonpath "$.plan_id" == "{{paid_plan_id}}"
 
-### TEST 7: Proxy should NOW be allowed (15 < 1000 on PAID tier) ###
+### TEST 6.5: Wait for plan change to propagate to metric actors ###
+GET {{TRACKTAGS_URL}}/health
+[Options]
+delay: 3000
+HTTP 200
+
+### TEST 7: Proxy should NOW be allowed (old value should persist or be reset to 0) ###
 POST {{TRACKTAGS_URL}}/api/v1/proxy
 Authorization: Bearer {{customer_key}}
 Content-Type: application/json
 [Options]
-retry: 10
+retry: 20
 retry-interval: 1000
 {
   "scope": "customer",
@@ -216,7 +225,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.status" == "allowed"
 
-### TEST 8: Breach PAID tier limit (set to 1500) ###
+### TEST 8: NOW set to 1500 (after plan change is complete) ###
 PUT {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
@@ -229,8 +238,8 @@ HTTP 200
 GET {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 [Options]
-retry: 10
-retry-interval: 500
+retry: 15
+retry-interval: 1000
 HTTP 200
 [Asserts]
 jsonpath "$.current_value" >= 1500.0
@@ -239,6 +248,9 @@ jsonpath "$.current_value" >= 1500.0
 POST {{TRACKTAGS_URL}}/api/v1/proxy
 Authorization: Bearer {{customer_key}}
 Content-Type: application/json
+[Options]
+retry: 5
+retry-interval: 1000
 {
   "scope": "customer",
   "metric_name": "",

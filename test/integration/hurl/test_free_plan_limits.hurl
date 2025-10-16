@@ -81,7 +81,7 @@ POST {{TRACKTAGS_URL}}/api/v1/customers
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
 {
-  "customer_id": "cust_{{test_id}}",
+  "customer_id": "cust_free_{{test_id}}",
   "customer_name": "FreeCustomer_{{test_id}}",
   "plan_id": "{{free_plan_id}}"
 }
