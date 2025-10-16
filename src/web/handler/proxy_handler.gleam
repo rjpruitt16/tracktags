@@ -1,6 +1,7 @@
 // src/web/handler/proxy_handler.gleam
 
 import actors/metric_actor
+import birl
 import clients/supabase_client
 import gleam/dict
 import gleam/dynamic/decode
@@ -914,25 +915,30 @@ fn validate_proxy_request(
 // AUTHENTICATION (Reused from other handlers)
 // ============================================================================
 
-// In proxy_handler.gleam
 fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
-  auth.with_auth(req, fn(auth_result, api_key, is_admin) {
+  auth.with_auth(req, fn(auth_result, _api_key, _is_admin) {
     case auth_result {
       auth.ActorCached(auth.BusinessActor(business_id, _)) ->
         handler(business_id)
 
       auth.ActorCached(auth.CustomerActor(business_id, customer_id, _)) -> {
-        // Fetch context for customer
         case
           supabase_client.get_customer_full_context(business_id, customer_id)
         {
-          Ok(context) ->
-            handle_customer_request_with_context(
-              req,
-              business_id,
-              customer_id,
-              context,
-            )
+          Ok(context) -> {
+            case check_and_handle_expiry(context) {
+              Ok(updated_context) ->
+                handle_customer_request_with_context(
+                  req,
+                  business_id,
+                  customer_id,
+                  updated_context,
+                )
+              Error(_) ->
+                wisp.internal_server_error()
+                |> wisp.string_body("Failed to process subscription expiry")
+            }
+          }
           Error(_) ->
             wisp.internal_server_error()
             |> wisp.string_body("Failed to get customer context")
@@ -940,40 +946,39 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
       }
 
       auth.DatabaseValid(supabase_client.BusinessKey(business_id)) -> {
-        case is_admin {
-          True -> {
-            // Admin shouldn't use proxy directly
-            wisp.json_response(
-              json.to_string_tree(
-                json.object([
-                  #("error", json.string("Forbidden")),
-                  #(
-                    "message",
-                    json.string("Admin key cannot use proxy endpoint"),
-                  ),
-                ]),
+        // Business keys can't use proxy
+        wisp.json_response(
+          json.to_string_tree(
+            json.object([
+              #("error", json.string("Forbidden")),
+              #(
+                "message",
+                json.string("Business key cannot use proxy endpoint"),
               ),
-              403,
-            )
-          }
-          False -> {
-            let _ = auth.ensure_actor_from_auth(auth_result, api_key)
-            handler(business_id)
-          }
-        }
+            ]),
+          ),
+          403,
+        )
       }
 
       auth.DatabaseValid(supabase_client.CustomerKey(business_id, customer_id)) -> {
         case
           supabase_client.get_customer_full_context(business_id, customer_id)
         {
-          Ok(context) ->
-            handle_customer_request_with_context(
-              req,
-              business_id,
-              customer_id,
-              context,
-            )
+          Ok(context) -> {
+            case check_and_handle_expiry(context) {
+              Ok(updated_context) ->
+                handle_customer_request_with_context(
+                  req,
+                  business_id,
+                  customer_id,
+                  updated_context,
+                )
+              Error(_) ->
+                wisp.internal_server_error()
+                |> wisp.string_body("Failed to process subscription expiry")
+            }
+          }
           Error(_) ->
             wisp.internal_server_error()
             |> wisp.string_body("Failed to get customer context")
@@ -1469,5 +1474,59 @@ fn check_all_plan_limits_and_forward(
         400,
       )
     }
+  }
+}
+
+// Add to proxy_handler.gleam
+fn check_and_handle_expiry(
+  context: customer_types.CustomerContext,
+) -> Result(customer_types.CustomerContext, String) {
+  case context.customer.subscription_ends_at {
+    Some(expires_at_str) -> {
+      case birl.parse(expires_at_str) {
+        Ok(expires_time) -> {
+          let expires_unix = birl.to_unix(expires_time)
+          let now = utils.current_timestamp()
+
+          case expires_unix < now {
+            True -> {
+              // Expired! Downgrade to free plan
+              logging.log(
+                logging.Warning,
+                "[ProxyHandler] Subscription expired for customer: "
+                  <> context.customer.customer_id
+                  <> " - downgrading to free plan",
+              )
+
+              case
+                supabase_client.downgrade_customer_to_free_plan(
+                  context.customer.business_id,
+                  context.customer.customer_id,
+                )
+              {
+                Ok(_) -> {
+                  // Reload context with free plan
+                  supabase_client.get_customer_full_context(
+                    context.customer.business_id,
+                    context.customer.customer_id,
+                  )
+                  |> result.map_error(fn(_) {
+                    "Failed to reload context after downgrade"
+                  })
+                }
+                Error(e) ->
+                  Error("Failed to downgrade customer: " <> string.inspect(e))
+              }
+            }
+            False -> Ok(context)
+            // Still valid
+          }
+        }
+        Error(_) -> Ok(context)
+        // Can't parse, assume valid
+      }
+    }
+    None -> Ok(context)
+    // No expiry set
   }
 }

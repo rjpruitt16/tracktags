@@ -28,6 +28,8 @@ pub type PlanLimitRequest {
     breach_action: String,
     webhook_urls: option.Option(String),
     customer_id: option.Option(String),
+    plan_id: option.Option(String),
+    metric_type: String,
   )
 }
 
@@ -156,6 +158,18 @@ fn limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
     None,
     decode.optional(decode.string),
   )
+  use plan_id <- decode.optional_field(
+    "plan_id",
+    None,
+    decode.optional(decode.string),
+  )
+  // ← ADD
+  use metric_type <- decode.optional_field(
+    "metric_type",
+    "reset",
+    decode.string,
+  )
+  // ← ADD
 
   decode.success(PlanLimitRequest(
     metric_name: metric_name,
@@ -165,6 +179,10 @@ fn limit_request_decoder() -> decode.Decoder(PlanLimitRequest) {
     breach_action: breach_action,
     webhook_urls: webhook_urls,
     customer_id: customer_id,
+    plan_id: plan_id,
+    // ← ADD
+    metric_type: metric_type,
+    // ← ADD
   ))
 }
 
@@ -560,44 +578,91 @@ pub fn delete_plan_limit(req: Request, limit_id: String) -> Response {
 // HELPER FUNCTIONS
 // ============================================================================
 
+// In plan_handler.gleam - update process_create_plan_limit
 fn process_create_plan_limit(
   business_id: String,
   req: PlanLimitRequest,
 ) -> Response {
-  case
-    supabase_client.create_business_plan_limit(
-      business_id,
-      req.metric_name,
-      req.limit_value,
-      req.limit_period,
-      req.breach_operator,
-      req.breach_action,
-      req.webhook_urls,
-    )
-  {
-    Ok(limit) -> {
-      wisp.json_response(
-        json.to_string_tree(
-          json.object([
-            #("status", json.string("created")),
-            #("id", json.string(limit.id)),
-            #("metric_name", json.string(req.metric_name)),
-            #("limit_value", json.float(req.limit_value)),
-          ]),
-        ),
-        201,
-      )
+  // Check if this is a plan-level or business-level limit
+  case req.plan_id {
+    Some(plan_id) -> {
+      // Plan-level limit
+      case
+        supabase_client.create_plan_limit(
+          business_id,
+          plan_id,
+          req.metric_name,
+          req.limit_value,
+          req.breach_operator,
+          req.breach_action,
+          req.webhook_urls,
+          req.metric_type,
+        )
+      {
+        Ok(limit) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("status", json.string("created")),
+                #("id", json.string(limit.id)),
+                #("metric_name", json.string(req.metric_name)),
+                #("limit_value", json.float(req.limit_value)),
+              ]),
+            ),
+            201,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Internal Server Error")),
+                #("message", json.string("Failed to create plan limit")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
     }
-    Error(_) -> {
-      wisp.json_response(
-        json.to_string_tree(
-          json.object([
-            #("error", json.string("Internal Server Error")),
-            #("message", json.string("Failed to create plan limit")),
-          ]),
-        ),
-        500,
-      )
+    None -> {
+      // Business-level limit
+      case
+        supabase_client.create_business_plan_limit(
+          business_id,
+          req.metric_name,
+          req.limit_value,
+          req.limit_period,
+          req.breach_operator,
+          req.breach_action,
+          req.webhook_urls,
+        )
+      {
+        Ok(limit) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("status", json.string("created")),
+                #("id", json.string(limit.id)),
+                #("metric_name", json.string(req.metric_name)),
+                #("limit_value", json.float(req.limit_value)),
+              ]),
+            ),
+            201,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Internal Server Error")),
+                #("message", json.string("Failed to create plan limit")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
     }
   }
 }
@@ -653,7 +718,6 @@ fn limit_to_json(limit: customer_types.PlanLimit) -> json.Json {
     #("id", json.string(limit.id)),
     #("metric_name", json.string(limit.metric_name)),
     #("limit_value", json.float(limit.limit_value)),
-    #("limit_period", json.string(limit.limit_period)),
     #("breach_operator", json.string(limit.breach_operator)),
     #("breach_action", json.string(limit.breach_action)),
     #("webhook_urls", case limit.webhook_urls {

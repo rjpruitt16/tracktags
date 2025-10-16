@@ -785,59 +785,103 @@ fn get_plan_limits(
   }
 }
 
-/// Downgrade business to their configured free tier limits
-pub fn downgrade_to_free_limits(
+// In supabase_client.gleam
+pub fn clear_stripe_subscription(
   business_id: String,
+  customer_id: String,
 ) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Downgrading to customer's free limits: " <> business_id,
+    "[SupabaseClient] Clearing expired subscription for: " <> customer_id,
   )
 
-  // Get customer's free tier configuration
-  use free_limits <- result.try(get_customer_free_limits(business_id))
+  let update_data =
+    json.object([
+      #("stripe_price_id", json.null()),
+      #("stripe_subscription_id", json.null()),
+      #("subscription_ends_at", json.null()),
+    ])
 
-  // Deactivate existing business-level limits (soft delete)
-  let deactivate_data = json.object([#("is_active", json.bool(False))])
-  let update_path = "/plan_limits?business_id=eq." <> business_id
-  use _response <- result.try(make_request(
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use _ <- result.try(make_request(
     http.Patch,
-    update_path,
-    Some(json.to_string(deactivate_data)),
+    path,
+    Some(json.to_string(update_data)),
   ))
 
-  // Create new business-level limits based on their free plan (avoiding duplicates)
-  use _ <- result.try(
-    list.try_each(free_limits, fn(limit) {
-      let #(metric_name, limit_value, period) = limit
+  logging.log(logging.Info, "[SupabaseClient] ✅ Subscription cleared")
+  Ok(Nil)
+}
 
-      // Delete any existing limit for this metric first
-      let delete_path =
-        "/plan_limits?business_id=eq."
-        <> business_id
-        <> "&metric_name=eq."
-        <> metric_name
-      let _ = make_request(http.Delete, delete_path, None)
-
-      create_plan_limit(
-        business_id,
-        metric_name,
-        limit_value,
-        period,
-        "gte",
-        "deny",
-        None,
-      )
-    })
-    |> result.map_error(fn(_) { DatabaseError("Failed to create free limits") }),
-  )
+pub fn downgrade_customer_to_free_plan(
+  business_id: String,
+  customer_id: String,
+) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] ✅ Successfully downgraded to customer's free limits: "
-      <> business_id,
+    "[SupabaseClient] Downgrading customer to free plan: "
+      <> business_id
+      <> "/"
+      <> customer_id,
   )
 
+  // Get the FREE plan for this business (stripe_price_id IS NULL)
+  use free_plan <- result.try(get_free_plan_for_business(business_id))
+
+  // Update customer to use free plan
+  let update_data =
+    json.object([
+      #("plan_id", json.string(free_plan.id)),
+      #("stripe_price_id", json.null()),
+      #("stripe_subscription_id", json.null()),
+      #("subscription_ends_at", json.null()),
+    ])
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use _ <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] ✅ Customer downgraded to free plan: " <> customer_id,
+  )
   Ok(Nil)
+}
+
+// Helper to get FREE plan
+pub fn get_free_plan_for_business(
+  business_id: String,
+) -> Result(Plan, SupabaseError) {
+  let path =
+    "/plans?business_id=eq."
+    <> business_id
+    <> "&stripe_price_id=is.null&limit=1"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case json.parse(response.body, decode.list(plan_decoder())) {
+        Ok([plan, ..]) -> Ok(plan)
+        Ok([]) -> Error(NotFound("No free plan found for business"))
+        Error(_) -> Error(ParseError("Invalid plan format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to get free plan"))
+  }
 }
 
 // Add to supabase_client.gleam
@@ -1652,19 +1696,23 @@ pub fn get_business(
   }
 }
 
-/// Create plan limit for subscription provisioning
+// Add to supabase_client.gleam
 pub fn create_plan_limit(
   business_id: String,
+  plan_id: String,
   metric_name: String,
   limit_value: Float,
-  period: String,
-  operator: String,
-  action: String,
-  webhook_url: Option(String),
-) -> Result(Nil, SupabaseError) {
+  breach_operator: String,
+  breach_action: String,
+  webhook_urls: Option(String),
+  metric_type: String,
+  // ← Also accept metric_type from request
+) -> Result(customer_types.PlanLimit, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Creating plan limit: "
+    "[SupabaseClient] Creating plan limit for plan: "
+      <> plan_id
+      <> "/"
       <> metric_name
       <> " = "
       <> float.to_string(limit_value),
@@ -1672,16 +1720,16 @@ pub fn create_plan_limit(
 
   let base_fields = [
     #("business_id", json.string(business_id)),
-    #("plan_id", json.null()),
-    #("customer_id", json.null()),
+    #("plan_id", json.string(plan_id)),
     #("metric_name", json.string(metric_name)),
     #("limit_value", json.float(limit_value)),
-    #("limit_period", json.string(period)),
-    #("breach_operator", json.string(operator)),
-    #("breach_action", json.string(action)),
+    #("breach_operator", json.string(breach_operator)),
+    #("breach_action", json.string(breach_action)),
+    #("metric_type", json.string(metric_type)),
   ]
-  let all_fields = case webhook_url {
-    Some(url) -> [#("webhook_url", json.string(url)), ..base_fields]
+
+  let all_fields = case webhook_urls {
+    Some(urls) -> [#("webhook_urls", json.string(urls)), ..base_fields]
     None -> base_fields
   }
 
@@ -1695,13 +1743,30 @@ pub fn create_plan_limit(
 
   case response.status {
     201 -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] ✅ Created plan limit: " <> metric_name,
-      )
-      Ok(Nil)
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([new_limit, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Created plan limit: " <> new_limit.id,
+          )
+          Ok(new_limit)
+        }
+        Ok([]) -> Error(ParseError("No plan limit returned"))
+        Error(_) -> Error(ParseError("Invalid response format"))
+      }
     }
-    _ -> Error(DatabaseError("Failed to create plan limit"))
+    409 -> Error(DatabaseError("Plan limit already exists"))
+    _ -> {
+      // ← ADD THIS LOGGING
+      logging.log(
+        logging.Error,
+        "[SupabaseClient] ❌ Failed to create plan limit. Status: "
+          <> int.to_string(response.status)
+          <> ", Body: "
+          <> response.body,
+      )
+      Error(DatabaseError("Failed to create plan limit"))
+    }
   }
 }
 
@@ -1799,7 +1864,6 @@ fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
     "limit_value",
     decode.one_of(decode.float, or: [decode.int |> decode.map(int.to_float)]),
   )
-  use limit_period <- decode.field("limit_period", decode.string)
   use breach_operator <- decode.field("breach_operator", decode.string)
   use breach_action <- decode.field("breach_action", decode.string)
   use webhook_urls <- decode.field(
@@ -1820,7 +1884,6 @@ fn plan_limit_decoder() -> decode.Decoder(customer_types.PlanLimit) {
     plan_id: plan_id,
     metric_name: metric_name,
     limit_value: limit_value,
-    limit_period: limit_period,
     breach_operator: breach_operator,
     breach_action: breach_action,
     webhook_urls: webhook_urls,

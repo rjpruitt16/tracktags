@@ -8,6 +8,7 @@ import glixir
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/utils
 
+// In types/customer_types.gleam
 pub type Customer {
   Customer(
     customer_id: String,
@@ -17,8 +18,49 @@ pub type Customer {
     stripe_customer_id: Option(String),
     stripe_subscription_id: Option(String),
     stripe_price_id: Option(String),
+    subscription_ends_at: Option(String),
     created_at: String,
   )
+}
+
+pub fn customer_decoder() -> decode.Decoder(Customer) {
+  use customer_id <- decode.field("customer_id", decode.string)
+  use business_id <- decode.field("business_id", decode.string)
+  use plan_id <- decode.field("plan_id", decode.optional(decode.string))
+  use customer_name <- decode.field("customer_name", decode.string)
+  use stripe_customer_id <- decode.optional_field(
+    "stripe_customer_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use stripe_subscription_id <- decode.optional_field(
+    "stripe_subscription_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use stripe_price_id <- decode.optional_field(
+    "stripe_price_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use subscription_ends_at <- decode.optional_field(
+    "subscription_ends_at",
+    None,
+    decode.optional(decode.string),
+  )
+  use created_at <- decode.field("created_at", decode.string)
+
+  decode.success(Customer(
+    customer_id: customer_id,
+    business_id: business_id,
+    plan_id: plan_id,
+    customer_name: customer_name,
+    stripe_customer_id: stripe_customer_id,
+    stripe_subscription_id: stripe_subscription_id,
+    stripe_price_id: stripe_price_id,
+    subscription_ends_at: subscription_ends_at,
+    created_at: created_at,
+  ))
 }
 
 pub type CustomerMachine {
@@ -53,7 +95,6 @@ pub type PlanLimit {
     plan_id: Option(String),
     metric_name: String,
     limit_value: Float,
-    limit_period: String,
     breach_operator: String,
     breach_action: String,
     webhook_urls: Option(String),
@@ -114,40 +155,6 @@ pub fn lookup_client_subject(
     Ok(subject) -> Ok(subject)
     Error(_) -> Error("Client actor not found: " <> key)
   }
-}
-
-pub fn customer_decoder() -> decode.Decoder(Customer) {
-  use customer_id <- decode.field("customer_id", decode.string)
-  use business_id <- decode.field("business_id", decode.string)
-  use plan_id <- decode.field("plan_id", decode.optional(decode.string))
-  use customer_name <- decode.field("customer_name", decode.string)
-  use stripe_customer_id <- decode.optional_field(
-    "stripe_customer_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use stripe_subscription_id <- decode.optional_field(
-    "stripe_subscription_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use stripe_price_id <- decode.optional_field(
-    "stripe_price_id",
-    None,
-    decode.optional(decode.string),
-  )
-  use created_at <- decode.field("created_at", decode.string)
-
-  decode.success(Customer(
-    customer_id: customer_id,
-    business_id: business_id,
-    plan_id: plan_id,
-    customer_name: customer_name,
-    stripe_customer_id: stripe_customer_id,
-    stripe_subscription_id: stripe_subscription_id,
-    stripe_price_id: stripe_price_id,
-    created_at: created_at,
-  ))
 }
 
 pub fn customer_machine_decoder() -> decode.Decoder(CustomerMachine) {

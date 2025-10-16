@@ -816,30 +816,64 @@ fn handle_payment_failed(event: StripeEvent) -> WebhookResult {
   }
 }
 
-/// Add new handler for subscription deletion
+// Fix handle_subscription_deleted - return WebhookResult, not Result
 fn handle_subscription_deleted(event: StripeEvent) -> WebhookResult {
   case extract_customer_id(event.data) {
     Error(error) -> ProcessingError("Failed to extract customer ID: " <> error)
-    Ok(customer_id) -> {
+    Ok(stripe_customer_id) -> {
       logging.log(
         logging.Info,
-        "[StripeHandler] 🗑️ Subscription canceled for customer: " <> customer_id,
+        "[StripeHandler] 🗑️ Subscription canceled for: " <> stripe_customer_id,
       )
 
-      case handle_subscription_cancellation(customer_id, event.data) {
-        Error(error) ->
-          ProcessingError("Failed to handle cancellation: " <> error)
-        Ok(_) -> Success("Subscription canceled for customer: " <> customer_id)
+      case supabase_client.get_business_by_stripe_customer(stripe_customer_id) {
+        Ok(_business) -> {
+          // Just mark as canceled - don't touch plan_id or limits
+          case
+            supabase_client.update_business_subscription(
+              stripe_customer_id,
+              "canceled",
+              option.unwrap(event.data.price_id, "unknown"),
+              None,
+              // Clear subscription_ends_at? Or set grace period?
+            )
+          {
+            Ok(_) -> {
+              logging.log(
+                logging.Info,
+                "[StripeHandler] ✅ Subscription marked as canceled",
+              )
+              Success("Subscription canceled for: " <> stripe_customer_id)
+            }
+            Error(error) -> {
+              logging.log(
+                logging.Error,
+                "[StripeHandler] ❌ Failed to update subscription: "
+                  <> string.inspect(error),
+              )
+              ProcessingError(
+                "Failed to update subscription: " <> string.inspect(error),
+              )
+            }
+          }
+        }
+        Error(error) -> {
+          logging.log(
+            logging.Error,
+            "[StripeHandler] ❌ Business lookup failed: "
+              <> string.inspect(error),
+          )
+          ProcessingError("Business lookup failed: " <> string.inspect(error))
+        }
       }
     }
   }
 }
 
+// DELETE handle_subscription_cancellation entirely
 fn extract_subscription_data(
   data: StripeData,
-  // Correct type!
 ) -> Result(#(String, String, String), String) {
-  // Extract from StripeData fields
   let status = option.unwrap(data.status, "active")
   let price_id = option.unwrap(data.price_id, "price_unknown")
 
@@ -882,71 +916,6 @@ fn handle_payment_failure_gracefully(
           <> string.inspect(error),
       )
       Error("Failed to update subscription")
-    }
-  }
-}
-
-/// Handle subscription cancellation 
-fn handle_subscription_cancellation(
-  customer_id: String,
-  data: StripeData,
-) -> Result(Nil, String) {
-  logging.log(
-    logging.Info,
-    "[StripeHandler] 🗑️ Processing cancellation for: " <> customer_id,
-  )
-
-  case supabase_client.get_business_by_stripe_customer(customer_id) {
-    Ok(business) -> {
-      // Mark subscription as canceled
-      case
-        supabase_client.update_business_subscription(
-          customer_id,
-          "canceled",
-          option.unwrap(data.price_id, "unknown"),
-          None,
-        )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] ✅ Marked subscription as canceled",
-          )
-          // Downgrade to free tier limits
-          case supabase_client.downgrade_to_free_limits(business.business_id) {
-            Ok(_) -> {
-              logging.log(
-                logging.Info,
-                "[StripeHandler] ✅ Downgraded to free tier limits",
-              )
-              Ok(Nil)
-            }
-            Error(error) -> {
-              logging.log(
-                logging.Error,
-                "[StripeHandler] ❌ Failed to downgrade limits: "
-                  <> string.inspect(error),
-              )
-              Error("Failed to downgrade limits")
-            }
-          }
-        }
-        Error(error) -> {
-          logging.log(
-            logging.Error,
-            "[StripeHandler] ❌ Failed to update subscription: "
-              <> string.inspect(error),
-          )
-          Error("Failed to update subscription")
-        }
-      }
-    }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[StripeHandler] ❌ Business lookup failed: " <> string.inspect(error),
-      )
-      Error("Business lookup failed")
     }
   }
 }

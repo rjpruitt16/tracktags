@@ -223,55 +223,59 @@ fn create_limit_checking_metric(
 ) -> Result(Nil, String) {
   let client_key = business_id <> ":" <> customer_id
 
-  logging.log(
-    logging.Info,
-    "[ClientActor] Creating plan-aware MetricActor for: " <> limit.metric_name,
-  )
-
-  // Create MetricActor with plan limits built-in
-  let metric_spec =
-    metric_actor.start(
-      client_key,
-      limit.metric_name,
-      "tick_1h",
-      // Default flush
-      0.0,
-      // Start at zero usage
-      "",
-      // No tags
-      "SUM",
-      // Accumulate usage
-      -1,
-      // No cleanup
-      limit.metric_type,
-      // Persistent
-      "",
-      // No metadata
-      limit.limit_value,
-      // Plan limit
-      limit.breach_operator,
-      // Plan operator
-      limit.breach_action,
-      // Plan action
-    )
-
-  case
-    glixir.start_dynamic_child(
-      metrics_supervisor,
-      metric_spec,
-      metric_types.encode_metric_args,
-      fn(_) { Ok(process.new_subject()) },
-    )
-  {
-    supervisor.ChildStarted(_child_pid, _reply) -> {
+  // Check if metric already exists
+  case metric_actor.lookup_metric_subject(client_key, limit.metric_name) {
+    Ok(_existing) -> {
       logging.log(
-        logging.Info,
-        "[ClientActor] ✅ Plan-aware metric spawned: " <> limit.metric_name,
+        logging.Debug,
+        "[ClientActor] Metric already exists, skipping: " <> limit.metric_name,
       )
       Ok(Nil)
+      // ← Just return Ok(Nil), no "return" keyword
     }
-    supervisor.StartChildError(error) -> {
-      Error("Failed to spawn plan-aware metric: " <> error)
+    Error(_) -> {
+      // Metric doesn't exist, spawn it
+      logging.log(
+        logging.Info,
+        "[ClientActor] Creating plan-aware MetricActor for: "
+          <> limit.metric_name,
+      )
+
+      let metric_spec =
+        metric_actor.start(
+          client_key,
+          limit.metric_name,
+          "tick_1h",
+          0.0,
+          "",
+          "SUM",
+          -1,
+          limit.metric_type,
+          "",
+          limit.limit_value,
+          limit.breach_operator,
+          limit.breach_action,
+        )
+
+      case
+        glixir.start_dynamic_child(
+          metrics_supervisor,
+          metric_spec,
+          metric_types.encode_metric_args,
+          fn(_) { Ok(process.new_subject()) },
+        )
+      {
+        supervisor.ChildStarted(_child_pid, _reply) -> {
+          logging.log(
+            logging.Info,
+            "[ClientActor] ✅ Plan-aware metric spawned: " <> limit.metric_name,
+          )
+          Ok(Nil)
+        }
+        supervisor.StartChildError(error) -> {
+          Error("Failed to spawn plan-aware metric: " <> error)
+        }
+      }
     }
   }
 }

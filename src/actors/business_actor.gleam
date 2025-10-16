@@ -218,11 +218,25 @@ fn handle_message(
                 logging.Info,
                 "[BusinessActor] Registered API key for " <> state.account_id,
               )
-            Error(e) ->
-              logging.log(
-                logging.Error,
-                "[BusinessActor] Failed to register API key: " <> e,
-              )
+            Error(e) -> {
+              // Check if it's just an "already registered" error
+              case string.contains(e, "AlreadyRegistered") {
+                True -> {
+                  logging.log(
+                    logging.Debug,
+                    "[BusinessActor] API key already registered for "
+                      <> state.account_id
+                      <> " - continuing",
+                  )
+                }
+                False -> {
+                  logging.log(
+                    logging.Error,
+                    "[BusinessActor] Failed to register API key: " <> e,
+                  )
+                }
+              }
+            }
           }
         }
         Error(_) -> {
