@@ -60,7 +60,12 @@ pub fn replay_webhook(
     "[AdminHandler] Replaying webhook: " <> business_id <> "/" <> event_id,
   )
 
-  case stripe_handler.fetch_and_process_stripe_event(business_id, event_id) {
+  case
+    stripe_handler.fetch_and_process_platform_stripe_event(
+      business_id,
+      event_id,
+    )
+  {
     Ok(message) -> {
       logging.log(
         logging.Info,
@@ -607,7 +612,7 @@ pub fn retry_webhook(req: Request, event_id: String) -> Response {
       // Reprocess it
       case parse_stripe_event(event.raw_payload) {
         Ok(parsed_event) -> {
-          case stripe_handler.process_stripe_event(parsed_event) {
+          case stripe_handler.process_platform_stripe_event(parsed_event) {
             stripe_handler.Success(_) -> {
               let _ =
                 supabase_client.update_stripe_event_status(

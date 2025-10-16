@@ -131,8 +131,9 @@ pub fn handle_request(req: Request) -> Response {
     ["api", "v1", "customers", customer_id] ->
       case req.method {
         Get -> user_handler.get_customer(req, customer_id)
+        Put -> user_handler.update_customer(req, customer_id)
         Delete -> user_handler.delete_customer(req, customer_id)
-        _ -> wisp.method_not_allowed([Get, Delete])
+        _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 
     ["api", "v1", "customers", customer_id, "machines"] ->
@@ -158,8 +159,9 @@ pub fn handle_request(req: Request) -> Response {
     ["api", "v1", "businesses", _business_id, "customers", customer_id] ->
       case req.method {
         Get -> user_handler.get_customer(req, customer_id)
+        Put -> user_handler.update_customer(req, customer_id)
         Delete -> user_handler.delete_customer(req, customer_id)
-        _ -> wisp.method_not_allowed([Get, Delete])
+        _ -> wisp.method_not_allowed([Get, Put, Delete])
       }
 
     [

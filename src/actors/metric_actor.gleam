@@ -1,3 +1,5 @@
+//// Handle plan changes from customer actor
+
 import actors/supabase_actor
 import clients/stripe_client
 import clients/supabase_client
@@ -8,6 +10,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
@@ -319,107 +322,75 @@ pub fn start_link(
   case actor.new(state) |> actor.on_message(handle_message) |> actor.start {
     Ok(started) -> {
       let subject = started.data
-
-      // Register in registry for lookup
       let key = account_id <> "_" <> metric_name
-      case
+
+      // Register in registry
+      let _ =
         glixir.register_subject_string(
           utils.tracktags_registry(),
           key,
           started.data,
         )
-      {
-        Ok(_) ->
-          logging.log(logging.Info, "[MetricActor] ✅ eegistered: " <> key)
-        Error(_) ->
-          logging.log(
-            logging.Error,
-            "[MetricActor] ❌ Failed to register: " <> key,
-          )
-      }
 
-      // SUBSCRIPTION 1: Flush ticks (original behavior)
-      case
+      // SUBSCRIPTION 1: Flush ticks
+      let _ =
         glixir.pubsub_subscribe_with_registry_key(
           atom.create("clock_events"),
           "tick:" <> tick_type,
           "actors@metric_actor",
           "handle_tick_direct",
-          account_id <> "_" <> metric_name,
+          key,
         )
-      {
-        Ok(_) -> {
-          logging.log(
-            logging.Info,
-            "[MetricActor] ✅ Flush subscription: "
-              <> tick_type
-              <> " for "
-              <> key,
-          )
-        }
-        Error(e) -> {
-          logging.log(
-            logging.Error,
-            "[MetricActor] ❌ Failed flush subscription: " <> string.inspect(e),
-          )
-        }
-      }
 
-      // SUBSCRIPTION 2: Cleanup ticks (NEW - always subscribe to 5s for cleanup)
+      // SUBSCRIPTION 2: Cleanup ticks
       case cleanup_after_seconds {
-        -1 -> {
-          // No cleanup needed
-          logging.log(
-            logging.Info,
-            "[MetricActor] ⏳ No cleanup subscription (cleanup disabled) for: "
-              <> key,
-          )
-        }
+        -1 -> Nil
         _ -> {
-          // Subscribe to 5-second ticks for cleanup checks
-          case
+          let _ =
             glixir.pubsub_subscribe_with_registry_key(
               atom.create("clock_events"),
               "tick:tick_5s",
               "actors@metric_actor",
               "handle_tick_direct",
-              account_id <> "_" <> metric_name,
+              key,
             )
-          {
-            Ok(_) -> {
-              logging.log(
-                logging.Info,
-                "[MetricActor] ✅ Cleanup subscription: tick_5s for " <> key,
-              )
-            }
-            Error(e) -> {
-              logging.log(
-                logging.Error,
-                "[MetricActor] ❌ Failed cleanup subscription: "
-                  <> string.inspect(e),
-              )
-            }
-          }
+          Nil
         }
       }
 
-      logging.log(
-        logging.Info,
-        "[MetricActor] ✅ MetricActor started with dual subscriptions: "
-          <> metric_name,
-      )
+      // ✨ SUBSCRIPTION 3: Plan changes (NEW!)
+      let customer_id = case string.split(account_id, ":") {
+        [_business_id, cust_id] -> Some(cust_id)
+        _ -> None
+      }
+
+      case customer_id {
+        Some(cust_id) -> {
+          let plan_channel = "customer:" <> cust_id <> ":plan_changed"
+          let _ =
+            glixir.pubsub_subscribe_with_registry_key(
+              utils.realtime_events_bus(),
+              plan_channel,
+              "actors@metric_actor",
+              "handle_plan_change",
+              key,
+            )
+          logging.log(
+            logging.Info,
+            "[MetricActor] ✅ Subscribed to plan changes for: " <> key,
+          )
+        }
+        None -> {
+          logging.log(
+            logging.Debug,
+            "[MetricActor] Business-level metric, no plan subscription",
+          )
+        }
+      }
+
       Ok(subject)
     }
-    Error(error) -> {
-      logging.log(
-        logging.Error,
-        "[MetricActor] ❌ Failed to start "
-          <> metric_name
-          <> ": "
-          <> string.inspect(error),
-      )
-      Error(error)
-    }
+    Error(error) -> Error(error)
   }
 }
 
@@ -882,18 +853,52 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
 
       actor.stop()
     }
-    // In metric_actor.gleam handle_message:
     metric_types.UpdatePlanLimit(new_limit, operator, action) -> {
+      logging.log(
+        logging.Info,
+        "[MetricActor] 📝 Updating limits: "
+          <> state.default_metric.metric_name
+          <> " = "
+          <> float.to_string(new_limit),
+      )
+
+      // Recalculate breach status with new limits
+      let current_value = case
+        metric_store.get_value(
+          state.default_metric.account_id,
+          state.default_metric.metric_name,
+        )
+      {
+        Ok(value) -> value
+        Error(_) -> state.current_metric.value
+      }
+
       let updated_state =
         State(
           ..state,
           limit_value: new_limit,
           limit_operator: operator,
           breach_action: action,
+          is_breached: check_plan_breach_with_params(
+            current_value,
+            new_limit,
+            operator,
+          ),
         )
-      logging.log(logging.Info, "[MetricActor] ✅ Plan limit updated in-memory")
+
+      logging.log(
+        logging.Info,
+        "[MetricActor] ✅ Limits updated | value="
+          <> float.to_string(current_value)
+          <> " limit="
+          <> float.to_string(new_limit)
+          <> " breached="
+          <> string.inspect(updated_state.is_breached),
+      )
+
       actor.continue(updated_state)
     }
+
     metric_types.GetLimitStatus(reply_with) -> {
       // NEW
       let limit_status =
@@ -1355,4 +1360,148 @@ fn check_plan_breach(current_value: Float, state: State) -> Bool {
 /// Check if metric is currently disabled due to breach
 pub fn is_metric_disabled(state: State) -> Bool {
   state.is_breached && state.breach_action == "disabled"
+}
+
+// Handle plan changes from customer actor
+pub fn handle_plan_change(registry_key: String, message: String) -> Nil {
+  logging.log(
+    logging.Info,
+    "[MetricActor] 🔄 Plan changed, reloading limits for: " <> registry_key,
+  )
+
+  let plan_decoder = {
+    use customer_id <- decode.field("customer_id", decode.string)
+    use plan_id <- decode.field("plan_id", decode.optional(decode.string))
+    use stripe_price_id <- decode.field(
+      "stripe_price_id",
+      decode.optional(decode.string),
+    )
+    decode.success(#(customer_id, plan_id, stripe_price_id))
+  }
+
+  case json.parse(message, plan_decoder) {
+    Ok(#(_customer_id, plan_id, stripe_price_id)) -> {
+      // Parse: "biz_ID:cust_TIMESTAMP_METRIC_NAME"
+      case string.split(registry_key, ":") {
+        [business_id, customer_part] -> {
+          // customer_part = "cust_1760593448_api_calls"
+          let parts = string.split(customer_part, "_")
+          case parts {
+            ["cust", timestamp, ..metric_parts] -> {
+              let metric_name = string.join(metric_parts, "_")
+              let account_id = business_id <> ":cust_" <> timestamp
+
+              case lookup_metric_subject(account_id, metric_name) {
+                Ok(metric_subject) -> {
+                  // Fetch new limits based on plan_id or stripe_price_id
+                  let limit_result = case stripe_price_id {
+                    Some(price_id) ->
+                      supabase_client.get_plan_limit_by_price(
+                        price_id,
+                        metric_name,
+                      )
+                    None ->
+                      case plan_id {
+                        Some(p_id) ->
+                          supabase_client.get_plan_limit_by_plan_id(
+                            p_id,
+                            metric_name,
+                          )
+                        None ->
+                          Error(supabase_client.NotFound("No plan specified"))
+                      }
+                  }
+
+                  case limit_result {
+                    Ok(limit) -> {
+                      process.send(
+                        metric_subject,
+                        metric_types.UpdatePlanLimit(
+                          limit.limit_value,
+                          limit.breach_operator,
+                          limit.breach_action,
+                        ),
+                      )
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] ✅ Updated limits: "
+                          <> metric_name
+                          <> " = "
+                          <> float.to_string(limit.limit_value),
+                      )
+                    }
+                    Error(supabase_client.NotFound(_)) -> {
+                      // No limit for this metric on new plan = unlimited
+                      process.send(
+                        metric_subject,
+                        metric_types.UpdatePlanLimit(0.0, "gte", "allow"),
+                      )
+                      logging.log(
+                        logging.Info,
+                        "[MetricActor] ✅ No limit on new plan (unlimited): "
+                          <> metric_name,
+                      )
+                    }
+                    Error(e) -> {
+                      logging.log(
+                        logging.Error,
+                        "[MetricActor] ❌ Failed to fetch limits: "
+                          <> string.inspect(e),
+                      )
+                    }
+                  }
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Debug,
+                    "[MetricActor] Actor not found (may have stopped): "
+                      <> registry_key,
+                  )
+                }
+              }
+            }
+            _ -> {
+              logging.log(
+                logging.Error,
+                "[MetricActor] ❌ Invalid customer_part format: "
+                  <> customer_part,
+              )
+            }
+          }
+        }
+        _ -> {
+          logging.log(
+            logging.Error,
+            "[MetricActor] ❌ Invalid registry key format: " <> registry_key,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Error,
+        "[MetricActor] ❌ Failed to decode plan change: " <> message,
+      )
+    }
+  }
+}
+
+/// Check breach with explicit parameters
+fn check_plan_breach_with_params(
+  current_value: Float,
+  limit: Float,
+  operator: String,
+) -> Bool {
+  case limit {
+    0.0 -> False
+    _ ->
+      case operator {
+        "gt" -> current_value >. limit
+        "gte" -> current_value >=. limit
+        "lt" -> current_value <. limit
+        "lte" -> current_value <=. limit
+        "eq" -> current_value == limit
+        _ -> False
+      }
+  }
 }

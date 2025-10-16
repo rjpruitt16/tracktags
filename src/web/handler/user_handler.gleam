@@ -4,7 +4,6 @@ import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
-import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -273,6 +272,147 @@ pub fn create_customer(req: Request) -> Response {
           #("message", json.string("Invalid request data")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 400)
+    }
+  }
+}
+
+pub fn update_customer(req: Request, customer_id: String) -> Response {
+  let request_id = string.inspect(utils.system_time())
+  logging.log(
+    logging.Info,
+    "[CustomerHandler] 🔍 UPDATE CUSTOMER REQUEST START - ID: "
+      <> request_id
+      <> " customer: "
+      <> customer_id,
+  )
+
+  use <- wisp.require_method(req, http.Put)
+  use business_id <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let decoder = {
+    use plan_id <- decode.optional_field(
+      "plan_id",
+      None,
+      decode.optional(decode.string),
+    )
+    use stripe_price_id <- decode.optional_field(
+      "stripe_price_id",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(#(plan_id, stripe_price_id))
+  }
+
+  case decode.run(json_data, decoder) {
+    Ok(#(plan_id, stripe_price_id)) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerHandler] 🔄 Updating customer: "
+          <> business_id
+          <> "/"
+          <> customer_id,
+      )
+
+      case
+        supabase_client.update_customer_plan(
+          business_id,
+          customer_id,
+          plan_id,
+          stripe_price_id,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[CustomerHandler] ✅ Customer updated successfully",
+          )
+
+          // 🔔 NOTIFY CUSTOMER ACTOR DIRECTLY (since we're not using realtime)
+          let registry_key = "client:" <> business_id <> ":" <> customer_id
+          case
+            glixir.lookup_subject_string(
+              utils.tracktags_registry(),
+              registry_key,
+            )
+          {
+            Ok(customer_subject) -> {
+              logging.log(
+                logging.Info,
+                "[CustomerHandler] 🔔 Notifying customer actor of plan change",
+              )
+              process.send(
+                customer_subject,
+                customer_types.RealtimePlanChange(
+                  plan_id: plan_id,
+                  price_id: stripe_price_id,
+                ),
+              )
+            }
+            Error(_) -> {
+              logging.log(
+                logging.Warning,
+                "[CustomerHandler] Customer actor not running, will load on next spawn",
+              )
+            }
+          }
+
+          let success_json =
+            json.object([
+              #("status", json.string("updated")),
+              #("customer_id", json.string(customer_id)),
+              #("plan_id", case plan_id {
+                Some(pid) -> json.string(pid)
+                None -> json.null()
+              }),
+              #("stripe_price_id", case stripe_price_id {
+                Some(spid) -> json.string(spid)
+                None -> json.null()
+              }),
+            ])
+
+          logging.log(
+            logging.Info,
+            "[CustomerHandler] 🔍 UPDATE CUSTOMER REQUEST END - ID: "
+              <> request_id,
+          )
+
+          wisp.json_response(json.to_string_tree(success_json), 200)
+        }
+        Error(supabase_client.NotFound(_)) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Not Found")),
+                #("message", json.string("Customer not found")),
+              ]),
+            ),
+            404,
+          )
+        }
+        Error(_) -> {
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Internal Server Error")),
+                #("message", json.string("Failed to update customer")),
+              ]),
+            ),
+            500,
+          )
+        }
+      }
+    }
+    Error(_) -> {
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string("Invalid request data")),
+          ]),
+        ),
+        400,
+      )
     }
   }
 }

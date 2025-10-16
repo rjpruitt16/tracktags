@@ -788,11 +788,39 @@ fn handle_message(
     }
 
     customer_types.RealtimePlanChange(plan_id, price_id) -> {
+      logging.log(
+        logging.Info,
+        "[CustomerActor] Plan changed for "
+          <> state.customer_id
+          <> ", notifying metrics",
+      )
+
+      // Broadcast to all metric actors for this customer
+      let customer_channel = "customer:" <> state.customer_id <> ":plan_changed"
+      let _ =
+        glixir.pubsub_broadcast(
+          utils.realtime_events_bus(),
+          customer_channel,
+          json.to_string(
+            json.object([
+              #("customer_id", json.string(state.customer_id)),
+              #("plan_id", case plan_id {
+                Some(p) -> json.string(p)
+                None -> json.null()
+              }),
+              #("stripe_price_id", case price_id {
+                Some(p) -> json.string(p)
+                None -> json.null()
+              }),
+            ]),
+          ),
+          fn(x) { x },
+        )
+
       actor.continue(
         State(..state, plan_id: plan_id, stripe_price_id: price_id),
       )
     }
-
     customer_types.SetContextFromDatabase(context) -> {
       logging.log(
         logging.Info,

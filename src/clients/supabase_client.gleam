@@ -96,17 +96,6 @@ pub type PlanMachine {
   )
 }
 
-// Add new combined validation function
-pub type ValidationResult {
-  BusinessValidation(business_id: String)
-  CustomerValidation(
-    business_id: String,
-    customer_id: String,
-    context: CustomerContext,
-  )
-  InvalidKey
-}
-
 pub type Plan {
   Plan(
     id: String,
@@ -116,6 +105,17 @@ pub type Plan {
     plan_status: String,
     created_at: String,
   )
+}
+
+// Add new combined validation function
+pub type ValidationResult {
+  BusinessValidation(business_id: String)
+  CustomerValidation(
+    business_id: String,
+    customer_id: String,
+    context: CustomerContext,
+  )
+  InvalidKey
 }
 
 pub fn validate_key_with_context(
@@ -717,6 +717,34 @@ pub fn create_plan(
   }
 }
 
+pub fn get_plan_by_stripe_price_id(
+  business_id: String,
+  stripe_price_id: String,
+) -> Result(Plan, SupabaseError) {
+  let path =
+    "/plans?business_id=eq."
+    <> business_id
+    <> "&stripe_price_id=eq."
+    <> stripe_price_id
+    <> "&limit=1"
+
+  case make_request(http.Get, path, None) {
+    Ok(response) -> {
+      case response.status {
+        200 -> {
+          case json.parse(response.body, decode.list(plan_decoder())) {
+            Ok([plan, ..]) -> Ok(plan)
+            Ok([]) -> Error(NotFound("Plan not found for price_id"))
+            Error(_) -> Error(DatabaseError("Failed to parse plan"))
+          }
+        }
+        _ -> Error(DatabaseError("Failed to get plan"))
+      }
+    }
+    Error(e) -> Error(e)
+  }
+}
+
 // Get all plans for a business
 pub fn get_plans_for_business(
   business_id: String,
@@ -782,6 +810,71 @@ fn get_plan_limits(
       }
     }
     _ -> Error(DatabaseError("Failed to fetch plan limits"))
+  }
+}
+
+/// Get a single plan limit by stripe_price_id and metric_name
+pub fn get_plan_limit_by_price(
+  stripe_price_id: String,
+  metric_name: String,
+) -> Result(customer_types.PlanLimit, SupabaseError) {
+  let path = "/rpc/get_plan_limit_by_price"
+
+  let body =
+    json.object([
+      #("p_stripe_price_id", json.string(stripe_price_id)),
+      #("p_metric_name", json.string(metric_name)),
+    ])
+    |> json.to_string
+
+  logging.log(logging.Info, "[SupabaseClient] 🔍 RPC BODY: " <> body)
+
+  case make_request(http.Post, path, Some(body)) {
+    Ok(response) -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] 📥 RPC RESPONSE: " <> response.body,
+      )
+
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([limit]) -> Ok(limit)
+        Ok([]) -> Error(NotFound("No plan limit found for this price"))
+        Ok(_multiple) -> Error(DatabaseError("Multiple limits found"))
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] Failed to decode: " <> string.inspect(e),
+          )
+          Error(DatabaseError("Failed to decode plan limit"))
+        }
+      }
+    }
+    Error(e) -> Error(e)
+  }
+}
+
+/// Get a single plan limit by plan_id and metric_name
+pub fn get_plan_limit_by_plan_id(
+  plan_id: String,
+  metric_name: String,
+) -> Result(customer_types.PlanLimit, SupabaseError) {
+  let path =
+    "/plan_limits?plan_id=eq."
+    <> plan_id
+    <> "&metric_name=eq."
+    <> metric_name
+    <> "&limit=1"
+
+  case make_request(http.Get, path, None) {
+    Ok(response) -> {
+      case json.parse(response.body, decode.list(plan_limit_decoder())) {
+        Ok([limit]) -> Ok(limit)
+        Ok([]) -> Error(NotFound("No plan limit found"))
+        Ok(_) -> Error(DatabaseError("Multiple limits found"))
+        Error(_) -> Error(DatabaseError("Failed to decode plan limit"))
+      }
+    }
+    Error(e) -> Error(e)
   }
 }
 
@@ -1460,6 +1553,53 @@ fn timestamp_to_iso(timestamp: Int) -> String {
   // Convert Unix timestamp to ISO8601 string
   let datetime = birl.from_unix(timestamp)
   birl.to_iso8601(datetime)
+}
+
+pub fn update_customer_plan(
+  business_id: String,
+  customer_id: String,
+  plan_id: Option(String),
+  stripe_price_id: Option(String),
+) -> Result(Nil, SupabaseError) {
+  let body_parts =
+    [
+      case plan_id {
+        Some(pid) -> [#("plan_id", json.string(pid))]
+        None -> []
+      },
+      case stripe_price_id {
+        Some(spid) -> [#("stripe_price_id", json.string(spid))]
+        None -> []
+      },
+    ]
+    |> list.flatten
+
+  let body = json.object(body_parts)
+
+  // ADD THIS LOGGING
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 🔍 UPDATE CUSTOMER BODY: " <> json.to_string(body),
+  )
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  case make_request(http.Patch, path, Some(json.to_string(body))) {
+    Ok(response) -> {
+      // ADD THIS LOGGING
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] 📥 PATCH RESPONSE: " <> response.body,
+      )
+      Ok(Nil)
+    }
+    Error(NotFound(msg)) -> Error(NotFound(msg))
+    Error(e) -> Error(e)
+  }
 }
 
 /// Update customer subscription (for admin override)

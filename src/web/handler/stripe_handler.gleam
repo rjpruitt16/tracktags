@@ -1,4 +1,3 @@
-// src/web/handler/stripe_handler.gleam
 import clients/supabase_client
 import gleam/bit_array
 import gleam/crypto as gleam_crypto
@@ -18,11 +17,6 @@ import types/customer_types
 import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
-
-// Add at top of stripe_handler.gleam
-fn is_test_mode() -> Bool {
-  utils.get_env_or("STRIPE_MOCK_MODE", "false") == "true"
-}
 
 // Stripe webhook event types we care about
 pub type StripeEventType {
@@ -348,35 +342,15 @@ fn get_stripe_signature(req: Request) -> Result(String, Nil) {
 }
 
 fn verify_and_process(body: String, signature: String) -> WebhookResult {
-  let self_hosted = utils.get_env_or("SELF_HOSTED", "false") == "true"
-  let mock_mode = is_test_mode()
-
-  // Block mock mode in cloud deployments
-  case mock_mode, self_hosted {
-    True, False ->
-      ProcessingError(
-        "STRIPE_MOCK_MODE is not allowed when SELF_HOSTED is false",
-      )
-
-    // Self-hosted + mock mode: skip signature verification
-    True, True ->
-      case parse_stripe_event(body) {
-        Ok(event) -> process_stripe_event(event)
-        Error(err) -> InvalidPayload(err)
-      }
-
-    // Normal path: verify signature
-    False, _ ->
-      case get_webhook_secret() {
-        Error(_) -> ProcessingError("Missing Stripe webhook secret")
-        Ok(secret) ->
-          case verify_stripe_signature(body, signature, secret) {
-            False -> InvalidSignature
-            True ->
-              case parse_stripe_event(body) {
-                Ok(event) -> process_stripe_event(event)
-                Error(err) -> InvalidPayload(err)
-              }
+  case get_webhook_secret() {
+    Error(_) -> ProcessingError("Missing Stripe webhook secret")
+    Ok(secret) ->
+      case verify_stripe_signature(body, signature, secret) {
+        False -> InvalidSignature
+        True ->
+          case parse_stripe_event(body) {
+            Ok(event) -> process_platform_stripe_event(event)
+            Error(err) -> InvalidPayload(err)
           }
       }
   }
@@ -449,7 +423,6 @@ pub fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
   }
 }
 
-// UPDATE the stripe_data_decoder (around line 275)
 fn stripe_data_decoder() -> decode.Decoder(StripeData) {
   use customer <- decode.optional_field("customer", "", decode.string)
   use subscription_id <- decode.optional_field(
@@ -467,13 +440,11 @@ fn stripe_data_decoder() -> decode.Decoder(StripeData) {
     None,
     decode.optional(decode.string),
   )
-  // ADD extraction
   use metadata <- decode.optional_field(
     "metadata",
     None,
     decode.optional(decode.dict(decode.string, decode.string)),
   )
-
   use current_period_end <- decode.optional_field(
     "current_period_end",
     None,
@@ -511,7 +482,7 @@ fn stripe_event_decoder() -> decode.Decoder(StripeEvent) {
 }
 
 /// Process parsed Stripe event based on type
-pub fn process_stripe_event(event: StripeEvent) -> WebhookResult {
+pub fn process_platform_stripe_event(event: StripeEvent) -> WebhookResult {
   logging.log(
     logging.Info,
     "[StripeHandler] Processing Stripe event: " <> event.id,
@@ -1104,7 +1075,7 @@ fn verify_and_process_customer(
           // REUSE existing parsing and processing
           case parse_stripe_event(body) {
             Error(error) -> InvalidPayload(error)
-            Ok(event) -> process_customer_stripe_event(event, business_id)
+            Ok(event) -> process_business_stripe_event(event, business_id)
           }
         }
       }
@@ -1132,36 +1103,87 @@ fn get_customer_webhook_secret(business_id: String) -> Result(String, String) {
   }
 }
 
-fn process_customer_stripe_event(
+fn process_business_stripe_event(
   event: StripeEvent,
   business_id: String,
 ) -> WebhookResult {
   case event.event_type {
     CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
-      case extract_subscription_data(event.data) {
-        Ok(#(stripe_customer_id, price_id, status)) -> {
-          case
-            supabase_client.update_business_subscription_by_stripe_customer(
-              business_id,
-              stripe_customer_id,
-              status,
-              price_id,
-            )
-          {
-            Ok(_) -> Success("Customer subscription updated")
-            Error(e) -> ProcessingError(string.inspect(e))
-          }
+      use metadata <- result.try(
+        event.data.metadata
+        |> option.to_result("Missing metadata in webhook")
+        |> result.map_error(ProcessingError),
+      )
+
+      use customer_id <- result.try(
+        dict.get(metadata, "customer_id")
+        |> result.map_error(fn(_) {
+          ProcessingError("Missing customer_id in metadata")
+        }),
+      )
+
+      use #(_stripe_customer_id, price_id, _status) <- result.try(
+        extract_subscription_data(event.data)
+        |> result.map_error(ProcessingError),
+      )
+
+      use plan <- result.try(
+        supabase_client.get_plan_by_stripe_price_id(business_id, price_id)
+        |> result.map_error(fn(_) {
+          ProcessingError("Plan not found for price_id: " <> price_id)
+        }),
+      )
+
+      use _ <- result.try(
+        supabase_client.update_customer_plan(
+          business_id,
+          customer_id,
+          Some(plan.id),
+          Some(price_id),
+        )
+        |> result.map_error(fn(e) {
+          ProcessingError("Failed to update customer: " <> string.inspect(e))
+        }),
+      )
+
+      // Notify customer actor with the actual changed values
+      let registry_key = "client:" <> business_id <> ":" <> customer_id
+      case
+        glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
+      {
+        Ok(customer_subject) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] 🔄 Sending plan change to customer actor: "
+              <> customer_id,
+          )
+          // Use RealtimePlanChange with the actual new values
+          process.send(
+            customer_subject,
+            customer_types.RealtimePlanChange(
+              plan_id: Some(plan.id),
+              price_id: Some(price_id),
+            ),
+          )
         }
-        Error(e) -> ProcessingError("Failed to extract data: " <> e)
-        // ADD THIS!
+        Error(_) -> {
+          logging.log(
+            logging.Info,
+            "[StripeHandler] Customer actor offline - will load new plan on next spawn",
+          )
+        }
       }
+
+      Ok(Success("Customer upgraded to plan: " <> plan.plan_name))
     }
+
     CustomerSubscriptionDeleted -> {
-      // Handle customer cancellation differently than business cancellation
-      Success("Customer subscription deleted for business: " <> business_id)
+      Ok(Success("Customer subscription deleted for business: " <> business_id))
     }
-    _ -> Success("Event acknowledged: " <> string.inspect(event.event_type))
+
+    _ -> Ok(Success("Event acknowledged: " <> string.inspect(event.event_type)))
   }
+  |> result.unwrap_both
 }
 
 /// Decoder for stored Stripe credentials
@@ -1172,7 +1194,7 @@ fn stripe_credentials_decoder() -> decode.Decoder(StripeCredentials) {
 }
 
 /// Fetch event from Stripe API and process it (for admin replay)
-pub fn fetch_and_process_stripe_event(
+pub fn fetch_and_process_platform_stripe_event(
   business_id: String,
   event_id: String,
 ) -> Result(String, String) {
@@ -1196,7 +1218,7 @@ pub fn fetch_and_process_stripe_event(
           case parse_stripe_event(event_json) {
             Error(error) -> Error("Failed to parse Stripe event: " <> error)
             Ok(event) -> {
-              case process_customer_stripe_event(event, business_id) {
+              case process_business_stripe_event(event, business_id) {
                 Success(message) -> Ok(message)
                 InvalidSignature -> Error("Invalid signature")
                 InvalidPayload(error) -> Error("Invalid payload: " <> error)
