@@ -133,7 +133,7 @@ pub type Message {
   )
 
   Shutdown
-  ResetStripeMetrics
+  ResetPlanMetrics
   SetMachinesList(machine_ids: List(String), expires_at: Int)
   SetPlan(plan_id: Option(String), stripe_price_id: Option(String))
   GetMachines(reply: Subject(List(String)))

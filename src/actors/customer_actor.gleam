@@ -66,11 +66,11 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
 }
 
 // ============================================================================
-// CLIENT ACTOR PLAN INHERITANCE (Add to customer_actor.gleam)
+// CUSTOMER ACTOR PLAN INHERITANCE (Add to customer_actor.gleam)
 // ============================================================================
 
-/// Load plan limits for a client and create limit-checking metrics
-fn load_client_plan_limits(
+/// Load plan limits for a customer and create metric actors
+fn load_customer_plan_limits(
   business_id: String,
   customer_id: String,
   metrics_supervisor: glixir.DynamicSupervisor(
@@ -93,7 +93,7 @@ fn load_client_plan_limits(
 ) -> Result(Nil, String) {
   logging.log(
     logging.Info,
-    "[ClientActor] Loading plan limits for: "
+    "[CustomerActor] 🔍 Loading plan limits for customer: "
       <> business_id
       <> "/"
       <> customer_id,
@@ -102,103 +102,98 @@ fn load_client_plan_limits(
   // Get the customer record
   case supabase_client.get_customer_by_id(business_id, customer_id) {
     Ok(customer) -> {
-      // Try stripe_product_id first (from customers table)
-      case customer.stripe_price_id {
-        Some(product_id) -> {
+      logging.log(
+        logging.Debug,
+        "[CustomerActor] Got customer record - plan_id: "
+          <> string.inspect(customer.plan_id)
+          <> ", stripe_price_id: "
+          <> string.inspect(customer.stripe_price_id),
+      )
+
+      // Try to get plan limits (try plan_id first, fallback to stripe_price_id)
+      let plan_limits_result = case customer.plan_id {
+        Some(plan_id) -> {
           logging.log(
             logging.Info,
-            "[ClientActor] Customer has Stripe product: " <> product_id,
+            "[CustomerActor] Customer has plan_id: " <> plan_id,
           )
-          // Look up limits via Stripe price
-          case supabase_client.get_plan_limits_by_stripe_price_id(product_id) {
-            Ok([]) -> {
-              logging.log(
-                logging.Info,
-                "[ClientActor] No plan limits for product: " <> product_id,
-              )
-              Ok(Nil)
-            }
-            Ok(limits) -> {
-              logging.log(
-                logging.Info,
-                "[ClientActor] Found "
-                  <> string.inspect(list.length(limits))
-                  <> " plan limits",
-              )
-              list.try_each(limits, fn(limit) {
-                create_limit_checking_metric(
-                  business_id,
-                  customer_id,
-                  limit,
-                  metrics_supervisor,
-                )
-              })
-              |> result.map_error(fn(_) { "Failed to create limit metrics" })
-              |> result.map(fn(_) { Nil })
-            }
-            Error(e) -> {
-              logging.log(
-                logging.Warning,
-                "[ClientActor] Failed to load limits: " <> string.inspect(e),
-              )
-              Ok(Nil)
-            }
-          }
+          supabase_client.get_plan_limits_by_plan_id(plan_id)
         }
-        None -> {
-          // Fallback to plan_id if no Stripe product
-          case customer.plan_id {
-            Some(plan_id) -> {
+        None ->
+          case customer.stripe_price_id {
+            Some(price_id) -> {
               logging.log(
                 logging.Info,
-                "[ClientActor] Customer has plan_id: " <> plan_id,
+                "[CustomerActor] Customer has stripe_price_id: " <> price_id,
               )
-              case supabase_client.get_plan_limits_by_plan_id(plan_id) {
-                Ok(limits) -> {
-                  list.try_each(limits, fn(limit) {
-                    create_limit_checking_metric(
-                      business_id,
-                      customer_id,
-                      limit,
-                      metrics_supervisor,
-                    )
-                  })
-                  |> result.map_error(fn(_) { "Failed to create limits" })
-                  |> result.map(fn(_) { Nil })
-                }
-                Error(e) -> {
-                  logging.log(
-                    logging.Warning,
-                    "[ClientActor] Failed to get plan limits: "
-                      <> string.inspect(e),
-                  )
-                  Ok(Nil)
-                }
-              }
+              supabase_client.get_plan_limits_by_stripe_price_id(price_id)
             }
             None -> {
               logging.log(
                 logging.Info,
-                "[ClientActor] Customer has no plan assigned - skipping limits",
+                "[CustomerActor] Customer has no plan assigned - skipping limits",
               )
-              Ok(Nil)
+              Ok([])
             }
           }
+      }
+
+      case plan_limits_result {
+        Ok([]) -> {
+          logging.log(
+            logging.Info,
+            "[CustomerActor] No plan limits found for customer",
+          )
+          Ok(Nil)
+        }
+        Ok(limits) -> {
+          logging.log(
+            logging.Info,
+            "[CustomerActor] Found "
+              <> int.to_string(list.length(limits))
+              <> " plan limits, creating metric actors...",
+          )
+
+          // Create a metric actor for each plan limit
+          list.try_each(limits, fn(limit) {
+            create_plan_limit_metric(
+              business_id,
+              customer_id,
+              limit,
+              metrics_supervisor,
+            )
+          })
+          |> result.map_error(fn(e) {
+            logging.log(
+              logging.Error,
+              "[CustomerActor] Failed to create limit metrics: " <> e,
+            )
+            "Failed to create limit metrics: " <> e
+          })
+          |> result.map(fn(_) { Nil })
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Warning,
+            "[CustomerActor] Failed to load limits: " <> string.inspect(e),
+          )
+          Ok(Nil)
+          // Don't fail startup if plan limits can't be loaded
         }
       }
     }
     Error(e) -> {
       logging.log(
         logging.Error,
-        "[ClientActor] Failed to get customer record: " <> string.inspect(e),
+        "[CustomerActor] Failed to get customer record: " <> string.inspect(e),
       )
       Error("Failed to get customer record")
     }
   }
 }
 
-/// Create a limit-checking metric for a plan limit
-fn create_limit_checking_metric(
+/// Create a metric actor for a plan limit
+fn create_plan_limit_metric(
   business_id: String,
   customer_id: String,
   limit: customer_types.PlanLimit,
@@ -218,40 +213,47 @@ fn create_limit_checking_metric(
       String,
     ),
     process.Subject(metric_types.Message),
-    // ← Missing second type parameter
   ),
 ) -> Result(Nil, String) {
-  let client_key = business_id <> ":" <> customer_id
+  let customer_key = business_id <> ":" <> customer_id
 
   // Check if metric already exists
-  case metric_actor.lookup_metric_subject(client_key, limit.metric_name) {
+  case metric_actor.lookup_metric_subject(customer_key, limit.metric_name) {
     Ok(_existing) -> {
       logging.log(
         logging.Debug,
-        "[ClientActor] Metric already exists, skipping: " <> limit.metric_name,
+        "[CustomerActor] Metric already exists: " <> limit.metric_name,
       )
       Ok(Nil)
-      // ← Just return Ok(Nil), no "return" keyword
     }
     Error(_) -> {
-      // Metric doesn't exist, spawn it
+      // Spawn the metric actor
       logging.log(
         logging.Info,
-        "[ClientActor] Creating plan-aware MetricActor for: "
-          <> limit.metric_name,
+        "[CustomerActor] 🚀 Creating metric actor for plan limit: "
+          <> limit.metric_name
+          <> " (limit: "
+          <> float.to_string(limit.limit_value)
+          <> ")",
       )
 
       let metric_spec =
         metric_actor.start(
-          client_key,
+          customer_key,
           limit.metric_name,
           "tick_1h",
+          // Use 1h for plan limit metrics
           0.0,
+          // Start at 0
           "",
+          // No tags
           "SUM",
+          // Default operation
           -1,
+          // Never cleanup
           limit.metric_type,
           "",
+          // No metadata
           limit.limit_value,
           limit.breach_operator,
           limit.breach_action,
@@ -268,60 +270,18 @@ fn create_limit_checking_metric(
         supervisor.ChildStarted(_child_pid, _reply) -> {
           logging.log(
             logging.Info,
-            "[ClientActor] ✅ Plan-aware metric spawned: " <> limit.metric_name,
+            "[CustomerActor] ✅ Plan limit metric spawned: " <> limit.metric_name,
           )
           Ok(Nil)
         }
         supervisor.StartChildError(error) -> {
-          Error("Failed to spawn plan-aware metric: " <> error)
+          logging.log(
+            logging.Error,
+            "[CustomerActor] ❌ Failed to spawn metric: " <> error,
+          )
+          Error("Failed to spawn plan limit metric: " <> error)
         }
       }
-    }
-  }
-}
-
-/// Check if a metric is over its plan limit
-pub fn is_metric_over_limit(
-  business_id: String,
-  customer_id: String,
-  metric_name: String,
-) -> Result(Bool, String) {
-  let client_key = business_id <> ":" <> customer_id
-  let limit_metric_name = "_limit_" <> metric_name
-
-  // Get current metric value
-  let current_value = case metric_store.get_value(client_key, metric_name) {
-    Ok(value) -> value
-    Error(_) -> 0.0
-    // No metric = no usage
-  }
-
-  // Get limit value
-  case metric_store.get_value(client_key, limit_metric_name) {
-    Ok(limit_value) -> {
-      let is_over = current_value >=. limit_value
-
-      logging.log(
-        logging.Debug,
-        "[ClientActor] Limit check: "
-          <> metric_name
-          <> " current="
-          <> float.to_string(current_value)
-          <> " limit="
-          <> float.to_string(limit_value)
-          <> " over="
-          <> string.inspect(is_over),
-      )
-
-      Ok(is_over)
-    }
-    Error(_) -> {
-      logging.log(
-        logging.Debug,
-        "[ClientActor] No limit found for metric: " <> metric_name,
-      )
-      Ok(False)
-      // No limit = no breach
     }
   }
 }
@@ -340,7 +300,7 @@ fn handle_message(
 
   logging.log(
     logging.Debug,
-    "[ClientActor] Processing message for: "
+    "[CustomerActor] Processing message for: "
       <> updated_state.business_id
       <> "/"
       <> updated_state.customer_id,
@@ -348,60 +308,205 @@ fn handle_message(
 
   case message {
     // When resetting, prune dead metrics lazily
-    customer_types.ResetStripeMetrics -> {
+    customer_types.ResetPlanMetrics -> {
       logging.log(
         logging.Info,
-        "[CustomerActor] Resetting Stripe billing metrics for: "
-          <> state.customer_id,
+        "[CustomerActor] 🔄 Resetting billing metrics to 0 for: "
+          <> updated_state.customer_id,
       )
 
-      let account_id = state.business_id <> ":" <> state.customer_id
+      let account_id =
+        updated_state.business_id <> ":" <> updated_state.customer_id
 
-      // Try each metric, collect the ones that still exist
-      let #(reset_count, alive_metrics) =
-        list.fold(state.stripe_billing_metrics, #(0, []), fn(acc, metric_name) {
-          let #(count, alive) = acc
-          let key = account_id <> "_" <> metric_name
+      logging.log(
+        logging.Info,
+        "[CustomerActor] 🔍 Using account_id: " <> account_id,
+      )
 
-          case glixir.lookup_subject_string(utils.tracktags_registry(), key) {
-            Ok(metric_subject) -> {
-              // It's alive! Reset it
-              process.send(metric_subject, metric_types.ResetToInitialValue)
+      // Get customer's current plan limits to know which metrics to reset
+      case
+        supabase_client.get_customer_by_id(
+          updated_state.business_id,
+          updated_state.customer_id,
+        )
+      {
+        Ok(customer) -> {
+          logging.log(logging.Info, "[CustomerActor] ✅ Got customer record")
+
+          // Get plan limits based on what the customer has
+          let plan_limits_result = case customer.stripe_price_id {
+            Some(price_id) -> {
               logging.log(
-                logging.Debug,
-                "[CustomerActor] Reset sent to: " <> metric_name,
+                logging.Info,
+                "[CustomerActor] 🔍 Using stripe_price_id: " <> price_id,
               )
-              #(count + 1, [metric_name, ..alive])
-              // Keep in list
+              supabase_client.get_plan_limits_by_stripe_price_id(price_id)
             }
-            Error(_) -> {
-              // Dead metric, prune it
+            None ->
+              case customer.plan_id {
+                Some(plan_id) -> {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerActor] 🔍 Using plan_id: " <> plan_id,
+                  )
+                  supabase_client.get_plan_limits_by_plan_id(plan_id)
+                }
+                None -> {
+                  logging.log(
+                    logging.Warning,
+                    "[CustomerActor] ⚠️  No plan_id or stripe_price_id!",
+                  )
+                  Ok([])
+                }
+              }
+          }
+
+          case plan_limits_result {
+            Ok(limits) -> {
               logging.log(
-                logging.Debug,
-                "[CustomerActor] Pruning dead metric: " <> metric_name,
+                logging.Info,
+                "[CustomerActor] 📋 Found "
+                  <> int.to_string(list.length(limits))
+                  <> " plan limits to reset",
               )
-              #(count, alive)
-              // Don't add to alive list
+
+              // Reset each metric directly in the store (synchronous)
+              let reset_count =
+                list.fold(limits, 0, fn(count, limit) {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerActor]   🔄 Attempting to reset: "
+                      <> limit.metric_name
+                      <> " in account: "
+                      <> account_id,
+                  )
+
+                  // 1. FIRST: Check current value BEFORE reset
+                  case metric_store.get_value(account_id, limit.metric_name) {
+                    Ok(before_val) -> {
+                      logging.log(
+                        logging.Info,
+                        "[CustomerActor]   📊 BEFORE reset: "
+                          <> limit.metric_name
+                          <> " = "
+                          <> float.to_string(before_val),
+                      )
+                    }
+                    Error(e) -> {
+                      logging.log(
+                        logging.Warning,
+                        "[CustomerActor]   ⚠️  Could not read BEFORE value: "
+                          <> string.inspect(e),
+                      )
+                    }
+                  }
+
+                  // 2. Reset in ETS (synchronous)
+                  case
+                    metric_store.reset_metric(
+                      account_id,
+                      limit.metric_name,
+                      0.0,
+                    )
+                  {
+                    Ok(_) -> {
+                      logging.log(
+                        logging.Info,
+                        "[CustomerActor]   ✅ Reset call succeeded for: "
+                          <> limit.metric_name,
+                      )
+
+                      // 3. VERIFY the reset worked
+                      case
+                        metric_store.get_value(account_id, limit.metric_name)
+                      {
+                        Ok(after_val) -> {
+                          logging.log(
+                            logging.Info,
+                            "[CustomerActor]   📊 AFTER reset: "
+                              <> limit.metric_name
+                              <> " = "
+                              <> float.to_string(after_val),
+                          )
+                        }
+                        Error(e) -> {
+                          logging.log(
+                            logging.Error,
+                            "[CustomerActor]   ❌ Could not read AFTER value: "
+                              <> string.inspect(e),
+                          )
+                        }
+                      }
+
+                      // 4. Also update the MetricActor's state
+                      let registry_key = account_id <> "_" <> limit.metric_name
+                      case
+                        glixir.lookup_subject_string(
+                          utils.tracktags_registry(),
+                          registry_key,
+                        )
+                      {
+                        Ok(metric_subject) -> {
+                          process.send(
+                            metric_subject,
+                            metric_types.ResetToInitialValue,
+                          )
+                          logging.log(
+                            logging.Info,
+                            "[CustomerActor]   ✅ Notified MetricActor: "
+                              <> limit.metric_name,
+                          )
+                        }
+                        Error(_) -> {
+                          logging.log(
+                            logging.Debug,
+                            "[CustomerActor]   ⚠️  MetricActor not found in registry: "
+                              <> registry_key,
+                          )
+                        }
+                      }
+
+                      count + 1
+                    }
+                    Error(e) -> {
+                      logging.log(
+                        logging.Error,
+                        "[CustomerActor]   ❌ Reset call FAILED: "
+                          <> limit.metric_name
+                          <> " - Error: "
+                          <> string.inspect(e),
+                      )
+                      count
+                    }
+                  }
+                })
+
+              logging.log(
+                logging.Info,
+                "[CustomerActor] ✅ Reset "
+                  <> int.to_string(reset_count)
+                  <> " billing metrics",
+              )
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Error,
+                "[CustomerActor] ❌ Failed to get plan limits: "
+                  <> string.inspect(e),
+              )
             }
           }
-        })
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[CustomerActor] ❌ Failed to get customer: " <> string.inspect(e),
+          )
+        }
+      }
 
-      logging.log(
-        logging.Info,
-        "[CustomerActor] Reset "
-          <> int.to_string(reset_count)
-          <> " StripeBilling metrics, pruned "
-          <> int.to_string(
-          list.length(state.stripe_billing_metrics) - list.length(alive_metrics),
-        )
-          <> " dead ones",
-      )
-
-      // Update state with pruned list
-      let updated_state = State(..state, stripe_billing_metrics: alive_metrics)
       actor.continue(updated_state)
     }
-
     customer_types.RegisterApiKey(api_key) -> {
       let key_hash = crypto.hash_api_key(api_key)
       let registry_key =
@@ -437,7 +542,7 @@ fn handle_message(
         True -> {
           logging.log(
             logging.Info,
-            "[ClientActor] 🧹 Client cleanup triggered: "
+            "[CustomerActor] 🧹 Client cleanup triggered: "
               <> updated_state.business_id
               <> "/"
               <> updated_state.customer_id
@@ -452,12 +557,12 @@ fn handle_message(
             Ok(_) ->
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Store cleanup successful: " <> client_key,
+                "[CustomerActor] ✅ Store cleanup successful: " <> client_key,
               )
             Error(error) ->
               logging.log(
                 logging.Error,
-                "[ClientActor] ❌ Store cleanup failed: "
+                "[CustomerActor] ❌ Store cleanup failed: "
                   <> string.inspect(error),
               )
           }
@@ -476,12 +581,13 @@ fn handle_message(
             Ok(_) ->
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Unregistered client: " <> registry_key,
+                "[CustomerActor] ✅ Unregistered client: " <> registry_key,
               )
             Error(_) ->
               logging.log(
                 logging.Warning,
-                "[ClientActor] ⚠️ Failed to unregister client: " <> registry_key,
+                "[CustomerActor] ⚠️ Failed to unregister client: "
+                  <> registry_key,
               )
           }
 
@@ -490,7 +596,7 @@ fn handle_message(
         False -> {
           logging.log(
             logging.Debug,
-            "[ClientActor] Client still active: "
+            "[CustomerActor] Client still active: "
               <> updated_state.business_id
               <> "/"
               <> updated_state.customer_id,
@@ -515,7 +621,7 @@ fn handle_message(
     ) -> {
       logging.log(
         logging.Info,
-        "[ClientActor] Processing metric: "
+        "[CustomerActor] Processing metric: "
           <> updated_state.business_id
           <> "/"
           <> updated_state.customer_id
@@ -540,7 +646,7 @@ fn handle_message(
 
           logging.log(
             logging.Info,
-            "[ClientActor] ✅ Found existing MetricActor, sending metric",
+            "[CustomerActor] ✅ Found existing MetricActor, sending metric",
           )
           process.send(metric_subject, metric_types.RecordMetric(metric))
 
@@ -569,7 +675,7 @@ fn handle_message(
           // METRIC DOESN'T EXIST, SPAWN NEW ONE
           logging.log(
             logging.Info,
-            "[ClientActor] MetricActor not found, spawning new one",
+            "[CustomerActor] MetricActor not found, spawning new one",
           )
 
           let metric_type_string =
@@ -602,7 +708,7 @@ fn handle_message(
             supervisor.ChildStarted(child_pid, _reply) -> {
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Spawned metric actor: "
+                "[CustomerActor] ✅ Spawned metric actor: "
                   <> metric_name
                   <> " PID: "
                   <> string.inspect(child_pid),
@@ -631,14 +737,14 @@ fn handle_message(
                   )
                   logging.log(
                     logging.Info,
-                    "[ClientActor] ✅ Sent metric to newly spawned actor: "
+                    "[CustomerActor] ✅ Sent metric to newly spawned actor: "
                       <> metric_name,
                   )
                 }
                 Error(_) -> {
                   logging.log(
                     logging.Info,
-                    "[ClientActor] MetricActor still initializing, will use initial_value",
+                    "[CustomerActor] MetricActor still initializing, will use initial_value",
                   )
                 }
               }
@@ -670,7 +776,7 @@ fn handle_message(
             supervisor.StartChildError(error) -> {
               logging.log(
                 logging.Error,
-                "[ClientActor] ❌ Failed to spawn metric: " <> error,
+                "[CustomerActor] ❌ Failed to spawn metric: " <> error,
               )
               actor.continue(updated_state)
             }
@@ -694,7 +800,7 @@ fn handle_message(
     customer_types.Shutdown -> {
       logging.log(
         logging.Info,
-        "[ClientActor] Shutting down: "
+        "[CustomerActor] Shutting down: "
           <> updated_state.business_id
           <> "/"
           <> updated_state.customer_id,
@@ -706,12 +812,12 @@ fn handle_message(
         Ok(_) ->
           logging.log(
             logging.Info,
-            "[ClientActor] ✅ Store cleanup on shutdown: " <> client_key,
+            "[CustomerActor] ✅ Store cleanup on shutdown: " <> client_key,
           )
         Error(error) ->
           logging.log(
             logging.Error,
-            "[ClientActor] ❌ Store cleanup failed on shutdown: "
+            "[CustomerActor] ❌ Store cleanup failed on shutdown: "
               <> string.inspect(error),
           )
       }
@@ -864,7 +970,7 @@ pub fn start_link(
 ) -> Result(process.Subject(customer_types.Message), actor.StartError) {
   logging.log(
     logging.Info,
-    "[ClientActor] Starting for: " <> business_id <> "/" <> customer_id,
+    "[CustomerActor] Starting for: " <> business_id <> "/" <> customer_id,
   )
 
   case
@@ -875,7 +981,7 @@ pub fn start_link(
     Ok(metrics_supervisor) -> {
       logging.log(
         logging.Debug,
-        "[ClientActor] ✅ Metrics supervisor started for "
+        "[CustomerActor] ✅ Metrics supervisor started for "
           <> business_id
           <> "/"
           <> customer_id,
@@ -909,12 +1015,12 @@ pub fn start_link(
             Ok(_) ->
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Registered: " <> registry_key,
+                "[CustomerActor] ✅ Registered: " <> registry_key,
               )
             Error(_) ->
               logging.log(
                 logging.Error,
-                "[ClientActor] ❌ Failed to register: " <> registry_key,
+                "[CustomerActor] ❌ Failed to register: " <> registry_key,
               )
           }
 
@@ -930,14 +1036,14 @@ pub fn start_link(
             Ok(_) -> {
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Client cleanup subscription for: "
+                "[CustomerActor] ✅ Client cleanup subscription for: "
                   <> registry_key,
               )
             }
             Error(e) -> {
               logging.log(
                 logging.Error,
-                "[ClientActor] ❌ Failed client cleanup subscription: "
+                "[CustomerActor] ❌ Failed client cleanup subscription: "
                   <> string.inspect(e),
               )
             }
@@ -964,7 +1070,7 @@ pub fn start_link(
 
           // Load plan limits and create limit-checking metrics
           case
-            load_client_plan_limits(
+            load_customer_plan_limits(
               business_id,
               customer_id,
               metrics_supervisor,
@@ -973,13 +1079,13 @@ pub fn start_link(
             Ok(_) -> {
               logging.log(
                 logging.Info,
-                "[ClientActor] ✅ Plan limits loaded and metrics created",
+                "[CustomerActor] ✅ Plan limits loaded and metrics created",
               )
             }
             Error(e) -> {
               logging.log(
                 logging.Warning,
-                "[ClientActor] ⚠️ Failed to load plan limits: " <> e,
+                "[CustomerActor] ⚠️ Failed to load plan limits: " <> e,
               )
             }
           }
@@ -992,7 +1098,7 @@ pub fn start_link(
     Error(error) -> {
       logging.log(
         logging.Error,
-        "[ClientActor] ❌ Failed to start metrics supervisor: "
+        "[CustomerActor] ❌ Failed to start metrics supervisor: "
           <> string.inspect(error),
       )
       Error(actor.InitFailed("Failed to start metrics supervisor"))
@@ -1006,7 +1112,7 @@ pub fn handle_client_cleanup_tick(
 ) -> Nil {
   logging.log(
     logging.Debug,
-    "[ClientActor] 🎯 Cleanup tick for client: " <> registry_key,
+    "[CustomerActor] 🎯 Cleanup tick for client: " <> registry_key,
   )
 
   case glixir.lookup_subject_string(utils.tracktags_registry(), registry_key) {
@@ -1027,7 +1133,7 @@ pub fn handle_client_cleanup_tick(
         Error(_) -> {
           logging.log(
             logging.Warning,
-            "[ClientActor] ❌ Invalid cleanup tick JSON for: " <> registry_key,
+            "[CustomerActor] ❌ Invalid cleanup tick JSON for: " <> registry_key,
           )
         }
       }
@@ -1035,7 +1141,7 @@ pub fn handle_client_cleanup_tick(
     Error(_) -> {
       logging.log(
         logging.Debug,
-        "[ClientActor] Client not found for cleanup tick: " <> registry_key,
+        "[CustomerActor] Client not found for cleanup tick: " <> registry_key,
       )
     }
   }

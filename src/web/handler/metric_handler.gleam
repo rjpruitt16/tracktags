@@ -591,7 +591,7 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
     Error(_) -> "business"
   }
 
-  let customer_id_opt = case
+  let customer_id_query = case
     wisp.get_query(req) |> list.key_find("customer_id")
   {
     Ok(cid) -> Some(cid)
@@ -599,39 +599,17 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
   }
 
   case key_validation {
-    supabase_client.CustomerKey(business_id, customer_id) -> {
+    supabase_client.CustomerKey(business_id, customer_id_from_key) -> {
       // Customers can only read their own customer-scoped metrics
-      case scope_str, customer_id_opt {
-        "customer", Some(cid) if cid == customer_id -> {
-          let lookup_key = business_id <> ":" <> customer_id
-          case metric_store.get_value(lookup_key, metric_name) {
-            Ok(value) ->
-              wisp.json_response(
-                json.to_string_tree(
-                  json.object([
-                    #("metric_name", json.string(metric_name)),
-                    #("business_id", json.string(business_id)),
-                    #("customer_id", json.string(customer_id)),
-                    #("current_value", json.float(value)),
-                    #("timestamp", json.int(utils.current_timestamp())),
-                  ]),
-                ),
-                200,
-              )
-            Error(_) ->
-              wisp.json_response(
-                json.to_string_tree(
-                  json.object([
-                    #("error", json.string("Not Found")),
-                    #(
-                      "message",
-                      json.string("Metric not found: " <> metric_name),
-                    ),
-                  ]),
-                ),
-                404,
-              )
-          }
+      case scope_str, customer_id_query {
+        "customer", Some(cid) if cid == customer_id_from_key -> {
+          let lookup_key = business_id <> ":" <> customer_id_from_key
+          get_metric_with_limit_status(
+            lookup_key,
+            metric_name,
+            business_id,
+            Some(customer_id_from_key),
+          )
         }
         _, _ -> {
           wisp.json_response(
@@ -653,23 +631,87 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
     supabase_client.BusinessKey(business_id) -> {
       // Businesses can read any metric in their scope
       case
-        metric_types.string_to_scope(scope_str, business_id, customer_id_opt)
+        metric_types.string_to_scope(scope_str, business_id, customer_id_query)
       {
         Ok(scope) -> {
           let lookup_key = metric_types.scope_to_lookup_key(scope)
+          get_metric_with_limit_status(
+            lookup_key,
+            metric_name,
+            business_id,
+            customer_id_query,
+          )
+        }
+        Error(error) ->
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Invalid Scope")),
+                #("message", json.string(error)),
+              ]),
+            ),
+            400,
+          )
+      }
+    }
+  }
+}
+
+// NEW: Helper function to get metric with limit status
+fn get_metric_with_limit_status(
+  lookup_key: String,
+  metric_name: String,
+  business_id: String,
+  customer_id: Option(String),
+) -> Response {
+  case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
+    Ok(metric_subject) -> {
+      // Get limit status from the metric actor
+      let reply_subject = process.new_subject()
+      process.send(metric_subject, metric_types.GetLimitStatus(reply_subject))
+
+      case process.receive(reply_subject, 5000) {
+        Ok(limit_status) -> {
+          let base_fields = [
+            #("metric_name", json.string(metric_name)),
+            #("business_id", json.string(business_id)),
+            #("current_value", json.float(limit_status.current_value)),
+            #("limit_value", json.float(limit_status.limit_value)),
+            #("limit_operator", json.string(limit_status.limit_operator)),
+            #("limit_breached", json.bool(limit_status.is_breached)),
+            // ← KEY FIELD
+            #("breach_action", json.string(limit_status.breach_action)),
+            #("timestamp", json.int(utils.current_timestamp())),
+          ]
+
+          let all_fields = case customer_id {
+            Some(cid) -> [#("customer_id", json.string(cid)), ..base_fields]
+            None -> base_fields
+          }
+
+          wisp.json_response(json.to_string_tree(json.object(all_fields)), 200)
+        }
+        Error(_) -> {
+          // Fallback to basic value if we can't get limit status
           case metric_store.get_value(lookup_key, metric_name) {
-            Ok(value) ->
+            Ok(value) -> {
+              let base_fields = [
+                #("metric_name", json.string(metric_name)),
+                #("business_id", json.string(business_id)),
+                #("current_value", json.float(value)),
+                #("timestamp", json.int(utils.current_timestamp())),
+              ]
+
+              let all_fields = case customer_id {
+                Some(cid) -> [#("customer_id", json.string(cid)), ..base_fields]
+                None -> base_fields
+              }
+
               wisp.json_response(
-                json.to_string_tree(
-                  json.object([
-                    #("metric_name", json.string(metric_name)),
-                    #("business_id", json.string(business_id)),
-                    #("current_value", json.float(value)),
-                    #("timestamp", json.int(utils.current_timestamp())),
-                  ]),
-                ),
+                json.to_string_tree(json.object(all_fields)),
                 200,
               )
+            }
             Error(_) ->
               wisp.json_response(
                 json.to_string_tree(
@@ -685,18 +727,18 @@ pub fn get_metric(req: Request, metric_name: String) -> Response {
               )
           }
         }
-        Error(error) ->
-          wisp.json_response(
-            json.to_string_tree(
-              json.object([
-                #("error", json.string("Invalid Scope")),
-                #("message", json.string(error)),
-              ]),
-            ),
-            400,
-          )
       }
     }
+    Error(_) ->
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Not Found")),
+            #("message", json.string("Metric not found: " <> metric_name)),
+          ]),
+        ),
+        404,
+      )
   }
 }
 
@@ -741,7 +783,7 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
         Error(_) -> "business"
       }
 
-      let customer_id_opt = case
+      let customer_id = case
         wisp.get_query(req) |> list.key_find("customer_id")
       {
         Ok(cid) -> Some(cid)
@@ -749,7 +791,7 @@ pub fn update_metric(req: Request, metric_name: String) -> Response {
       }
 
       let lookup_key = case
-        metric_types.string_to_scope(scope_str, business_id, customer_id_opt)
+        metric_types.string_to_scope(scope_str, business_id, customer_id)
       {
         Ok(scope) -> metric_types.scope_to_lookup_key(scope)
         Error(_) -> business_id
@@ -991,6 +1033,7 @@ fn process_create_metric(business_id: String, req: MetricRequest) -> Response {
 fn process_update_metric(
   lookup_key: String,
   business_id: String,
+  // Keep for response JSON
   metric_name: String,
   new_value: Float,
 ) -> Response {

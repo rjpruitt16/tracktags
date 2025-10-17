@@ -13,8 +13,10 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import glixir
 import logging
 import types/business_types
+import types/customer_types
 import utils/audit
 import utils/auth
 import utils/utils
@@ -61,7 +63,7 @@ pub fn replay_webhook(
   )
 
   case
-    stripe_handler.fetch_and_process_platform_stripe_event(
+    stripe_handler.fetch_and_process_business_stripe_event(
       business_id,
       event_id,
     )
@@ -310,6 +312,85 @@ pub fn override_customer_subscription(
           ]),
         ),
         400,
+      )
+    }
+  }
+}
+
+pub fn reset_customer_billing(
+  req: Request,
+  business_id: String,
+  customer_id: String,
+) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Post)
+
+  // No need to parse business_id from JSON anymore!
+  logging.log(
+    logging.Info,
+    "[AdminHandler] 🔄 Resetting billing for: "
+      <> business_id
+      <> "/"
+      <> customer_id,
+  )
+
+  case
+    supabase_client.reset_customer_stripe_billing_metrics(
+      business_id,
+      customer_id,
+    )
+  {
+    Ok(_) -> {
+      logging.log(
+        logging.Info,
+        "[AdminHandler] ✅ Billing metrics reset successfully",
+      )
+
+      // Reset in-memory if customer actor is running
+      let registry_key = "client:" <> business_id <> ":" <> customer_id
+      case
+        glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
+      {
+        Ok(customer_subject) -> {
+          process.send(customer_subject, customer_types.ResetPlanMetrics)
+          logging.log(
+            logging.Info,
+            "[AdminHandler] ✅ Sent reset message to CustomerActor",
+          )
+        }
+        Error(_) -> {
+          logging.log(
+            logging.Info,
+            "[AdminHandler] CustomerActor not running (metrics reset in DB only)",
+          )
+        }
+      }
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("status", json.string("success")),
+            #("message", json.string("Billing metrics reset")),
+            #("business_id", json.string(business_id)),
+            #("customer_id", json.string(customer_id)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[AdminHandler] ❌ Failed to reset metrics: " <> string.inspect(e),
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Internal Server Error")),
+            #("message", json.string("Failed to reset billing metrics")),
+          ]),
+        ),
+        500,
       )
     }
   }

@@ -17,7 +17,6 @@ import gleam/string
 import gleam/uri
 import glixir
 import logging
-import storage/metric_store
 import types/application_types
 import types/business_types
 import types/customer_types.{type CustomerContext}
@@ -745,6 +744,19 @@ pub fn get_plan_by_stripe_price_id(
   }
 }
 
+/// Get a single plan limit by stripe_price_id and metric_name
+pub fn get_plan_limit_by_price(
+  stripe_price_id: String,
+  metric_name: String,
+) -> Result(customer_types.PlanLimit, SupabaseError) {
+  use limits <- result.try(get_plan_limits_by_stripe_price_id(stripe_price_id))
+
+  case list.find(limits, fn(limit) { limit.metric_name == metric_name }) {
+    Ok(limit) -> Ok(limit)
+    Error(_) -> Error(NotFound("No plan limit found for this metric"))
+  }
+}
+
 // Get all plans for a business
 pub fn get_plans_for_business(
   business_id: String,
@@ -813,43 +825,99 @@ fn get_plan_limits(
   }
 }
 
-/// Get a single plan limit by stripe_price_id and metric_name
-pub fn get_plan_limit_by_price(
-  stripe_price_id: String,
-  metric_name: String,
-) -> Result(customer_types.PlanLimit, SupabaseError) {
-  let path = "/rpc/get_plan_limit_by_price"
+/// Get plan limits by Stripe price ID (for billing reset)
+pub fn get_plan_limits_by_stripe_price_id(
+  price_id: String,
+) -> Result(List(customer_types.PlanLimit), SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting plan limits for Stripe price: " <> price_id,
+  )
 
-  let body =
-    json.object([
-      #("p_stripe_price_id", json.string(stripe_price_id)),
-      #("p_metric_name", json.string(metric_name)),
-    ])
-    |> json.to_string
+  // First, get ALL plans with this price_id
+  let url = "/plans?stripe_price_id=eq." <> price_id
 
-  logging.log(logging.Info, "[SupabaseClient] 🔍 RPC BODY: " <> body)
+  use response <- result.try(make_request(http.Get, url, None))
 
-  case make_request(http.Post, path, Some(body)) {
-    Ok(response) -> {
-      logging.log(
-        logging.Info,
-        "[SupabaseClient] 📥 RPC RESPONSE: " <> response.body,
-      )
+  case response.status {
+    200 -> {
+      // Decode the plans list
+      case json.parse(response.body, decode.list(plan_decoder())) {
+        Ok([]) -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] No plan found for price_id: " <> price_id,
+          )
+          Ok([])
+        }
+        Ok([single_plan]) -> {
+          // Only one plan found - get its limits
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] Found plan: " <> single_plan.id,
+          )
+          get_plan_limits_by_plan_id(single_plan.id)
+        }
+        Ok(plans) -> {
+          // Multiple plans found - use the most recent one (last in list)
+          let latest_plan = case list.last(plans) {
+            Ok(plan) -> plan
+            Error(_) -> {
+              // Fallback to first plan if list.last fails
+              case plans {
+                [first, ..] -> first
+                [] -> {
+                  // Should never happen but handle it
+                  logging.log(
+                    logging.Error,
+                    "[SupabaseClient] Unexpected empty plans list",
+                  )
+                  Plan(
+                    id: "",
+                    business_id: "",
+                    plan_name: "",
+                    stripe_price_id: None,
+                    plan_status: "",
+                    created_at: "",
+                  )
+                }
+              }
+            }
+          }
 
-      case json.parse(response.body, decode.list(plan_limit_decoder())) {
-        Ok([limit]) -> Ok(limit)
-        Ok([]) -> Error(NotFound("No plan limit found for this price"))
-        Ok(_multiple) -> Error(DatabaseError("Multiple limits found"))
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] Multiple plans found for price_id: "
+              <> price_id
+              <> " - using latest: "
+              <> latest_plan.id
+              <> " (found "
+              <> int.to_string(list.length(plans))
+              <> " total)",
+          )
+
+          get_plan_limits_by_plan_id(latest_plan.id)
+        }
         Error(e) -> {
           logging.log(
             logging.Error,
-            "[SupabaseClient] Failed to decode: " <> string.inspect(e),
+            "[SupabaseClient] Failed to decode plans: " <> string.inspect(e),
           )
-          Error(DatabaseError("Failed to decode plan limit"))
+          Error(DatabaseError("Failed to decode plans response"))
         }
       }
     }
-    Error(e) -> Error(e)
+    404 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] No plan found for price_id: " <> price_id,
+      )
+      Ok([])
+    }
+    _ ->
+      Error(DatabaseError(
+        "Failed to get plan for price_id: " <> int.to_string(response.status),
+      ))
   }
 }
 
@@ -974,47 +1042,6 @@ pub fn get_free_plan_for_business(
       }
     }
     _ -> Error(DatabaseError("Failed to get free plan"))
-  }
-}
-
-// Add to supabase_client.gleam
-pub fn get_plan_limits_by_stripe_price_id(
-  stripe_price_id: String,
-) -> Result(List(customer_types.PlanLimit), SupabaseError) {
-  logging.log(
-    logging.Info,
-    "[SupabaseClient] Getting plan limits for Stripe price: " <> stripe_price_id,
-  )
-
-  // First, find the plan by stripe_price_id
-  let plan_query = "/plans?stripe_price_id=eq." <> stripe_price_id
-
-  use plan_response <- result.try(make_request(http.Get, plan_query, None))
-
-  case plan_response.status {
-    200 -> {
-      // Parse to get plan_id
-      let plan_id_decoder = decode.field("id", decode.string, decode.success)
-
-      case json.parse(plan_response.body, decode.list(plan_id_decoder)) {
-        Ok([plan_id]) -> {
-          // Now get limits for this plan_id (function already exists!)
-          get_plan_limits_by_plan_id(plan_id)
-        }
-        Ok([]) -> {
-          logging.log(
-            logging.Info,
-            "No plan found for price: " <> stripe_price_id,
-          )
-          Ok([])
-          // No plan configured for this price
-        }
-        Ok([_, _, ..]) ->
-          Error(DatabaseError("Multiple plans with same price_id"))
-        Error(_) -> Error(ParseError("Invalid plan response"))
-      }
-    }
-    _ -> Error(DatabaseError("Failed to lookup plan by price_id"))
   }
 }
 
@@ -3784,56 +3811,136 @@ pub fn get_customer_by_stripe_customer(
   }
 }
 
-/// Reset all stripe_billing metrics for a specific customer
+/// Reset all plan limit metrics to 0 for a customer (billing cycle reset)
 pub fn reset_customer_stripe_billing_metrics(
   business_id: String,
   customer_id: String,
 ) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
-    "[SupabaseClient] Resetting StripeBilling metrics for customer: "
+    "[SupabaseClient] 🔄 Starting billing cycle reset for: "
       <> business_id
       <> "/"
       <> customer_id,
   )
 
-  // Reset in database
-  let url =
-    "/metrics?business_id=eq."
-    <> business_id
-    <> "&customer_id=eq."
-    <> customer_id
-    <> "&metric_type=eq.stripe_billing"
+  // 1. Get customer to find their plan
+  use customer <- result.try(get_customer_by_id(business_id, customer_id))
 
-  let reset_json = json.object([#("value", json.float(0.0))])
-
-  use response <- result.try(make_request(
-    http.Patch,
-    url,
-    Some(json.to_string(reset_json)),
-  ))
-
-  case response.status {
-    200 | 204 -> {
-      // Also reset in-memory value
-      let account_id = business_id <> ":" <> customer_id
-
-      // Get all stripe_billing metrics for this customer
-      // You'll need to find the metric names somehow
-      // For now, just reset the known one:
-      let _ = metric_store.reset_metric(account_id, "api_calls_billing", 0.0)
-
+  // 2. Get plan_limits for their plan
+  let plan_limits_result = case customer.stripe_price_id {
+    Some(price_id) -> {
       logging.log(
         logging.Info,
-        "[SupabaseClient] ✅ Reset metrics in DB and memory",
+        "[SupabaseClient] Using stripe_price_id: " <> price_id,
       )
+      get_plan_limits_by_stripe_price_id(price_id)
+    }
+    None ->
+      case customer.plan_id {
+        Some(plan_id) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] Using plan_id: " <> plan_id,
+          )
+          get_plan_limits_by_plan_id(plan_id)
+        }
+        None -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] No plan assigned - nothing to reset",
+          )
+          Ok([])
+        }
+      }
+  }
+
+  use plan_limits <- result.try(plan_limits_result)
+
+  // 3. Extract metric names from plan_limits
+  let metric_names_to_reset =
+    list.map(plan_limits, fn(limit) { limit.metric_name })
+
+  case metric_names_to_reset {
+    [] -> {
+      logging.log(logging.Info, "[SupabaseClient] ✅ No plan limits to reset")
       Ok(Nil)
     }
-    404 -> {
-      logging.log(logging.Warning, "[SupabaseClient] No metrics found to reset")
-      Ok(Nil)
+    metrics -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] 📋 Resetting "
+          <> int.to_string(list.length(metrics))
+          <> " plan metrics: "
+          <> string.join(metrics, ", "),
+      )
+
+      // 4. Reset each metric in the database
+      list.try_each(metrics, fn(metric_name) {
+        let url =
+          "/metrics?business_id=eq."
+          <> business_id
+          <> "&customer_id=eq."
+          <> customer_id
+          <> "&metric_name=eq."
+          <> metric_name
+
+        let reset_json =
+          json.object([
+            #("value", json.float(0.0)),
+            #(
+              "flushed_at",
+              json.string(int.to_string(utils.current_timestamp())),
+            ),
+          ])
+
+        logging.log(
+          logging.Info,
+          "[SupabaseClient]   🔄 Resetting metric: " <> metric_name,
+        )
+
+        use response <- result.try(make_request(
+          http.Patch,
+          url,
+          Some(json.to_string(reset_json)),
+        ))
+
+        case response.status {
+          200 | 204 -> {
+            logging.log(
+              logging.Info,
+              "[SupabaseClient]   ✅ Reset complete: " <> metric_name,
+            )
+            Ok(Nil)
+          }
+          404 -> {
+            logging.log(
+              logging.Warning,
+              "[SupabaseClient]   ⚠️  Metric not found (may not exist yet): "
+                <> metric_name,
+            )
+            Ok(Nil)
+            // Not an error - metric just doesn't exist yet
+          }
+          _ -> {
+            logging.log(
+              logging.Error,
+              "[SupabaseClient]   ❌ Failed to reset: " <> metric_name,
+            )
+            Error(DatabaseError("Failed to reset metric: " <> metric_name))
+          }
+        }
+      })
+      |> result.map(fn(_) {
+        logging.log(
+          logging.Info,
+          "[SupabaseClient] ✅ Billing cycle reset complete - "
+            <> int.to_string(list.length(metrics))
+            <> " metrics reset to 0",
+        )
+        Nil
+      })
     }
-    _ -> Error(DatabaseError("Failed to reset metrics"))
   }
 }
 
@@ -3920,7 +4027,7 @@ pub fn create_customer(
       )
       Ok(Nil)
     }
-    409 -> Error(DatabaseError("Client already exists"))
+    409 -> Error(DatabaseError("Customer already exists"))
     _ ->
       Error(DatabaseError(
         "Failed to create customer: " <> int.to_string(response.status),

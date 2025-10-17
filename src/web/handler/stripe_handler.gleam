@@ -1,3 +1,4 @@
+// src/web/handler/stripe_handler.gleam
 import clients/supabase_client
 import gleam/bit_array
 import gleam/crypto as gleam_crypto
@@ -233,7 +234,6 @@ fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
               "active",
               option.unwrap(event.data.price_id, "unknown"),
               event.data.current_period_end,
-              // ← Sets subscription_ends_at
             )
           {
             Ok(_) ->
@@ -253,16 +253,22 @@ fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
           {
             Ok(customer) -> {
               // This is a CUSTOMER subscription under a business
-              let next_period_end = utils.current_timestamp() + 2_592_000
-              // 30 days
+              // Use Stripe's current_period_end instead of calculating
+              let subscription_ends_at = case event.data.current_period_end {
+                Some(timestamp) -> timestamp
+                None -> utils.current_timestamp() + 2_592_000
+                // Fallback: 30 days
+              }
+
+              // Update subscription period
               let _ =
                 supabase_client.update_customer_subscription_period(
                   customer.business_id,
                   customer.customer_id,
                   utils.current_timestamp(),
                   // last_invoice_date
-                  next_period_end,
-                  // subscription_ends_at
+                  subscription_ends_at,
+                  // subscription_ends_at from Stripe
                 )
 
               // Reset billing metrics in-memory
@@ -279,7 +285,7 @@ fn handle_invoice_finalized(event: StripeEvent) -> WebhookResult {
                   )
                   process.send(
                     customer_subject,
-                    customer_types.ResetStripeMetrics,
+                    customer_types.ResetPlanMetrics,
                   )
                 }
                 Error(_) -> {
@@ -1107,83 +1113,85 @@ fn process_business_stripe_event(
   event: StripeEvent,
   business_id: String,
 ) -> WebhookResult {
-  case event.event_type {
-    CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
-      use metadata <- result.try(
-        event.data.metadata
-        |> option.to_result("Missing metadata in webhook")
-        |> result.map_error(ProcessingError),
-      )
-
-      use customer_id <- result.try(
-        dict.get(metadata, "customer_id")
-        |> result.map_error(fn(_) {
-          ProcessingError("Missing customer_id in metadata")
-        }),
-      )
-
-      use #(_stripe_customer_id, price_id, _status) <- result.try(
-        extract_subscription_data(event.data)
-        |> result.map_error(ProcessingError),
-      )
-
-      use plan <- result.try(
-        supabase_client.get_plan_by_stripe_price_id(business_id, price_id)
-        |> result.map_error(fn(_) {
-          ProcessingError("Plan not found for price_id: " <> price_id)
-        }),
-      )
-
-      use _ <- result.try(
-        supabase_client.update_customer_plan(
-          business_id,
-          customer_id,
-          Some(plan.id),
-          Some(price_id),
+  {
+    case event.event_type {
+      CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
+        use metadata <- result.try(
+          event.data.metadata
+          |> option.to_result("Missing metadata in webhook")
+          |> result.map_error(ProcessingError),
         )
-        |> result.map_error(fn(e) {
-          ProcessingError("Failed to update customer: " <> string.inspect(e))
-        }),
-      )
+        use customer_id <- result.try(
+          dict.get(metadata, "customer_id")
+          |> result.map_error(fn(_) {
+            ProcessingError("Missing customer_id in metadata")
+          }),
+        )
+        use #(_stripe_customer_id, price_id, _status) <- result.try(
+          extract_subscription_data(event.data)
+          |> result.map_error(ProcessingError),
+        )
+        use plan <- result.try(
+          supabase_client.get_plan_by_stripe_price_id(business_id, price_id)
+          |> result.map_error(fn(_) {
+            ProcessingError("Plan not found for price_id: " <> price_id)
+          }),
+        )
+        use _ <- result.try(
+          supabase_client.update_customer_plan(
+            business_id,
+            customer_id,
+            Some(plan.id),
+            Some(price_id),
+          )
+          |> result.map_error(fn(e) {
+            ProcessingError("Failed to update customer: " <> string.inspect(e))
+          }),
+        )
 
-      // Notify customer actor with the actual changed values
-      let registry_key = "client:" <> business_id <> ":" <> customer_id
-      case
-        glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
-      {
-        Ok(customer_subject) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] 🔄 Sending plan change to customer actor: "
-              <> customer_id,
-          )
-          // Use RealtimePlanChange with the actual new values
-          process.send(
-            customer_subject,
-            customer_types.RealtimePlanChange(
-              plan_id: Some(plan.id),
-              price_id: Some(price_id),
-            ),
-          )
+        let registry_key = "client:" <> business_id <> ":" <> customer_id
+        case
+          glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
+        {
+          Ok(customer_subject) -> {
+            logging.log(
+              logging.Info,
+              "[StripeHandler] 🔄 Sending plan change to customer actor: "
+                <> customer_id,
+            )
+            process.send(
+              customer_subject,
+              customer_types.RealtimePlanChange(
+                plan_id: Some(plan.id),
+                price_id: Some(price_id),
+              ),
+            )
+          }
+          Error(_) -> {
+            logging.log(
+              logging.Info,
+              "[StripeHandler] Customer actor offline - will load new plan on next spawn",
+            )
+          }
         }
-        Error(_) -> {
-          logging.log(
-            logging.Info,
-            "[StripeHandler] Customer actor offline - will load new plan on next spawn",
-          )
-        }
+        Ok(Success("Customer upgraded to plan: " <> plan.plan_name))
       }
-
-      Ok(Success("Customer upgraded to plan: " <> plan.plan_name))
+      CustomerSubscriptionDeleted -> {
+        Ok(Success(
+          "Customer subscription deleted for business: " <> business_id,
+        ))
+      }
+      _ ->
+        Ok(Success("Event acknowledged: " <> string.inspect(event.event_type)))
     }
-
-    CustomerSubscriptionDeleted -> {
-      Ok(Success("Customer subscription deleted for business: " <> business_id))
-    }
-
-    _ -> Ok(Success("Event acknowledged: " <> string.inspect(event.event_type)))
   }
-  |> result.unwrap_both
+  // Replace result.unwrap_both with case expression
+  |> fn(res) {
+    case res {
+      Ok(webhook_result) -> webhook_result
+      Error(webhook_result) -> webhook_result
+    }
+  }
 }
 
 /// Decoder for stored Stripe credentials
@@ -1194,7 +1202,7 @@ fn stripe_credentials_decoder() -> decode.Decoder(StripeCredentials) {
 }
 
 /// Fetch event from Stripe API and process it (for admin replay)
-pub fn fetch_and_process_platform_stripe_event(
+pub fn fetch_and_process_business_stripe_event(
   business_id: String,
   event_id: String,
 ) -> Result(String, String) {

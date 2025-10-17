@@ -11,6 +11,7 @@ import gleam/result
 import gleam/string
 import glixir
 import logging
+import types/application_types
 import types/customer_types
 import utils/audit
 import utils/auth
@@ -607,7 +608,27 @@ pub fn delete_customer(req: Request, customer_id: String) -> Response {
 }
 
 // ============================================================================
-// PROCESSING FUNCTIONS
+// HELPER FUNCTION - Add this near the top with other helpers
+// ============================================================================
+
+fn get_application_actor() -> Result(
+  process.Subject(application_types.ApplicationMessage),
+  String,
+) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.application_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Application actor not found in registry")
+  }
+}
+
+// ============================================================================
+// UPDATED PROCESS_CREATE_CUSTOMER FUNCTION
 // ============================================================================
 
 fn process_create_customer(
@@ -625,7 +646,7 @@ fn process_create_customer(
       <> ")",
   )
 
-  // Actually create the client in the database
+  // Actually create the customer in the database
   case
     supabase_client.create_customer(
       business_id,
@@ -641,6 +662,78 @@ fn process_create_customer(
         "[CustomerHandler] ✅ Customer created successfully in database",
       )
 
+      // 🚀 NEW: Spawn the CustomerActor immediately after database creation
+      logging.log(
+        logging.Info,
+        "[CustomerHandler] 🚀 Attempting to spawn CustomerActor for: "
+          <> req.customer_id,
+      )
+
+      case
+        supabase_client.get_customer_full_context(business_id, req.customer_id)
+      {
+        Ok(context) -> {
+          logging.log(
+            logging.Info,
+            "[CustomerHandler] ✅ Loaded customer context successfully",
+          )
+
+          case get_application_actor() {
+            Ok(app_actor) -> {
+              let reply = process.new_subject()
+
+              logging.log(
+                logging.Info,
+                "[CustomerHandler] 📤 Sending EnsureCustomerActor message to ApplicationActor",
+              )
+
+              process.send(
+                app_actor,
+                application_types.EnsureCustomerActor(
+                  business_id,
+                  req.customer_id,
+                  context,
+                  "",
+                  // No API key yet
+                  reply,
+                ),
+              )
+
+              // Wait briefly for the actor to spawn (optional, non-blocking)
+              case process.receive(reply, 500) {
+                Ok(_customer_subject) -> {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerHandler] ✅ CustomerActor spawned successfully for: "
+                      <> req.customer_id,
+                  )
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Warning,
+                    "[CustomerHandler] ⚠️ CustomerActor spawn timeout (may still be initializing)",
+                  )
+                }
+              }
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[CustomerHandler] ⚠️ Could not get application actor: " <> e,
+              )
+            }
+          }
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Warning,
+            "[CustomerHandler] ⚠️ Could not load customer context: "
+              <> string.inspect(e),
+          )
+        }
+      }
+
+      // Return success response regardless of actor spawn status
       let success_json =
         json.object([
           #("status", json.string("created")),
@@ -653,6 +746,7 @@ fn process_create_customer(
 
       wisp.json_response(json.to_string_tree(success_json), 201)
     }
+
     Error(supabase_client.DatabaseError(msg)) -> {
       logging.log(
         logging.Error,
@@ -667,6 +761,7 @@ fn process_create_customer(
 
       wisp.json_response(json.to_string_tree(error_json), 500)
     }
+
     Error(error) -> {
       logging.log(
         logging.Error,

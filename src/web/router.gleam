@@ -81,6 +81,13 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post])
       }
 
+    // In router.gleam:
+    ["admin", "v1", "customers", business_id, customer_id, "reset-billing"] ->
+      case req.method {
+        Post ->
+          admin_handler.reset_customer_billing(req, business_id, customer_id)
+        _ -> wisp.method_not_allowed([Post])
+      }
     // Business management
     ["api", "v1", "businesses"] ->
       case req.method {

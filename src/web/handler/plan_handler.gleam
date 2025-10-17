@@ -7,6 +7,7 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import logging
 import types/customer_types
 import utils/auth
 import wisp.{type Request, type Response}
@@ -41,7 +42,7 @@ const valid_periods = ["daily", "monthly", "yearly", "realtime"]
 
 const valid_operators = ["gt", "gte", "lt", "lte", "eq"]
 
-const valid_actions = ["deny", "allow_overage", "webhook", "scale"]
+const valid_actions = ["deny", "allow_overage", "webhook", "scale", "allow"]
 
 // ============================================================================
 // AUTHENTICATION
@@ -413,19 +414,56 @@ pub fn create_plan_limit(req: Request) -> Response {
   use json_data <- wisp.require_json(req)
 
   let result = {
-    use limit_req <- result.try(decode.run(json_data, limit_request_decoder()))
-    use validated_req <- result.try(validate_limit_request(limit_req))
+    use limit_req <- result.try(
+      decode.run(json_data, limit_request_decoder())
+      |> result.map_error(fn(errors) {
+        let error_messages =
+          list.map(errors, fn(err) {
+            "Field: "
+            <> string.join(err.path, ".")
+            <> " - "
+            <> err.expected
+            <> " (got: "
+            <> err.found
+            <> ")"
+          })
+          |> string.join(", ")
+
+        logging.log(
+          logging.Error,
+          "[PlanLimitHandler] Decode error: " <> error_messages,
+        )
+        error_messages
+      }),
+    )
+
+    use validated_req <- result.try(
+      validate_limit_request(limit_req)
+      |> result.map_error(fn(errors) {
+        let error_messages =
+          list.map(errors, fn(err) { err.expected })
+          |> string.join(", ")
+
+        logging.log(
+          logging.Error,
+          "[PlanLimitHandler] Validation error: " <> error_messages,
+        )
+        error_messages
+      }),
+    )
+
     Ok(process_create_plan_limit(business_id, validated_req))
   }
 
   case result {
     Ok(response) -> response
-    Error(_) -> {
+    Error(error_msg) -> {
       wisp.json_response(
         json.to_string_tree(
           json.object([
             #("error", json.string("Bad Request")),
             #("message", json.string("Invalid plan limit data")),
+            #("details", json.string(error_msg)),
           ]),
         ),
         400,

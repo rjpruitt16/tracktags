@@ -10,7 +10,6 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/json
-import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
@@ -899,21 +898,39 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       actor.continue(updated_state)
     }
 
-    metric_types.GetLimitStatus(reply_with) -> {
-      // NEW
+    metric_types.GetLimitStatus(reply_to) -> {
+      // ✅ Read fresh value from ETS using fields from current_metric
+      let fresh_value = case
+        metric_store.get_value(
+          state.current_metric.account_id,
+          state.current_metric.metric_name,
+        )
+      {
+        Ok(val) -> val
+        Error(_) -> state.current_metric.value
+        // Fallback to cached value
+      }
+
+      let is_breached = case state.limit_operator {
+        "gte" -> fresh_value >=. state.limit_value
+        "gt" -> fresh_value >. state.limit_value
+        "lte" -> fresh_value <=. state.limit_value
+        "lt" -> fresh_value <. state.limit_value
+        "eq" -> fresh_value == state.limit_value
+        _ -> False
+      }
+
       let limit_status =
         metric_types.LimitStatus(
-          current_value: updated_state.current_metric.value,
-          limit_value: updated_state.limit_value,
-          // TODO: Rename to limit_value
-          limit_operator: updated_state.limit_operator,
-          // TODO: Rename to limit_operator  
-          breach_action: updated_state.breach_action,
-          // TODO: Rename to breach_action
-          is_breached: updated_state.is_breached,
+          current_value: fresh_value,
+          limit_value: state.limit_value,
+          limit_operator: state.limit_operator,
+          is_breached: is_breached,
+          breach_action: state.breach_action,
         )
-      process.send(reply_with, limit_status)
-      actor.continue(updated_state)
+
+      process.send(reply_to, limit_status)
+      actor.continue(state)
     }
   }
 }
