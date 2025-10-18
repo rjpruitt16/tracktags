@@ -6,7 +6,7 @@ import gleam/erlang/process
 import gleam/http
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import glixir
@@ -28,6 +28,7 @@ pub type CustomerRequest {
     name: String,
     description: String,
     plan_id: String,
+    subscription_ends_at: Option(String),
   )
 }
 
@@ -82,12 +83,17 @@ fn customer_request_decoder() -> decode.Decoder(CustomerRequest) {
   use plan_id <- decode.field("plan_id", decode.string)
   use name <- decode.optional_field("name", "", decode.string)
   use description <- decode.optional_field("description", "", decode.string)
-
+  use subscription_ends_at <- decode.optional_field(
+    "subscription_ends_at",
+    None,
+    decode.optional(decode.string),
+  )
   decode.success(CustomerRequest(
     customer_id: customer_id,
     name: name,
     description: description,
     plan_id: plan_id,
+    subscription_ends_at: subscription_ends_at,
   ))
 }
 
@@ -302,11 +308,16 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
       None,
       decode.optional(decode.string),
     )
-    decode.success(#(plan_id, stripe_price_id))
+    use subscription_ends_at <- decode.optional_field(
+      "subscription_ends_at",
+      None,
+      decode.optional(decode.string),
+    )
+    decode.success(#(plan_id, stripe_price_id, subscription_ends_at))
   }
 
   case decode.run(json_data, decoder) {
-    Ok(#(plan_id, stripe_price_id)) -> {
+    Ok(#(plan_id, stripe_price_id, subscription_ends_at)) -> {
       logging.log(
         logging.Info,
         "[CustomerHandler] 🔄 Updating customer: "
@@ -315,21 +326,77 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
           <> customer_id,
       )
 
-      case
-        supabase_client.update_customer_plan(
-          business_id,
-          customer_id,
-          plan_id,
-          stripe_price_id,
-        )
-      {
-        Ok(_) -> {
+      // Perform updates in sequence, handling each result
+      let update_result = {
+        // Step 1: Update plan/price if provided
+        case plan_id, stripe_price_id {
+          Some(_), _ | _, Some(_) -> {
+            logging.log(
+              logging.Info,
+              "[CustomerHandler] Updating plan and/or price",
+            )
+            case
+              supabase_client.update_customer_plan(
+                business_id,
+                customer_id,
+                plan_id,
+                stripe_price_id,
+              )
+            {
+              Ok(_) -> {
+                // Step 2: Update expiry if provided
+                case subscription_ends_at {
+                  Some(_) -> {
+                    logging.log(
+                      logging.Info,
+                      "[CustomerHandler] Updating subscription_ends_at",
+                    )
+                    supabase_client.update_customer_subscription_expiry(
+                      business_id,
+                      customer_id,
+                      subscription_ends_at,
+                    )
+                  }
+                  None -> {
+                    // No expiry update, fetch final state
+                    supabase_client.get_customer_by_id(business_id, customer_id)
+                  }
+                }
+              }
+              Error(e) -> Error(e)
+            }
+          }
+          None, None -> {
+            // No plan update, just update expiry if provided
+            case subscription_ends_at {
+              Some(_) -> {
+                logging.log(
+                  logging.Info,
+                  "[CustomerHandler] Updating subscription_ends_at only",
+                )
+                supabase_client.update_customer_subscription_expiry(
+                  business_id,
+                  customer_id,
+                  subscription_ends_at,
+                )
+              }
+              None -> {
+                // Nothing to update, just fetch current state
+                supabase_client.get_customer_by_id(business_id, customer_id)
+              }
+            }
+          }
+        }
+      }
+
+      case update_result {
+        Ok(updated_customer) -> {
           logging.log(
             logging.Info,
             "[CustomerHandler] ✅ Customer updated successfully",
           )
 
-          // 🔔 NOTIFY CUSTOMER ACTOR DIRECTLY (since we're not using realtime)
+          // 🔔 NOTIFY CUSTOMER ACTOR - use the updated customer's ACTUAL plan
           let registry_key = "client:" <> business_id <> ":" <> customer_id
           case
             glixir.lookup_subject_string(
@@ -345,8 +412,8 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
               process.send(
                 customer_subject,
                 customer_types.RealtimePlanChange(
-                  plan_id: plan_id,
-                  price_id: stripe_price_id,
+                  plan_id: updated_customer.plan_id,
+                  price_id: updated_customer.stripe_price_id,
                 ),
               )
             }
@@ -362,14 +429,21 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
             json.object([
               #("status", json.string("updated")),
               #("customer_id", json.string(customer_id)),
-              #("plan_id", case plan_id {
+              #("plan_id", case updated_customer.plan_id {
                 Some(pid) -> json.string(pid)
                 None -> json.null()
               }),
-              #("stripe_price_id", case stripe_price_id {
+              #("stripe_price_id", case updated_customer.stripe_price_id {
                 Some(spid) -> json.string(spid)
                 None -> json.null()
               }),
+              #(
+                "subscription_ends_at",
+                case updated_customer.subscription_ends_at {
+                  Some(exp) -> json.string(exp)
+                  None -> json.null()
+                },
+              ),
             ])
 
           logging.log(
@@ -514,6 +588,11 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
             Some(pid) -> json.string(pid)
             None -> json.null()
           }),
+          // 🆕 ADD THIS:
+          #("subscription_ends_at", case customer.subscription_ends_at {
+            Some(exp) -> json.string(exp)
+            None -> json.null()
+          }),
         ])
       wisp.json_response(json.to_string_tree(success_json), 200)
     }
@@ -654,6 +733,7 @@ fn process_create_customer(
       req.name,
       req.plan_id,
       option.None,
+      req.subscription_ends_at,
     )
   {
     Ok(_) -> {
@@ -1285,6 +1365,7 @@ pub fn get_or_create_customer_for_user(
               user_email,
               "",
               option.Some(user_id),
+              option.None,
             )
           {
             Ok(_) -> {

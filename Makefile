@@ -70,6 +70,8 @@ test-single:
 		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
                 --variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \
+		--variable expired_date=$$(date -u -d '30 days ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-30d +"%Y-%m-%dT%H:%M:%SZ") \
+		--variable future_date=$$(date -u -d '30 days' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v+30d +"%Y-%m-%dT%H:%M:%SZ") \
 		$(FILE) || \
 		(echo "Test failed, showing container logs:"; \
 		 docker compose -f docker-compose.test.yml logs --tail=100 tracktags; \
@@ -88,6 +90,8 @@ test-docker:
 		--variable SUPABASE_ANON_KEY=$(SUPABASE_ANON_KEY) \
 		--variable PROXY_TARGET_URL=http://webhook:9090 \
 		--variable test_id=$$(date +%s) \
+                --variable expired_date=$$(date -u -d '30 days ago' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-30d +"%Y-%m-%dT%H:%M:%SZ") \
+		--variable future_date=$$(date -u -d '30 days' +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v+30d +"%Y-%m-%dT%H:%M:%SZ") \
 		test/integration/hurl/*.hurl || \
 		(echo "Test failed, showing container logs:"; \
 		 docker compose -f docker-compose.test.yml logs --tail=200 tracktags; \

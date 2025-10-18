@@ -1026,19 +1026,36 @@ pub fn downgrade_customer_to_free_plan(
 pub fn get_free_plan_for_business(
   business_id: String,
 ) -> Result(Plan, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Getting free plan for business: " <> business_id,
+  )
+
   let path =
-    "/plans?business_id=eq."
-    <> business_id
-    <> "&stripe_price_id=is.null&limit=1"
+    "/plans?business_id=eq." <> business_id <> "&plan_name=eq.free_plan"
 
   use response <- result.try(make_request(http.Get, path, None))
 
   case response.status {
     200 -> {
+      // Use the existing plan_decoder that's already in this file
       case json.parse(response.body, decode.list(plan_decoder())) {
-        Ok([plan, ..]) -> Ok(plan)
-        Ok([]) -> Error(NotFound("No free plan found for business"))
-        Error(_) -> Error(ParseError("Invalid plan format"))
+        Ok([free_plan, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Found free plan: " <> free_plan.id,
+          )
+          Ok(free_plan)
+        }
+        Ok([]) -> {
+          logging.log(
+            logging.Warning,
+            "[SupabaseClient] ⚠️ No free plan found for business: "
+              <> business_id,
+          )
+          Error(NotFound("No free plan configured for this business"))
+        }
+        Error(_) -> Error(ParseError("Invalid plan response format"))
       }
     }
     _ -> Error(DatabaseError("Failed to get free plan"))
@@ -3739,6 +3756,68 @@ pub fn update_customer(
   }
 }
 
+/// Update customer's subscription_ends_at without changing plan
+pub fn update_customer_subscription_expiry(
+  business_id: String,
+  customer_id: String,
+  subscription_ends_at: Option(String),
+) -> Result(customer_types.Customer, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Updating subscription expiry for: " <> customer_id,
+  )
+
+  let update_data = case subscription_ends_at {
+    Some(date) -> json.object([#("subscription_ends_at", json.string(date))])
+    None -> json.object([#("subscription_ends_at", json.null())])
+  }
+
+  let path =
+    "/customers?customer_id=eq."
+    <> customer_id
+    <> "&business_id=eq."
+    <> business_id
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 🔍 UPDATE CUSTOMER BODY: " <> json.to_string(update_data),
+  )
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_data)),
+  ))
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 📥 PATCH RESPONSE: " <> response.body,
+  )
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok([]) -> Error(NotFound("Customer not found or not owned by business"))
+        Ok([updated_customer, ..]) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Updated customer expiry: "
+              <> updated_customer.customer_id,
+          )
+          Ok(updated_customer)
+        }
+        Error(_) -> Error(ParseError("Invalid customer response format"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to update customer expiry"))
+  }
+}
+
 /// Delete a client
 pub fn delete_customer(
   business_id: String,
@@ -3975,13 +4054,13 @@ pub fn reset_stripe_billing_metrics_for_business(
   Ok(Nil)
 }
 
-/// Create a new client for a business
 pub fn create_customer(
   business_id: String,
   customer_id: String,
   customer_name: String,
   plan_id: String,
   user_id: option.Option(String),
+  subscription_ends_at: option.Option(String),
 ) -> Result(Nil, SupabaseError) {
   logging.log(
     logging.Info,
@@ -3992,33 +4071,41 @@ pub fn create_customer(
       <> " on plan: "
       <> plan_id,
   )
-
   let base_fields = [
     #("business_id", json.string(business_id)),
     #("customer_id", json.string(customer_id)),
     #("customer_name", json.string(customer_name)),
   ]
-
   // Add plan_id if not empty
   let with_plan = case plan_id {
     "" -> base_fields
     _ -> [#("plan_id", json.string(plan_id)), ..base_fields]
   }
-
   // Add user_id if provided
-  let final_fields = case user_id {
+  let with_user = case user_id {
     option.Some(uid) -> [#("user_id", json.string(uid)), ..with_plan]
     option.None -> with_plan
+  }
+  // Add subscription_ends_at if provided
+  let final_fields = case subscription_ends_at {
+    option.Some(exp) -> [
+      #("subscription_ends_at", json.string(exp)),
+      ..with_user
+    ]
+    option.None -> with_user
   }
 
   let body = json.object(final_fields)
 
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 🔍 CREATE CUSTOMER BODY: " <> json.to_string(body),
+  )
   use response <- result.try(make_request(
     http.Post,
     "/customers",
     Some(json.to_string(body)),
   ))
-
   case response.status {
     201 -> {
       logging.log(

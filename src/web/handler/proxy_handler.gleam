@@ -6,13 +6,14 @@ import clients/supabase_client
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/float
 import gleam/http
 import gleam/http/request
 import gleam/httpc
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import glixir
@@ -150,7 +151,7 @@ fn extract_domain_from_url(url: String) -> String {
 fn process_proxy_request(
   business_id: String,
   req: ProxyRequest,
-  _request_id: String,
+  request_id: String,
 ) -> Response {
   logging.log(
     logging.Info,
@@ -167,71 +168,249 @@ fn process_proxy_request(
       wisp.json_response(json.to_string_tree(error_json), 400)
     }
     Ok(scope) -> {
-      let lookup_key = metric_types.scope_to_lookup_key(scope)
-
-      // NEW: Check if metric_name is empty
-      case string.length(req.metric_name) {
-        0 -> {
-          // No specific metric - return ALL plan limit statuses
+      // Check for customer scope and handle expiry
+      case scope {
+        metric_types.Customer(bid, cid) -> {
           logging.log(
             logging.Info,
-            "[ProxyHandler] 🔍 No metric specified - checking all plan limits",
-          )
-          check_all_plan_limits_and_forward(lookup_key, scope, business_id, req)
-        }
-        _ -> {
-          // Original behavior - check specific metric
-          logging.log(
-            logging.Info,
-            "[ProxyHandler] 🔍 Checking metric: "
-              <> lookup_key
-              <> "/"
-              <> req.metric_name,
+            "[ProxyHandler] 🔍 Customer scope - checking for expiry: "
+              <> request_id,
           )
 
-          case
-            check_metric_breach_status(
-              lookup_key,
-              req.metric_name,
-              scope,
-              business_id,
-            )
-          {
-            Ok(breach_status) -> {
-              case should_deny_request(breach_status) {
-                True -> {
-                  logging.log(
-                    logging.Warning,
-                    "[ProxyHandler] 🚨 Request DENIED - metric over limit",
+          // Get customer context to check expiry
+          case supabase_client.get_customer_full_context(bid, cid) {
+            Ok(context) -> {
+              case check_and_handle_expiry(context) {
+                Ok(updated_context) -> {
+                  // Context may have free limits if expired
+                  process_proxy_with_context(
+                    business_id,
+                    req,
+                    scope,
+                    Some(updated_context),
+                    request_id,
                   )
-                  create_denied_response(breach_status)
                 }
-                False -> {
+                Error(e) -> {
                   logging.log(
-                    logging.Info,
-                    "[ProxyHandler] ✅ Request ALLOWED - forwarding to target",
+                    logging.Error,
+                    "[ProxyHandler] ❌ Expiry check failed: " <> e,
                   )
-                  forward_request_to_target(req, breach_status, scope, None)
+                  let error_json =
+                    json.object([
+                      #("error", json.string("Internal Server Error")),
+                      #(
+                        "message",
+                        json.string("Failed to check subscription status"),
+                      ),
+                    ])
+                  wisp.json_response(json.to_string_tree(error_json), 500)
                 }
               }
             }
-
-            Error(error_msg) -> {
+            Error(_) -> {
               logging.log(
                 logging.Error,
-                "[ProxyHandler] ❌ Failed to check metric status: " <> error_msg,
+                "[ProxyHandler] ❌ Failed to get customer context",
               )
               let error_json =
                 json.object([
                   #("error", json.string("Internal Server Error")),
-                  #("message", json.string("Failed to check metric status")),
+                  #("message", json.string("Failed to get customer context")),
                 ])
               wisp.json_response(json.to_string_tree(error_json), 500)
             }
           }
         }
+        metric_types.Business(_) -> {
+          // Business scope - no expiry check needed
+          process_proxy_with_context(business_id, req, scope, None, request_id)
+        }
       }
     }
+  }
+}
+
+fn process_proxy_with_context(
+  business_id: String,
+  req: ProxyRequest,
+  scope: metric_types.MetricScope,
+  context: option.Option(customer_types.CustomerContext),
+  request_id: String,
+) -> Response {
+  let lookup_key = metric_types.scope_to_lookup_key(scope)
+
+  // Check if metric_name is empty
+  case string.length(req.metric_name) {
+    0 -> {
+      // No specific metric - return ALL plan limit statuses
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] 🔍 No metric specified - checking all plan limits: "
+          <> request_id,
+      )
+      check_all_plan_limits_and_forward(lookup_key, scope, business_id, req)
+    }
+    _ -> {
+      // Original behavior - check specific metric
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] 🔍 Checking metric: "
+          <> lookup_key
+          <> "/"
+          <> req.metric_name
+          <> " - "
+          <> request_id,
+      )
+
+      // If we have context with plan_limits, use those for the check
+      let plan_limits = case context {
+        Some(ctx) -> ctx.plan_limits
+        None -> []
+      }
+
+      case
+        check_metric_breach_status_with_limits(
+          lookup_key,
+          req.metric_name,
+          scope,
+          business_id,
+          plan_limits,
+        )
+      {
+        Ok(breach_status) -> {
+          case should_deny_request(breach_status) {
+            True -> {
+              logging.log(
+                logging.Warning,
+                "[ProxyHandler] 🚨 Request DENIED - metric over limit: "
+                  <> request_id,
+              )
+              create_denied_response(breach_status)
+            }
+            False -> {
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] ✅ Request ALLOWED - forwarding to target: "
+                  <> request_id,
+              )
+              forward_request_to_target(req, breach_status, scope, context)
+            }
+          }
+        }
+
+        Error(error_msg) -> {
+          logging.log(
+            logging.Error,
+            "[ProxyHandler] ❌ Failed to check metric status: "
+              <> error_msg
+              <> " - "
+              <> request_id,
+          )
+          let error_json =
+            json.object([
+              #("error", json.string("Internal Server Error")),
+              #("message", json.string("Failed to check metric status")),
+            ])
+          wisp.json_response(json.to_string_tree(error_json), 500)
+        }
+      }
+    }
+  }
+}
+
+fn check_metric_breach_status_with_limits(
+  lookup_key: String,
+  metric_name: String,
+  scope: metric_types.MetricScope,
+  business_id: String,
+  plan_limits: List(customer_types.PlanLimit),
+) -> Result(BreachStatus, String) {
+  case metric_actor.lookup_metric_subject(lookup_key, metric_name) {
+    Ok(metric_subject) -> {
+      // Metric exists - get its current status
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] ✅ Found existing metric, checking status",
+      )
+
+      // If we have plan_limits from expiry check, find the matching limit
+      case find_limit_for_metric(plan_limits, metric_name) {
+        Some(limit) -> {
+          logging.log(
+            logging.Info,
+            "[ProxyHandler] 📊 Using plan limit: "
+              <> metric_name
+              <> " = "
+              <> float.to_string(limit.limit_value),
+          )
+          get_metric_status_with_override(metric_subject, limit)
+        }
+        None -> {
+          // No override, use metric's own limit
+          get_metric_status(metric_subject)
+        }
+      }
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] 📡 Metric not found, requiring manual creation",
+      )
+      lookup_existing_metric_actor(lookup_key, metric_name, scope, business_id)
+      |> result.try(get_metric_status)
+    }
+  }
+}
+
+fn find_limit_for_metric(
+  plan_limits: List(customer_types.PlanLimit),
+  metric_name: String,
+) -> Option(customer_types.PlanLimit) {
+  list.find(plan_limits, fn(limit) { limit.metric_name == metric_name })
+  |> option.from_result
+}
+
+fn get_metric_status_with_override(
+  metric_subject: process.Subject(metric_types.Message),
+  limit: customer_types.PlanLimit,
+) -> Result(BreachStatus, String) {
+  let reply_subject = process.new_subject()
+
+  process.send(metric_subject, metric_types.GetLimitStatus(reply_subject))
+
+  case process.receive(reply_subject, 1000) {
+    Ok(status) -> {
+      // Override with the new limit from plan
+      let is_breached = case limit.breach_operator {
+        "gte" -> status.current_value >=. limit.limit_value
+        "gt" -> status.current_value >. limit.limit_value
+        "lte" -> status.current_value <=. limit.limit_value
+        "lt" -> status.current_value <. limit.limit_value
+        _ -> False
+      }
+
+      let remaining = case limit.breach_operator {
+        "gte" | "gt" -> {
+          let remaining_value = limit.limit_value -. status.current_value
+          case remaining_value >. 0.0 {
+            True -> Some(remaining_value)
+            False -> Some(0.0)
+          }
+        }
+        _ -> None
+      }
+
+      Ok(BreachStatus(
+        is_breached: is_breached,
+        current_usage: status.current_value,
+        limit_value: limit.limit_value,
+        limit_operator: limit.breach_operator,
+        breach_action: limit.breach_action,
+        remaining: remaining,
+      ))
+    }
+    Error(_) -> Error("Timeout waiting for limit status")
   }
 }
 
@@ -945,7 +1124,7 @@ fn with_auth(req: Request, handler: fn(String) -> Response) -> Response {
         }
       }
 
-      auth.DatabaseValid(supabase_client.BusinessKey(business_id)) -> {
+      auth.DatabaseValid(supabase_client.BusinessKey(_)) -> {
         // Business keys can't use proxy
         wisp.json_response(
           json.to_string_tree(
@@ -1481,52 +1660,49 @@ fn check_all_plan_limits_and_forward(
 fn check_and_handle_expiry(
   context: customer_types.CustomerContext,
 ) -> Result(customer_types.CustomerContext, String) {
-  case context.customer.subscription_ends_at {
-    Some(expires_at_str) -> {
-      case birl.parse(expires_at_str) {
-        Ok(expires_time) -> {
-          let expires_unix = birl.to_unix(expires_time)
-          let now = utils.current_timestamp()
+  case is_subscription_expired(context.customer.subscription_ends_at) {
+    True -> {
+      logging.log(
+        logging.Warning,
+        "[ProxyHandler] ⏰ Subscription expired, loading free tier limits",
+      )
 
-          case expires_unix < now {
-            True -> {
-              // Expired! Downgrade to free plan
-              logging.log(
-                logging.Warning,
-                "[ProxyHandler] Subscription expired for customer: "
-                  <> context.customer.customer_id
-                  <> " - downgrading to free plan",
+      // Get free plan for this business
+      case
+        supabase_client.get_free_plan_for_business(context.customer.business_id)
+      {
+        Ok(free_plan) -> {
+          // Get free plan limits
+          case supabase_client.get_plan_limits_by_plan_id(free_plan.id) {
+            Ok(free_limits) -> {
+              // Return context with FREE LIMITS swapped in
+              Ok(
+                customer_types.CustomerContext(
+                  ..context,
+                  plan_limits: free_limits,
+                  // ← Just swap!
+                ),
               )
-
-              case
-                supabase_client.downgrade_customer_to_free_plan(
-                  context.customer.business_id,
-                  context.customer.customer_id,
-                )
-              {
-                Ok(_) -> {
-                  // Reload context with free plan
-                  supabase_client.get_customer_full_context(
-                    context.customer.business_id,
-                    context.customer.customer_id,
-                  )
-                  |> result.map_error(fn(_) {
-                    "Failed to reload context after downgrade"
-                  })
-                }
-                Error(e) ->
-                  Error("Failed to downgrade customer: " <> string.inspect(e))
-              }
             }
-            False -> Ok(context)
-            // Still valid
+            Error(_) -> Error("Failed to load free limits")
           }
         }
-        Error(_) -> Ok(context)
-        // Can't parse, assume valid
+        Error(_) -> Error("No free plan found")
       }
     }
-    None -> Ok(context)
-    // No expiry set
+    False -> Ok(context)
+  }
+}
+
+fn is_subscription_expired(ends_at: Option(String)) -> Bool {
+  case ends_at {
+    Some(expires_str) -> {
+      case birl.parse(expires_str) {
+        Ok(expires_time) ->
+          birl.to_unix(expires_time) < utils.current_timestamp()
+        Error(_) -> False
+      }
+    }
+    None -> False
   }
 }

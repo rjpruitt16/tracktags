@@ -1,5 +1,6 @@
 // src/actors/customer_actor.gleam
 import actors/metric_actor
+import birl
 import clients/supabase_client
 import gleam/dict.{type Dict}
 import gleam/dynamic
@@ -69,7 +70,6 @@ pub fn dict_to_string(tags: Dict(String, String)) -> String {
 // CUSTOMER ACTOR PLAN INHERITANCE (Add to customer_actor.gleam)
 // ============================================================================
 
-/// Load plan limits for a customer and create metric actors
 fn load_customer_plan_limits(
   business_id: String,
   customer_id: String,
@@ -106,79 +106,88 @@ fn load_customer_plan_limits(
         logging.Debug,
         "[CustomerActor] Got customer record - plan_id: "
           <> string.inspect(customer.plan_id)
-          <> ", stripe_price_id: "
-          <> string.inspect(customer.stripe_price_id),
+          <> ", subscription_ends_at: "
+          <> string.inspect(customer.subscription_ends_at),
       )
 
-      // Try to get plan limits (try plan_id first, fallback to stripe_price_id)
-      let plan_limits_result = case customer.plan_id {
-        Some(plan_id) -> {
-          logging.log(
-            logging.Info,
-            "[CustomerActor] Customer has plan_id: " <> plan_id,
-          )
-          supabase_client.get_plan_limits_by_plan_id(plan_id)
-        }
-        None ->
-          case customer.stripe_price_id {
-            Some(price_id) -> {
+      // 🆕 Get the EFFECTIVE plan (checks expiry)
+      case get_effective_plan_ids(customer, business_id) {
+        Ok(#(effective_plan_id, effective_price_id)) -> {
+          // Try to get plan limits using effective plan
+          let plan_limits_result = case effective_plan_id {
+            Some(plan_id) -> {
               logging.log(
                 logging.Info,
-                "[CustomerActor] Customer has stripe_price_id: " <> price_id,
+                "[CustomerActor] Using effective plan_id: " <> plan_id,
               )
-              supabase_client.get_plan_limits_by_stripe_price_id(price_id)
+              supabase_client.get_plan_limits_by_plan_id(plan_id)
             }
-            None -> {
+            None ->
+              case effective_price_id {
+                Some(price_id) -> {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerActor] Using effective stripe_price_id: "
+                      <> price_id,
+                  )
+                  supabase_client.get_plan_limits_by_stripe_price_id(price_id)
+                }
+                None -> {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerActor] No effective plan - skipping limits",
+                  )
+                  Ok([])
+                }
+              }
+          }
+
+          case plan_limits_result {
+            Ok([]) -> {
+              logging.log(logging.Info, "[CustomerActor] No plan limits found")
+              Ok(Nil)
+            }
+            Ok(limits) -> {
               logging.log(
                 logging.Info,
-                "[CustomerActor] Customer has no plan assigned - skipping limits",
+                "[CustomerActor] Found "
+                  <> int.to_string(list.length(limits))
+                  <> " plan limits, creating metric actors...",
               )
-              Ok([])
+
+              // Create a metric actor for each plan limit
+              list.try_each(limits, fn(limit) {
+                create_plan_limit_metric(
+                  business_id,
+                  customer_id,
+                  limit,
+                  metrics_supervisor,
+                )
+              })
+              |> result.map_error(fn(e) {
+                logging.log(
+                  logging.Error,
+                  "[CustomerActor] Failed to create limit metrics: " <> e,
+                )
+                "Failed to create limit metrics: " <> e
+              })
+              |> result.map(fn(_) { Nil })
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[CustomerActor] Failed to load limits: " <> string.inspect(e),
+              )
+              Ok(Nil)
             }
           }
-      }
-
-      case plan_limits_result {
-        Ok([]) -> {
-          logging.log(
-            logging.Info,
-            "[CustomerActor] No plan limits found for customer",
-          )
-          Ok(Nil)
-        }
-        Ok(limits) -> {
-          logging.log(
-            logging.Info,
-            "[CustomerActor] Found "
-              <> int.to_string(list.length(limits))
-              <> " plan limits, creating metric actors...",
-          )
-
-          // Create a metric actor for each plan limit
-          list.try_each(limits, fn(limit) {
-            create_plan_limit_metric(
-              business_id,
-              customer_id,
-              limit,
-              metrics_supervisor,
-            )
-          })
-          |> result.map_error(fn(e) {
-            logging.log(
-              logging.Error,
-              "[CustomerActor] Failed to create limit metrics: " <> e,
-            )
-            "Failed to create limit metrics: " <> e
-          })
-          |> result.map(fn(_) { Nil })
         }
         Error(e) -> {
           logging.log(
-            logging.Warning,
-            "[CustomerActor] Failed to load limits: " <> string.inspect(e),
+            logging.Error,
+            "[CustomerActor] Failed to get effective plan: " <> e,
           )
-          Ok(Nil)
-          // Don't fail startup if plan limits can't be loaded
+          Error(e)
         }
       }
     }
@@ -1225,5 +1234,93 @@ pub fn handle_realtime_update(registry_key: String, message: String) -> Nil {
     }
 
     _ -> Nil
+  }
+}
+
+/// Get the effective plan IDs for a customer (accounting for expiry)
+fn get_effective_plan_ids(
+  customer: customer_types.Customer,
+  business_id: String,
+) -> Result(#(Option(String), Option(String)), String) {
+  logging.log(
+    logging.Info,
+    // ← Change from Debug to Info
+    "[CustomerActor] 🔍 Checking effective plan for customer",
+  )
+
+  case customer.subscription_ends_at {
+    Some(expiry_date) -> {
+      // Use birl to parse the date properly
+      case birl.parse(expiry_date) {
+        Ok(expires_time) -> {
+          let expires_unix = birl.to_unix(expires_time)
+          let current_time = utils.current_timestamp()
+
+          logging.log(
+            logging.Info,
+            // ← Change from Debug to Info
+            "[CustomerActor] Subscription expires at: "
+              <> expiry_date
+              <> " (unix: "
+              <> int.to_string(expires_unix)
+              <> ", current: "
+              <> int.to_string(current_time)
+              <> ")",
+          )
+
+          case expires_unix < current_time {
+            True -> {
+              // Subscription EXPIRED - use free plan
+              logging.log(
+                logging.Info,
+                "[CustomerActor] ⚠️ Subscription EXPIRED, loading free tier limits",
+              )
+
+              case supabase_client.get_free_plan_for_business(business_id) {
+                Ok(free_plan) -> {
+                  logging.log(
+                    logging.Info,
+                    "[CustomerActor] ✅ Using free plan: " <> free_plan.id,
+                  )
+                  Ok(#(Some(free_plan.id), None))
+                }
+                Error(_) -> {
+                  logging.log(
+                    logging.Warning,
+                    "[CustomerActor] ⚠️ No free plan found, using unlimited",
+                  )
+                  Ok(#(None, None))
+                }
+              }
+            }
+            False -> {
+              // Subscription ACTIVE - use customer's plan
+              logging.log(
+                logging.Info,
+                "[CustomerActor] ✅ Subscription ACTIVE, using customer's plan",
+              )
+              Ok(#(customer.plan_id, customer.stripe_price_id))
+            }
+          }
+        }
+        Error(_) -> {
+          // Can't parse date - assume active
+          logging.log(
+            logging.Warning,
+            "[CustomerActor] ⚠️ Failed to parse expiry date: " <> expiry_date,
+          )
+          Ok(#(customer.plan_id, customer.stripe_price_id))
+        }
+      }
+    }
+    None -> {
+      // No expiry date - use customer's plan
+      logging.log(
+        logging.Info,
+        // ← Change from Debug to Info
+        "[CustomerActor] No expiry date, using customer's plan",
+      )
+      Ok(#(customer.plan_id, customer.stripe_price_id))
+    }
   }
 }
