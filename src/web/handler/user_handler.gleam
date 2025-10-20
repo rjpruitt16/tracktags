@@ -143,7 +143,7 @@ pub fn get_customer_machines(req: Request, customer_id: String) -> Response {
         // Admin gets direct database access, no actor check
         logging.log(
           logging.Info,
-          "[CustomerHandler] Admin access for machines: " <> customer_id,
+          "[UserHandler] Admin access for machines: " <> customer_id,
         )
         query_database_for_machines(customer_id)
       }
@@ -153,7 +153,7 @@ pub fn get_customer_machines(req: Request, customer_id: String) -> Response {
           True -> {
             logging.log(
               logging.Info,
-              "[CustomerHandler] Test customer, skipping actor check: "
+              "[UserHandler] Test customer, skipping actor check: "
                 <> customer_id,
             )
             query_database_for_machines(customer_id)
@@ -183,7 +183,7 @@ pub fn get_customer_machines(req: Request, customer_id: String) -> Response {
               Error(_) -> {
                 logging.log(
                   logging.Info,
-                  "[CustomerHandler] No actor found, checking database",
+                  "[UserHandler] No actor found, checking database",
                 )
                 query_database_for_machines(customer_id)
               }
@@ -221,7 +221,7 @@ fn query_database_for_machines(customer_id: String) -> Response {
     Error(err) -> {
       logging.log(
         logging.Error,
-        "[CustomerHandler] Database error: " <> string.inspect(err),
+        "[UserHandler] Database error: " <> string.inspect(err),
       )
       wisp.internal_server_error()
       |> wisp.string_body("Failed to get machines")
@@ -245,7 +245,7 @@ pub fn create_customer(req: Request) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 CREATE CUSTOMER REQUEST START - ID: " <> request_id,
+    "[UserHandler] 🔍 CREATE CUSTOMER REQUEST START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Post)
@@ -263,7 +263,7 @@ pub fn create_customer(req: Request) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 CREATE CUSTOMER REQUEST END - ID: " <> request_id,
+    "[UserHandler] 🔍 CREATE CUSTOMER REQUEST END - ID: " <> request_id,
   )
 
   case result {
@@ -271,7 +271,7 @@ pub fn create_customer(req: Request) -> Response {
     Error(decode_errors) -> {
       logging.log(
         logging.Warning,
-        "[CustomerHandler] Bad request: " <> string.inspect(decode_errors),
+        "[UserHandler] Bad request: " <> string.inspect(decode_errors),
       )
       let error_json =
         json.object([
@@ -287,7 +287,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 UPDATE CUSTOMER REQUEST START - ID: "
+    "[UserHandler] 🔍 UPDATE CUSTOMER REQUEST START - ID: "
       <> request_id
       <> " customer: "
       <> customer_id,
@@ -320,7 +320,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
     Ok(#(plan_id, stripe_price_id, subscription_ends_at)) -> {
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔄 Updating customer: "
+        "[UserHandler] 🔄 Updating customer: "
           <> business_id
           <> "/"
           <> customer_id,
@@ -333,7 +333,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
           Some(_), _ | _, Some(_) -> {
             logging.log(
               logging.Info,
-              "[CustomerHandler] Updating plan and/or price",
+              "[UserHandler] Updating plan and/or price",
             )
             case
               supabase_client.update_customer_plan(
@@ -349,7 +349,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
                   Some(_) -> {
                     logging.log(
                       logging.Info,
-                      "[CustomerHandler] Updating subscription_ends_at",
+                      "[UserHandler] Updating subscription_ends_at",
                     )
                     supabase_client.update_customer_subscription_expiry(
                       business_id,
@@ -372,7 +372,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
               Some(_) -> {
                 logging.log(
                   logging.Info,
-                  "[CustomerHandler] Updating subscription_ends_at only",
+                  "[UserHandler] Updating subscription_ends_at only",
                 )
                 supabase_client.update_customer_subscription_expiry(
                   business_id,
@@ -393,7 +393,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
         Ok(updated_customer) -> {
           logging.log(
             logging.Info,
-            "[CustomerHandler] ✅ Customer updated successfully",
+            "[UserHandler] ✅ Customer updated successfully",
           )
 
           // 🔔 NOTIFY CUSTOMER ACTOR - use the updated customer's ACTUAL plan
@@ -407,7 +407,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
             Ok(customer_subject) -> {
               logging.log(
                 logging.Info,
-                "[CustomerHandler] 🔔 Notifying customer actor of plan change",
+                "[UserHandler] 🔔 Notifying customer actor of plan change",
               )
               process.send(
                 customer_subject,
@@ -420,7 +420,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
             Error(_) -> {
               logging.log(
                 logging.Warning,
-                "[CustomerHandler] Customer actor not running, will load on next spawn",
+                "[UserHandler] Customer actor not running, will load on next spawn",
               )
             }
           }
@@ -448,8 +448,7 @@ pub fn update_customer(req: Request, customer_id: String) -> Response {
 
           logging.log(
             logging.Info,
-            "[CustomerHandler] 🔍 UPDATE CUSTOMER REQUEST END - ID: "
-              <> request_id,
+            "[UserHandler] 🔍 UPDATE CUSTOMER REQUEST END - ID: " <> request_id,
           )
 
           wisp.json_response(json.to_string_tree(success_json), 200)
@@ -496,7 +495,7 @@ pub fn list_customers(req: Request) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST START - ID: " <> request_id,
+    "[UserHandler] 🔍 LIST CUSTOMERS REQUEST START - ID: " <> request_id,
   )
 
   use <- wisp.require_method(req, http.Get)
@@ -504,7 +503,7 @@ pub fn list_customers(req: Request) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 📋 Listing customers for business: " <> business_id,
+    "[UserHandler] 📋 Listing customers for business: " <> business_id,
   )
 
   case supabase_client.get_business_customers(business_id) {
@@ -531,7 +530,7 @@ pub fn list_customers(req: Request) -> Response {
 
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
+        "[UserHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(json.to_string_tree(success_json), 200)
@@ -544,7 +543,7 @@ pub fn list_customers(req: Request) -> Response {
         ])
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
+        "[UserHandler] 🔍 LIST CUSTOMERS REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(json.to_string_tree(error_json), 500)
@@ -556,7 +555,7 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
   let request_id = string.inspect(utils.system_time())
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 GET CUSTOMER REQUEST START - ID: "
+    "[UserHandler] 🔍 GET CUSTOMER REQUEST START - ID: "
       <> request_id
       <> " customer: "
       <> customer_id,
@@ -567,17 +566,14 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] 🔍 Getting customer: "
-      <> business_id
-      <> "/"
-      <> customer_id,
+    "[UserHandler] 🔍 Getting customer: " <> business_id <> "/" <> customer_id,
   )
 
   case supabase_client.get_customer_by_id(business_id, customer_id) {
     Ok(customer) -> {
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
+        "[UserHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       let success_json =
@@ -599,7 +595,7 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
     Error(supabase_client.NotFound(_)) -> {
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
+        "[UserHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(
@@ -615,7 +611,7 @@ pub fn get_customer(req: Request, customer_id: String) -> Response {
     Error(_) -> {
       logging.log(
         logging.Info,
-        "[CustomerHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
+        "[UserHandler] 🔍 GET CUSTOMER REQUEST END - ID: " <> request_id,
       )
 
       wisp.json_response(
@@ -634,7 +630,7 @@ pub fn delete_customer(req: Request, customer_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] Attempting to delete customer: " <> customer_id,
+    "[UserHandler] Attempting to delete customer: " <> customer_id,
   )
 
   // Verify customer belongs to this business BEFORE deleting
@@ -658,14 +654,14 @@ pub fn delete_customer(req: Request, customer_id: String) -> Response {
             )
           logging.log(
             logging.Info,
-            "[CustomerHandler] Successfully deleted customer: " <> customer_id,
+            "[UserHandler] Successfully deleted customer: " <> customer_id,
           )
           wisp.ok() |> wisp.string_body("Customer deleted")
         }
         Error(_) -> {
           logging.log(
             logging.Error,
-            "[CustomerHandler] Failed to delete customer: " <> customer_id,
+            "[UserHandler] Failed to delete customer: " <> customer_id,
           )
           wisp.internal_server_error()
         }
@@ -742,29 +738,18 @@ fn process_create_customer(
         "[CustomerHandler] ✅ Customer created successfully in database",
       )
 
-      // 🚀 NEW: Spawn the CustomerActor immediately after database creation
-      logging.log(
-        logging.Info,
-        "[CustomerHandler] 🚀 Attempting to spawn CustomerActor for: "
-          <> req.customer_id,
-      )
-
+      // 🚀 Send spawn message but DON'T WAIT for response
       case
         supabase_client.get_customer_full_context(business_id, req.customer_id)
       {
         Ok(context) -> {
-          logging.log(
-            logging.Info,
-            "[CustomerHandler] ✅ Loaded customer context successfully",
-          )
-
           case get_application_actor() {
             Ok(app_actor) -> {
               let reply = process.new_subject()
 
               logging.log(
                 logging.Info,
-                "[CustomerHandler] 📤 Sending EnsureCustomerActor message to ApplicationActor",
+                "[CustomerHandler] 📤 Sending EnsureCustomerActor message (non-blocking)",
               )
 
               process.send(
@@ -774,27 +759,11 @@ fn process_create_customer(
                   req.customer_id,
                   context,
                   "",
-                  // No API key yet
                   reply,
                 ),
               )
-
-              // Wait briefly for the actor to spawn (optional, non-blocking)
-              case process.receive(reply, 500) {
-                Ok(_customer_subject) -> {
-                  logging.log(
-                    logging.Info,
-                    "[CustomerHandler] ✅ CustomerActor spawned successfully for: "
-                      <> req.customer_id,
-                  )
-                }
-                Error(_) -> {
-                  logging.log(
-                    logging.Warning,
-                    "[CustomerHandler] ⚠️ CustomerActor spawn timeout (may still be initializing)",
-                  )
-                }
-              }
+              // ✅ DON'T WAIT - just continue immediately!
+              // The actor will spawn in the background
             }
             Error(e) -> {
               logging.log(
@@ -813,7 +782,7 @@ fn process_create_customer(
         }
       }
 
-      // Return success response regardless of actor spawn status
+      // Return success immediately - don't wait for actor spawn
       let success_json =
         json.object([
           #("status", json.string("created")),
@@ -866,7 +835,7 @@ pub fn list_client_keys(req: Request, customer_id: String) -> Response {
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] Listing keys for customer: " <> customer_id,
+    "[UserHandler] Listing keys for customer: " <> customer_id,
   )
 
   let success_json =
@@ -889,10 +858,7 @@ pub fn delete_client_key(
 
   logging.log(
     logging.Info,
-    "[CustomerHandler] Deleting key: "
-      <> key_id
-      <> " for customer: "
-      <> customer_id,
+    "[UserHandler] Deleting key: " <> key_id <> " for customer: " <> customer_id,
   )
 
   let success_json =
@@ -1247,7 +1213,7 @@ pub fn link_user_to_customer(
     Ok(user_id) -> {
       logging.log(
         logging.Info,
-        "[CustomerHandler] Linking user "
+        "[UserHandler] Linking user "
           <> user_id
           <> " to customer "
           <> customer_id,

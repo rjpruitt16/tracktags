@@ -534,7 +534,7 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
           case state.metric_type {
             // Checkpoint and StripeBilling need atomic updates across servers
             metric_types.Checkpoint | metric_types.StripeBilling -> {
-              let #(business_id, customer_id, scope) =
+              let #(business_id, customer_id, _) =
                 metric_types.parse_account_id(state.default_metric.account_id)
 
               case
@@ -543,7 +543,6 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
                   customer_id,
                   state.default_metric.metric_name,
                   metric.value,
-                  scope,
                   metric.tags,
                 )
               {

@@ -13,24 +13,34 @@ RETURNS TABLE(
 DECLARE
   v_old_value NUMERIC;
   v_new_value NUMERIC;
+  v_scope TEXT;
 BEGIN
-  -- Get current value (or 0 if doesn't exist)
+  -- Determine scope based on customer_id
+  v_scope := CASE 
+    WHEN p_customer_id IS NULL OR p_customer_id = '' THEN 'business'
+    ELSE 'customer'
+  END;
+
+  -- Get current value
   SELECT COALESCE(value, 0) INTO v_old_value
   FROM metrics
   WHERE business_id = p_business_id
-    AND customer_id = p_customer_id
+    AND (customer_id = p_customer_id OR (customer_id IS NULL AND p_customer_id IS NULL))
     AND metric_name = p_metric_name
+    AND scope = v_scope
   ORDER BY flushed_at DESC
   LIMIT 1;
 
   -- Calculate new value
   v_new_value := COALESCE(v_old_value, 0) + p_increment;
 
-  -- Insert new row with tags
+  -- Insert new row with ALL required fields
   INSERT INTO metrics (
     business_id,
     customer_id,
+    scope,
     metric_name,
+    metric_type,
     value,
     tags,
     flushed_at,
@@ -38,7 +48,9 @@ BEGIN
   ) VALUES (
     p_business_id,
     p_customer_id,
+    v_scope,
     p_metric_name,
+    'checkpoint',  -- ✅ Always checkpoint for this RPC
     v_new_value,
     p_tags,
     NOW(),
