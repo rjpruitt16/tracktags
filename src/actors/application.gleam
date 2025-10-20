@@ -40,36 +40,27 @@ fn tier_limits() -> Dict(String, TierLimit) {
     #(
       "free",
       TierLimit(
-        daily_calls: 333.0,
-        // ~10K/month
-        daily_metrics: 33.0,
-        // ~1K/month
-        supabase_writes: 0.0,
+        daily_calls: 10_000.0,
+        daily_metrics: 1000.0,
+        supabase_writes: 100.0,
         breach_action: "deny",
       ),
     ),
     #(
       "pro",
       TierLimit(
-        daily_calls: 3333.0,
-        // ~100K/month
-        daily_metrics: 333.0,
-        // ~10K/month
-        supabase_writes: 33.0,
-        // ~1K/month
+        daily_calls: -1.0,
+        daily_metrics: -1.0,
+        supabase_writes: -1.0,
         breach_action: "allow_overage",
-        // Bill for extra
       ),
     ),
     #(
       "scale",
       TierLimit(
-        daily_calls: 33_333.0,
-        // ~1M/month
-        daily_metrics: 3333.0,
-        // ~100K/month
-        supabase_writes: 333.0,
-        // ~10K/month
+        daily_calls: -1.0,
+        daily_metrics: -1.0,
+        supabase_writes: -1.0,
         breach_action: "allow_overage",
       ),
     ),
@@ -77,7 +68,6 @@ fn tier_limits() -> Dict(String, TierLimit) {
       "enterprise",
       TierLimit(
         daily_calls: -1.0,
-        // Unlimited
         daily_metrics: -1.0,
         supabase_writes: -1.0,
         breach_action: "allow",
