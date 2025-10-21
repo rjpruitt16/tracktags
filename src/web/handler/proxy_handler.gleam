@@ -418,34 +418,46 @@ fn verify_domain_authorization(
   domain: String,
   business_id: String,
 ) -> Result(Bool, String) {
-  // Skip verification if not on Fly (local dev)
-  case utils.get_env_or("FLY_APP_NAME", "") {
-    "" -> {
+  // ✅ Skip verification for webhook.site (testing/debugging only)
+  case string.contains(domain, "webhook.site") {
+    True -> {
       logging.log(
         logging.Info,
-        "[ProxyHandler] Skipping domain verification (local dev)",
+        "[ProxyHandler] ✅ Skipping domain verification for webhook.site (debug endpoint)",
       )
       Ok(True)
     }
-    _ -> {
-      // Check cache first
-      let cache_key = domain <> ":" <> business_id
-      case cachex.get("domain_cache", cache_key) {
-        Ok(Some(cached_result)) -> {
+    False -> {
+      // Original verification logic
+      case utils.get_env_or("FLY_APP_NAME", "") {
+        "" -> {
           logging.log(
             logging.Info,
-            "[ProxyHandler] Cache hit for domain: " <> domain,
+            "[ProxyHandler] Skipping domain verification (local dev)",
           )
-          Ok(cached_result)
+          Ok(True)
         }
         _ -> {
-          // Cache miss - fetch from domain
-          logging.log(
-            logging.Info,
-            "[ProxyHandler] Cache miss, fetching .tracktags.json for: "
-              <> domain,
-          )
-          fetch_and_verify_domain(domain, business_id, cache_key)
+          // Check cache first
+          let cache_key = domain <> ":" <> business_id
+          case cachex.get("domain_cache", cache_key) {
+            Ok(Some(cached_result)) -> {
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] Cache hit for domain: " <> domain,
+              )
+              Ok(cached_result)
+            }
+            _ -> {
+              // Cache miss - fetch from domain
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] Cache miss, fetching .tracktags.json for: "
+                  <> domain,
+              )
+              fetch_and_verify_domain(domain, business_id, cache_key)
+            }
+          }
         }
       }
     }
