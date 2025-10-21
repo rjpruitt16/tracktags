@@ -750,7 +750,7 @@ fn forward_request_to_target(
     Ok(True) -> {
       // Domain is authorized - proceed with existing forwarding logic
 
-      // Get TracktTags URL from environment, default to localhost:8080
+      // Get TrackTags URL from environment, default to localhost:8080
       let tracktags_url =
         utils.get_env_or("TRACKTAGS_URL", "http://localhost:8080")
 
@@ -776,17 +776,17 @@ fn forward_request_to_target(
           let error_json =
             json.object([
               #("error", json.string("Loop Detected")),
-              #("message", json.string("Cannot proxy back to TracktTags")),
+              #("message", json.string("Cannot proxy back to TrackTags")),
             ])
           wisp.json_response(json.to_string_tree(error_json), 400)
         }
         False -> {
-          // Check if request already has TracktTags headers (indicating it's been proxied)
+          // Check if request already has TrackTags headers (indicating it's been proxied)
           case dict.get(req.headers, "x-tracktags-customer-id") {
             Ok(_) -> {
               logging.log(
                 logging.Warning,
-                "[ProxyHandler] Request already proxied - TracktTags headers detected",
+                "[ProxyHandler] Request already proxied - TrackTags headers detected",
               )
               let error_json =
                 json.object([
@@ -794,7 +794,7 @@ fn forward_request_to_target(
                   #(
                     "message",
                     json.string(
-                      "Request has already been proxied through TracktTags",
+                      "Request has already been proxied through TrackTags",
                     ),
                   ),
                 ])
@@ -831,37 +831,37 @@ fn forward_request_to_target(
                       request.set_header(acc_req, key, value)
                     })
 
-                  // Add TracktTags metadata headers based on scope and context
+                  // Add TrackTags metadata headers based on scope and context
                   let req_with_metadata = case scope, context {
                     metric_types.Customer(bid, cid), Some(ctx) -> {
                       let machine_ids =
                         list.map(ctx.machines, fn(m) { m.machine_id })
                       req_with_headers
-                      |> request.set_header("X-TracktTags-Customer-Id", cid)
-                      |> request.set_header("X-TracktTags-Business-Id", bid)
+                      |> request.set_header("X-TrackTags-Customer-Id", cid)
+                      |> request.set_header("X-TrackTags-Business-Id", bid)
                       |> request.set_header(
-                        "X-TracktTags-Owned-Machines",
+                        "X-TrackTags-Owned-Machines",
                         string.join(machine_ids, ","),
                       )
                       |> request.set_header(
-                        "X-TracktTags-Plan-Id",
+                        "X-TrackTags-Plan-Id",
                         option.unwrap(ctx.customer.plan_id, "free"),
                       )
                       |> request.set_header(
-                        "X-TracktTags-Machine-Count",
+                        "X-TrackTags-Machine-Count",
                         int.to_string(list.length(ctx.machines)),
                       )
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                     metric_types.Business(bid), _ -> {
                       req_with_headers
-                      |> request.set_header("X-TracktTags-Business-Id", bid)
-                      |> request.set_header("X-TracktTags-Scope", "business")
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Business-Id", bid)
+                      |> request.set_header("X-TrackTags-Scope", "business")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                     _, _ -> {
                       req_with_headers
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                   }
 
@@ -1387,7 +1387,7 @@ fn forward_with_limit_metadata(
           let error_json =
             json.object([
               #("error", json.string("Loop Detected")),
-              #("message", json.string("Cannot proxy back to TracktTags")),
+              #("message", json.string("Cannot proxy back to TrackTags")),
             ])
           wisp.json_response(json.to_string_tree(error_json), 400)
         }
@@ -1396,7 +1396,7 @@ fn forward_with_limit_metadata(
             Ok(_) -> {
               logging.log(
                 logging.Warning,
-                "[ProxyHandler] Request already proxied - TracktTags headers detected",
+                "[ProxyHandler] Request already proxied - TrackTags headers detected",
               )
               let error_json =
                 json.object([
@@ -1404,7 +1404,7 @@ fn forward_with_limit_metadata(
                   #(
                     "message",
                     json.string(
-                      "Request has already been proxied through TracktTags",
+                      "Request has already been proxied through TrackTags",
                     ),
                   ),
                 ])
@@ -1439,11 +1439,11 @@ fn forward_with_limit_metadata(
                       request.set_header(acc_req, key, value)
                     })
 
-                  // NEW: Add X-TracktTags-Limits header with all limit statuses
+                  // NEW: Add X-TrackTags-Limits header with all limit statuses
                   let req_with_limits =
                     req_with_headers
                     |> request.set_header(
-                      "X-TracktTags-Limits",
+                      "X-TrackTags-Limits",
                       json.to_string(limits_json),
                     )
 
@@ -1452,31 +1452,31 @@ fn forward_with_limit_metadata(
                       let machine_ids =
                         list.map(ctx.machines, fn(m) { m.machine_id })
                       req_with_limits
-                      |> request.set_header("X-TracktTags-Customer-Id", cid)
-                      |> request.set_header("X-TracktTags-Business-Id", bid)
+                      |> request.set_header("X-TrackTags-Customer-Id", cid)
+                      |> request.set_header("X-TrackTags-Business-Id", bid)
                       |> request.set_header(
-                        "X-TracktTags-Owned-Machines",
+                        "X-TrackTags-Owned-Machines",
                         string.join(machine_ids, ","),
                       )
                       |> request.set_header(
-                        "X-TracktTags-Plan-Id",
+                        "X-TrackTags-Plan-Id",
                         option.unwrap(ctx.customer.plan_id, "free"),
                       )
                       |> request.set_header(
-                        "X-TracktTags-Machine-Count",
+                        "X-TrackTags-Machine-Count",
                         int.to_string(list.length(ctx.machines)),
                       )
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                     metric_types.Business(bid), _ -> {
                       req_with_limits
-                      |> request.set_header("X-TracktTags-Business-Id", bid)
-                      |> request.set_header("X-TracktTags-Scope", "business")
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Business-Id", bid)
+                      |> request.set_header("X-TrackTags-Scope", "business")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                     _, _ -> {
                       req_with_limits
-                      |> request.set_header("X-TracktTags-Proxied", "true")
+                      |> request.set_header("X-TrackTags-Proxied", "true")
                     }
                   }
 
