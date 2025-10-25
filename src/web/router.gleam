@@ -107,6 +107,11 @@ pub fn handle_request(req: Request) -> Response {
         Post -> user_handler.restore_business(req, business_id)
         _ -> wisp.method_not_allowed([Post])
       }
+    ["api", "v1", "businesses", business_id, "stripe-config"] ->
+      case req.method {
+        Get -> key_handler.get_stripe_config(req, business_id)
+        _ -> wisp.method_not_allowed([Get])
+      }
 
     // Business key management
     ["api", "v1", "businesses", business_id, "keys"] ->
@@ -114,6 +119,13 @@ pub fn handle_request(req: Request) -> Response {
         Post -> key_handler.create_business_key(req, business_id)
         Get -> key_handler.list_business_keys(req, business_id)
         _ -> wisp.method_not_allowed([Post, Get])
+      }
+
+    // BATCH key operations (NEW)
+    ["api", "v1", "businesses", business_id, "keys", "batch"] ->
+      case req.method {
+        Post -> key_handler.batch_upsert_business_keys(req, business_id)
+        _ -> wisp.method_not_allowed([Post])
       }
 
     ["api", "v1", "businesses", business_id, "keys", key_type, key_name] ->

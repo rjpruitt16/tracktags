@@ -158,6 +158,28 @@ pub fn test_encryption() -> Result(String, CryptoError) {
   }
 }
 
+/// Encrypt a single string value (wrapper for encrypt_to_json)
+pub fn encrypt_string(value: String) -> Result(String, String) {
+  case encrypt_to_json(value) {
+    Ok(encrypted) -> Ok(encrypted)
+    Error(EncryptionFailed(msg)) -> Error(msg)
+    Error(DecryptionFailed(msg)) -> Error(msg)
+    Error(InvalidInput(msg)) -> Error(msg)
+    Error(KeyDerivationFailed(msg)) -> Error(msg)
+  }
+}
+
+/// Decrypt a string (wrapper for decrypt_from_json)
+pub fn decrypt_string(encrypted_json: String) -> Result(String, String) {
+  case decrypt_from_json(encrypted_json) {
+    Ok(decrypted) -> Ok(decrypted)
+    Error(EncryptionFailed(msg)) -> Error(msg)
+    Error(DecryptionFailed(msg)) -> Error(msg)
+    Error(InvalidInput(msg)) -> Error(msg)
+    Error(KeyDerivationFailed(msg)) -> Error(msg)
+  }
+}
+
 // ============================================================================
 // TODO: KEY ROTATION (Future Implementation)
 // ============================================================================

@@ -452,7 +452,6 @@ fn integration_key_decoder() -> decode.Decoder(IntegrationKey) {
   use key_hash <- decode.field("key_hash", decode.optional(decode.string))
   use is_active <- decode.field("is_active", decode.bool)
   use created_at <- decode.field("created_at", decode.optional(decode.string))
-
   decode.success(IntegrationKey(
     id: id,
     business_id: business_id,
@@ -3118,12 +3117,11 @@ pub fn update_integration_key(
       <> "/"
       <> key_name,
   )
-
   let update_data =
     json.object([
       #("encrypted_key", json.string(encrypted_key)),
+      #("is_active", json.bool(True)),
     ])
-
   let path =
     "/integration_keys?business_id=eq."
     <> business_id
@@ -3131,13 +3129,11 @@ pub fn update_integration_key(
     <> key_type
     <> "&key_name=eq."
     <> key_name
-
   use response <- result.try(make_request(
     http.Patch,
     path,
     Some(json.to_string(update_data)),
   ))
-
   case response.status {
     200 -> {
       case json.parse(response.body, decode.list(integration_key_decoder())) {
@@ -3167,6 +3163,60 @@ pub fn store_integration_key_with_hash(
       #("encrypted_key", json.string(encrypted_key)),
       #("key_hash", json.string(key_hash)),
       // Add hash
+      #("metadata", case metadata {
+        Some(data) -> json.string(data)
+        None -> json.null()
+      }),
+      #("is_active", json.bool(True)),
+    ])
+    |> json.to_string()
+
+  logging.log(logging.Info, "[SupabaseClient] 🔍 INSERT BODY: " <> body)
+
+  let path = "/integration_keys"
+  use response <- result.try(make_request(http.Post, path, Some(body)))
+
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 📥 RESPONSE STATUS: " <> int.to_string(response.status),
+  )
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 📥 RESPONSE BODY: " <> response.body,
+  )
+
+  case response.status {
+    201 | 200 -> {
+      case json.parse(response.body, decode.list(integration_key_decoder())) {
+        Ok([key, ..]) -> Ok(key)
+        Ok([]) -> Error(ParseError("No key returned"))
+        Error(_) -> Error(ParseError("Failed to parse created key"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to store key"))
+  }
+}
+
+pub fn store_integration_key_with_plaintext(
+  business_id: String,
+  key_type: String,
+  key_name: String,
+  plaintext_value: Option(String),
+  encrypted_key: String,
+  key_hash: String,
+  metadata: Option(String),
+) -> Result(IntegrationKey, SupabaseError) {
+  let body =
+    json.object([
+      #("business_id", json.string(business_id)),
+      #("key_type", json.string(key_type)),
+      #("key_name", json.string(key_name)),
+      #("plaintext_value", case plaintext_value {
+        Some(val) -> json.string(val)
+        None -> json.null()
+      }),
+      #("encrypted_key", json.string(encrypted_key)),
+      #("key_hash", json.string(key_hash)),
       #("metadata", case metadata {
         Some(data) -> json.string(data)
         None -> json.null()

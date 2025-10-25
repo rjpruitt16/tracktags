@@ -1,8 +1,10 @@
 // src/web/handler/key_handler.gleam
-import clients/supabase_client
+import clients/supabase_client.{type IntegrationKey}
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/http
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
@@ -1318,6 +1320,461 @@ fn generate_and_store_customer_key(
           #("message", json.string("Failed to encrypt API key")),
         ])
       wisp.json_response(json.to_string_tree(error_json), 500)
+    }
+  }
+}
+
+// Add this type definition near the top with other types (around line 30)
+pub type BatchKeyRequest {
+  BatchKeyRequest(
+    key_name: String,
+    key_type: String,
+    key_value: String,
+    description: String,
+  )
+}
+
+// Add this decoder (around line 240 with other decoders)
+fn batch_key_decoder() -> decode.Decoder(BatchKeyRequest) {
+  use key_name <- decode.field("key_name", decode.string)
+  use key_type <- decode.field("key_type", decode.string)
+  use key_value <- decode.field("key_value", decode.string)
+  use description <- decode.field("description", decode.string)
+
+  decode.success(BatchKeyRequest(
+    key_name: key_name,
+    key_type: key_type,
+    key_value: key_value,
+    description: description,
+  ))
+}
+
+fn batch_request_decoder() -> decode.Decoder(List(BatchKeyRequest)) {
+  decode.field("keys", decode.list(batch_key_decoder()), decode.success)
+}
+
+// Add this endpoint function (around line 340 with other endpoints)
+/// BATCH UPSERT - POST /api/v1/businesses/{business_id}/keys/batch
+pub fn batch_upsert_business_keys(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Post)
+  use _ <- with_auth(req)
+  use json_data <- wisp.require_json(req)
+
+  let result = {
+    use keys_list <- result.try(decode.run(json_data, batch_request_decoder()))
+    Ok(process_batch_upsert(business_id, keys_list))
+  }
+
+  case result {
+    Ok(response) -> response
+    Error(decode_errors) -> {
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] Bad batch request: " <> string.inspect(decode_errors),
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Bad Request")),
+            #("message", json.string("Invalid batch key data")),
+          ]),
+        ),
+        400,
+      )
+    }
+  }
+}
+
+// Add these helper functions (around line 1100 with other helpers)
+fn process_batch_upsert(
+  business_id: String,
+  keys: List(BatchKeyRequest),
+) -> Response {
+  logging.log(
+    logging.Info,
+    "[KeyHandler] 🔄 Processing batch of "
+      <> int.to_string(list.length(keys))
+      <> " keys CONCURRENTLY",
+  )
+
+  // Fetch all keys ONCE before spawning processes
+  let existing_keys = case
+    supabase_client.get_integration_keys(business_id, None)
+  {
+    Ok(keys) -> keys
+    Error(_) -> []
+  }
+
+  // Create a subject for receiving results
+  let parent = process.new_subject()
+
+  // Spawn a process for each key using process.spawn
+  list.each(keys, fn(key_req) {
+    let parent_subject = parent
+    let _ =
+      process.spawn(fn() {
+        let result =
+          upsert_single_key_optimized(business_id, key_req, existing_keys)
+        // Send result back to parent
+        process.send(parent_subject, #(key_req.key_name, result))
+      })
+    Nil
+  })
+
+  // Collect results from all spawned processes
+  let results = collect_results(parent, list.length(keys), [])
+
+  // Count successes
+  let success_count =
+    list.count(results, fn(r) {
+      case r {
+        Ok(_) -> True
+        Error(_) -> False
+      }
+    })
+
+  let total_count = list.length(results)
+  let failure_count = total_count - success_count
+
+  // Get first error message if any
+  let error_message = case
+    list.find(results, fn(r) {
+      case r {
+        Error(_) -> True
+        _ -> False
+      }
+    })
+  {
+    Ok(Error(msg)) -> Some(msg)
+    _ -> None
+  }
+
+  logging.log(
+    logging.Info,
+    "[KeyHandler] ✅ Batch complete: "
+      <> int.to_string(success_count)
+      <> " succeeded, "
+      <> int.to_string(failure_count)
+      <> " failed",
+  )
+
+  case error_message {
+    None ->
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("success", json.bool(True)),
+            #("message", json.string("All keys updated successfully")),
+            #("updated_count", json.int(success_count)),
+            #("failed_count", json.int(0)),
+          ]),
+        ),
+        200,
+      )
+
+    Some(err_msg) -> {
+      let status_code = case failure_count == total_count {
+        True -> 400
+        False -> 207
+      }
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("success", json.bool(False)),
+            #("error", json.string(err_msg)),
+            #("updated_count", json.int(success_count)),
+            #("failed_count", json.int(failure_count)),
+          ]),
+        ),
+        status_code,
+      )
+    }
+  }
+}
+
+// Helper to collect results from spawned processes
+fn collect_results(
+  subject: process.Subject(#(String, Result(Nil, String))),
+  remaining: Int,
+  acc: List(Result(Nil, String)),
+) -> List(Result(Nil, String)) {
+  case remaining {
+    0 -> acc
+    _ -> {
+      case process.receive(subject, 5000) {
+        Ok(#(_key_name, result)) ->
+          collect_results(subject, remaining - 1, [result, ..acc])
+        Error(_) ->
+          collect_results(subject, remaining - 1, [Error("Timeout"), ..acc])
+      }
+    }
+  }
+}
+
+fn upsert_single_key_optimized(
+  business_id: String,
+  key_req: BatchKeyRequest,
+  existing_keys: List(IntegrationKey),
+) -> Result(Nil, String) {
+  logging.log(
+    logging.Info,
+    "[KeyHandler] Processing: " <> key_req.key_type <> "/" <> key_req.key_name,
+  )
+
+  // Check if key exists
+  let key_exists =
+    list.any(existing_keys, fn(k: IntegrationKey) {
+      k.key_name == key_req.key_name && k.key_type == key_req.key_type
+    })
+
+  case key_exists {
+    True -> {
+      logging.log(logging.Info, "[KeyHandler] 🔄 Updating existing key")
+      update_key_from_batch(business_id, key_req)
+    }
+    False -> {
+      logging.log(logging.Info, "[KeyHandler] ➕ Creating new key")
+      create_key_from_batch(business_id, key_req)
+    }
+  }
+}
+
+// Add this new UPDATE function
+fn update_key_from_batch(
+  business_id: String,
+  key_req: BatchKeyRequest,
+) -> Result(Nil, String) {
+  let _ = crypto.hash_api_key(key_req.key_value)
+
+  let encrypted_key_value = case key_req.key_type {
+    "stripe_frontend" -> Ok(key_req.key_value)
+    // Plaintext
+    "stripe" -> crypto.encrypt_string(key_req.key_value)
+    // Encrypted
+    _ -> {
+      let credentials =
+        dict.from_list([
+          #("api_key", key_req.key_value),
+          #("description", key_req.description),
+        ])
+      encrypt_credentials(credentials)
+    }
+  }
+
+  case encrypted_key_value {
+    Error(err) -> Error("Encryption failed: " <> err)
+    Ok(encrypted) -> {
+      case
+        supabase_client.update_integration_key(
+          business_id,
+          key_req.key_type,
+          key_req.key_name,
+          encrypted,
+        )
+      {
+        Ok(_) -> {
+          logging.log(logging.Info, "[KeyHandler] ✅ Updated key")
+          Ok(Nil)
+        }
+        Error(_) -> Error("Failed to update key")
+      }
+    }
+  }
+}
+
+fn create_key_from_batch(
+  business_id: String,
+  key_req: BatchKeyRequest,
+) -> Result(Nil, String) {
+  let api_key_hash = crypto.hash_api_key(key_req.key_value)
+
+  // Determine what to store in encrypted_key based on type
+  let encrypted_key_value = case key_req.key_type {
+    // PUBLIC keys (stripe_frontend): Store raw value, no encryption
+    "stripe_frontend" -> Ok(key_req.key_value)
+
+    // PRIVATE retrievable keys (stripe): Encrypt just the key value
+    "stripe" -> crypto.encrypt_string(key_req.key_value)
+
+    // BUSINESS keys: Encrypt full credentials object
+    _ -> {
+      let credentials =
+        dict.from_list([
+          #("api_key", key_req.key_value),
+          #("description", key_req.description),
+        ])
+      encrypt_credentials(credentials)
+    }
+  }
+
+  case encrypted_key_value {
+    Error(err) -> Error("Encryption failed: " <> err)
+    Ok(encrypted) -> {
+      // Just INSERT (delete already happened in upsert_single_key)
+      case
+        supabase_client.store_integration_key_with_hash(
+          business_id,
+          key_req.key_type,
+          key_req.key_name,
+          encrypted,
+          api_key_hash,
+          None,
+        )
+      {
+        Ok(_) -> {
+          logging.log(
+            logging.Info,
+            "[KeyHandler] ✅ Created key: "
+              <> key_req.key_type
+              <> "/"
+              <> key_req.key_name,
+          )
+          Ok(Nil)
+        }
+        Error(_) -> Error("Failed to create key")
+      }
+    }
+  }
+}
+
+/// GET Stripe configuration for frontend - /api/v1/businesses/{business_id}/stripe-config
+pub fn get_stripe_config(req: Request, business_id: String) -> Response {
+  use <- wisp.require_method(req, http.Get)
+  use _ <- with_auth(req)
+
+  logging.log(
+    logging.Warning,
+    "[KeyHandler] 🔍 FETCHING STRIPE CONFIG for: " <> business_id,
+  )
+
+  case supabase_client.get_integration_keys(business_id, None) {
+    Ok(keys) -> {
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] 📦 Retrieved "
+          <> int.to_string(list.length(keys))
+          <> " keys",
+      )
+
+      // Log all keys
+      list.each(keys, fn(k) {
+        logging.log(
+          logging.Warning,
+          "[KeyHandler] 🔑 Key: "
+            <> k.key_type
+            <> "/"
+            <> k.key_name
+            <> " (active: "
+            <> string.inspect(k.is_active)
+            <> ")",
+        )
+      })
+
+      // Find stripe_frontend keys (not encrypted)
+      let pricing_table =
+        list.find(keys, fn(k) {
+          k.key_type == "stripe_frontend"
+          && k.key_name == "stripe_pricing_table"
+          && k.is_active
+        })
+
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] 🎯 Pricing table found: "
+          <> string.inspect(result.is_ok(pricing_table)),
+      )
+
+      let publishable_key =
+        list.find(keys, fn(k) {
+          k.key_type == "stripe_frontend"
+          && k.key_name == "stripe_publishable_key"
+          && k.is_active
+        })
+
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] 🎯 Publishable key found: "
+          <> string.inspect(result.is_ok(publishable_key)),
+      )
+
+      // Find stripe backend keys (encrypted - don't expose values)
+      let webhook_secret =
+        list.find(keys, fn(k) {
+          k.key_type == "stripe"
+          && k.key_name == "stripe_webhook_secret"
+          && k.is_active
+        })
+
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] 🎯 Webhook secret found: "
+          <> string.inspect(result.is_ok(webhook_secret)),
+      )
+
+      let secret_key =
+        list.find(keys, fn(k) {
+          k.key_type == "stripe"
+          && k.key_name == "stripe_secret_key"
+          && k.is_active
+        })
+
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] 🎯 Secret key found: "
+          <> string.inspect(result.is_ok(secret_key)),
+      )
+
+      // Build response
+      let response =
+        json.object([
+          #("pricing_table_id", case pricing_table {
+            Ok(key) -> {
+              logging.log(
+                logging.Warning,
+                "[KeyHandler] 📤 Returning pricing_table_id: "
+                  <> key.encrypted_key,
+              )
+              json.string(key.encrypted_key)
+            }
+            Error(_) -> json.null()
+          }),
+          #("pricing_table_configured", json.bool(result.is_ok(pricing_table))),
+          #("publishable_key", case publishable_key {
+            Ok(key) -> {
+              logging.log(
+                logging.Warning,
+                "[KeyHandler] 📤 Returning publishable_key: "
+                  <> key.encrypted_key,
+              )
+              json.string(key.encrypted_key)
+            }
+            Error(_) -> json.null()
+          }),
+          #(
+            "publishable_key_configured",
+            json.bool(result.is_ok(publishable_key)),
+          ),
+          #(
+            "webhook_secret_configured",
+            json.bool(result.is_ok(webhook_secret)),
+          ),
+          #("secret_key_configured", json.bool(result.is_ok(secret_key))),
+        ])
+
+      logging.log(
+        logging.Warning,
+        "[KeyHandler] ✅ Returning Stripe config successfully",
+      )
+
+      wisp.json_response(json.to_string_tree(response), 200)
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Error,
+        "[KeyHandler] ❌ Failed to fetch keys for: " <> business_id,
+      )
+      wisp.internal_server_error()
     }
   }
 }
