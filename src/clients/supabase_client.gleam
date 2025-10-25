@@ -573,6 +573,82 @@ pub fn validate_api_key_with_retry(
 // ============================================================================
 // SUBSCRIPTION CANCELLATION - Customer Controlled
 // ============================================================================
+/// Get TrackTags customer by Stripe customer ID
+pub fn get_customer_by_stripe_customer_id(
+  business_id: String,
+  stripe_customer_id: String,
+) -> Result(customer_types.Customer, SupabaseError) {
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&stripe_customer_id=eq."
+    <> stripe_customer_id
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      case
+        json.parse(
+          response.body,
+          decode.list(customer_types.customer_decoder()),
+        )
+      {
+        Ok([customer, ..]) -> Ok(customer)
+        Ok([]) ->
+          Error(NotFound(
+            "Customer not found for Stripe customer: " <> stripe_customer_id,
+          ))
+        Error(_) -> Error(ParseError("Failed to parse customer"))
+      }
+    }
+    _ -> Error(DatabaseError("Failed to fetch customer"))
+  }
+}
+
+/// Link Stripe subscription to TrackTags customer
+pub fn link_stripe_subscription_to_customer(
+  business_id: String,
+  customer_id: String,
+  stripe_subscription_id: String,
+  stripe_customer_id: String,
+) -> Result(Nil, SupabaseError) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] Linking Stripe subscription to customer: " <> customer_id,
+  )
+
+  let update_json =
+    json.object([
+      #("stripe_customer_id", json.string(stripe_customer_id)),
+      #("stripe_subscription_id", json.string(stripe_subscription_id)),
+    ])
+
+  let path =
+    "/customers?business_id=eq."
+    <> business_id
+    <> "&customer_id=eq."
+    <> customer_id
+
+  use response <- result.try(make_request(
+    http.Patch,
+    path,
+    Some(json.to_string(update_json)),
+  ))
+
+  case response.status {
+    200 | 204 -> {
+      logging.log(
+        logging.Info,
+        "[SupabaseClient] ✅ Linked Stripe subscription to customer",
+      )
+      Ok(Nil)
+    }
+    404 -> Error(NotFound("Customer not found: " <> customer_id))
+    _ -> Error(DatabaseError("Failed to link subscription"))
+  }
+}
+
 /// Get customer by user_id
 pub fn get_customer_by_user_id(
   user_id: String,
