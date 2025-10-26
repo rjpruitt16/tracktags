@@ -327,24 +327,31 @@ fn validate_batch_interval(interval: String) -> String {
   }
 }
 
-/// Check if Supabase integration is enabled in metadata
 pub fn should_send_to_supabase(
   metric_type: MetricType,
   metadata: Option(MetricMetadata),
 ) -> Bool {
+  // Try to get explicit config from metadata
   case metadata {
     Some(meta) -> {
       case meta.integrations {
         Some(integrations) -> {
           case integrations.supabase {
             Some(supabase_config) -> supabase_config.enabled
-            None -> default_supabase_behavior(metric_type)
+            None -> type_default(metric_type)
           }
         }
-        None -> default_supabase_behavior(metric_type)
+        None -> type_default(metric_type)
       }
     }
-    None -> default_supabase_behavior(metric_type)
+    None -> type_default(metric_type)
+  }
+}
+
+fn type_default(metric_type: MetricType) -> Bool {
+  case metric_type {
+    Checkpoint -> True
+    Reset -> False
   }
 }
 

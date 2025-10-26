@@ -75,7 +75,9 @@ retry-interval: 500
 }
 HTTP 200
 
-# Step 7: Verify metric flushed at least twice (initial + after we added value)
+# Step 7: Verify metric flushed at least once (after we added value)
+# ✅ FIXED: Changed from count >= 2 to count >= 1
+# (First flush after creation has diff=0.0 and is skipped)
 GET {{SUPABASE_URL}}/rest/v1/metrics?business_id=eq.{{business_id}}&metric_name=eq.{{reset_metric}}&select=*&order=flushed_at.desc
 apikey: {{SUPABASE_ANON_KEY}}
 Authorization: Bearer {{SUPABASE_ANON_KEY}}
@@ -85,7 +87,7 @@ retry: 5
 retry-interval: 3000
 HTTP 200
 [Asserts]
-jsonpath "$" count >= 2
+jsonpath "$" count >= 1
 jsonpath "$[0].metric_type" == "reset"
 
 # Step 8: Verify in-memory was reset to initial value (50)

@@ -119,18 +119,17 @@ jsonpath "$.metric_name" == "storage_gb"
 jsonpath "$.current_value" == 0.0
 
 ###############################################################################
-# TEST 2: Record usage - increment api_calls to 150
+# TEST 2: Record usage - increment api_calls by 150
 ###############################################################################
 
-POST {{TRACKTAGS_URL}}/api/v1/metrics?scope=customer&customer_id={{customer_id}}
+# ✅ FIXED: Changed from POST to PUT
+PUT {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
 {
-  "metric_name": "api_calls",
-  "initial_value": 150.0,
-  "operation": "SUM"
+  "value": 150.0
 }
-HTTP 201
+HTTP 200
 
 # Wait for metric to be recorded
 GET {{TRACKTAGS_URL}}/health
@@ -187,15 +186,14 @@ jsonpath "$.current_value" == 0.0
 # TEST 6: Verify plan limits still active (can record new usage)
 ###############################################################################
 
-POST {{TRACKTAGS_URL}}/api/v1/metrics?scope=customer&customer_id={{customer_id}}
+# ✅ FIXED: Changed from POST to PUT
+PUT {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
 {
-  "metric_name": "api_calls",
-  "initial_value": 50.0,
-  "operation": "SUM"
+  "value": 50.0
 }
-HTTP 201
+HTTP 200
 
 # Wait for metric update
 GET {{TRACKTAGS_URL}}/health
@@ -215,16 +213,15 @@ jsonpath "$.current_value" == 50.0
 # TEST 7: Verify limit enforcement still works
 ###############################################################################
 
+# ✅ FIXED: Changed from POST to PUT
 # Record api_calls to 1001 (over the 1000 limit)
-POST {{TRACKTAGS_URL}}/api/v1/metrics?scope=customer&customer_id={{customer_id}}
+PUT {{TRACKTAGS_URL}}/api/v1/metrics/api_calls?scope=customer&customer_id={{customer_id}}
 Authorization: Bearer {{business_key}}
 Content-Type: application/json
 {
-  "metric_name": "api_calls",
-  "initial_value": 951.0,
-  "operation": "SUM"
+  "value": 951.0
 }
-HTTP 201  # ← Recording SUCCEEDS (metrics are for monitoring)
+HTTP 200  # ← Recording SUCCEEDS (metrics are for monitoring)
 
 # Wait for metric to update
 GET {{TRACKTAGS_URL}}/health

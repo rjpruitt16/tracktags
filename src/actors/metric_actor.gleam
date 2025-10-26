@@ -1,5 +1,4 @@
-//// Handle plan changes from customer actor
-
+/// Handle plan changes from customer actor
 import actors/supabase_actor
 import clients/stripe_client
 import clients/supabase_client
@@ -978,7 +977,7 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
               business_id: business_id,
               customer_id: customer_id,
               metric_name: state.default_metric.metric_name,
-              aggregated_value: current_value,
+              aggregated_value: diff,
               operation_count: 1,
               metric_type: metric_types.metric_type_to_string(state.metric_type),
               window_start: utils.current_timestamp(),
@@ -987,18 +986,17 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
                 state.metadata,
               ),
               scope: scope,
-              adapters: metric_types.metadata_to_adapters(state.metadata),
+              adapters: None,
               metric_mode: metric_types.Simple(
                 convert_metric_store_operation_to_simple(state.metric_operation),
               ),
             )
-
           case supabase_actor.send_metric_batch(batch) {
             Ok(_) -> {
               logging.log(
                 logging.Info,
-                "[MetricActor] ✅ Sent current value to SupabaseActor: "
-                  <> float.to_string(current_value),
+                "[MetricActor] ✅ Sent diff to SupabaseActor: "
+                  <> float.to_string(diff),
               )
               current_value
             }
@@ -1020,10 +1018,8 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
     }
   }
 
-  // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
     metric_types.Checkpoint -> {
-      // Both accumulate until explicitly reset
       logging.log(
         logging.Info,
         "[MetricActor] ✅ Accumulating metric (keeping current value)",
@@ -1047,7 +1043,7 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
       }
     }
   }
-  // ✅ Update state with new last_flushed_value
+
   actor.continue(
     State(
       ..state,
@@ -1103,156 +1099,75 @@ fn flush_metrics_and_get_state(state: State) -> State {
       <> float.to_string(diff),
   )
 
-  // Determine new last_flushed_value based on metric type
-  let new_last_flushed_value = case state.metric_type {
-    // Checkpoint and StripeBilling write to Supabase immediately via atomic increment
-    // So flush doesn't need to write again - just update our tracking
-    metric_types.Checkpoint -> {
+  let new_last_flushed_value = case
+    metric_types.should_send_to_supabase(state.metric_type, state.metadata)
+  {
+    False -> {
       logging.log(
-        logging.Info,
-        "[MetricActor] ✅ Checkpoint/StripeBilling already written atomically, updating flush marker",
+        logging.Debug,
+        "[MetricActor] Skipping Supabase for this metric type",
       )
-      current_value
+      state.last_flushed_value
     }
+    True -> {
+      case diff {
+        0.0 -> {
+          logging.log(
+            logging.Info,
+            "[MetricActor] 📊 No change since last flush, skipping Supabase",
+          )
+          state.last_flushed_value
+        }
+        _ -> {
+          let #(business_id, customer_id, scope) =
+            metric_types.parse_account_id(state.default_metric.account_id)
 
-    // Reset metrics need to flush to Supabase (if configured)
-    metric_types.Reset -> {
-      case
-        metric_types.should_send_to_supabase(state.metric_type, state.metadata)
-      {
-        True -> {
-          case diff {
-            0.0 -> {
+          // Determine aggregated value based on metric type
+          let aggregated_value = case state.metric_type {
+            metric_types.Checkpoint -> diff
+            // Incremental
+            metric_types.Reset -> current_value
+            // Full value
+          }
+
+          // ALWAYS batch - let SupabaseActor handle the write
+          let batch =
+            metric_types.MetricBatch(
+              business_id: business_id,
+              customer_id: customer_id,
+              metric_name: state.default_metric.metric_name,
+              aggregated_value: aggregated_value,
+              operation_count: 1,
+              metric_type: metric_types.metric_type_to_string(state.metric_type),
+              window_start: utils.current_timestamp(),
+              window_end: utils.current_timestamp(),
+              flush_interval: metric_types.get_supabase_batch_interval(
+                state.metadata,
+              ),
+              scope: scope,
+              adapters: None,
+              metric_mode: metric_types.Simple(
+                convert_metric_store_operation_to_simple(state.metric_operation),
+              ),
+            )
+
+          case supabase_actor.send_metric_batch(batch) {
+            Ok(_) -> {
               logging.log(
                 logging.Info,
-                "[MetricActor] 📊 No change since last flush, skipping Supabase",
+                "[MetricActor] ✅ Batched to SupabaseActor: "
+                  <> float.to_string(aggregated_value),
+              )
+              current_value
+            }
+            Error(e) -> {
+              logging.log(
+                logging.Warning,
+                "[MetricActor] ⚠️ Failed to batch: " <> e,
               )
               state.last_flushed_value
             }
-            _ -> {
-              let #(business_id, customer_id, scope) =
-                metric_types.parse_account_id(state.default_metric.account_id)
-
-              logging.log(
-                logging.Info,
-                "[MetricActor] 🔍 PARSED account_id='"
-                  <> state.default_metric.account_id
-                  <> "' -> business='"
-                  <> business_id
-                  <> "', customer='"
-                  <> string.inspect(customer_id)
-                  <> "', scope='"
-                  <> scope
-                  <> "'",
-              )
-
-              let supabase_batch_interval =
-                metric_types.get_supabase_batch_interval(state.metadata)
-              let current_tick_interval = state.tick_type
-
-              logging.log(
-                logging.Info,
-                "[MetricActor] 🔍 Comparing intervals: supabase="
-                  <> supabase_batch_interval
-                  <> ", current="
-                  <> current_tick_interval,
-              )
-
-              case supabase_batch_interval == current_tick_interval {
-                True -> {
-                  logging.log(
-                    logging.Info,
-                    "[MetricActor] 🚀 Same interval flush (immediate): "
-                      <> supabase_batch_interval,
-                  )
-                  case
-                    supabase_client.store_metric(
-                      business_id,
-                      customer_id,
-                      state.default_metric.metric_name,
-                      float.to_string(current_value),
-                      metric_types.metric_type_to_string(state.metric_type),
-                      scope,
-                      None,
-                      None,
-                      None,
-                      None,
-                      None,
-                    )
-                  {
-                    Ok(_) -> {
-                      logging.log(
-                        logging.Info,
-                        "[MetricActor] ✅ Direct flush to Supabase: "
-                          <> float.to_string(diff),
-                      )
-                      current_value
-                    }
-                    Error(e) -> {
-                      logging.log(
-                        logging.Warning,
-                        "[MetricActor] ⚠️ Direct flush failed: "
-                          <> string.inspect(e),
-                      )
-                      state.last_flushed_value
-                    }
-                  }
-                }
-                False -> {
-                  logging.log(
-                    logging.Info,
-                    "[MetricActor] 📦 Batching for later flush: "
-                      <> supabase_batch_interval,
-                  )
-                  let batch =
-                    metric_types.MetricBatch(
-                      business_id: business_id,
-                      customer_id: customer_id,
-                      metric_name: state.default_metric.metric_name,
-                      aggregated_value: current_value,
-                      operation_count: 1,
-                      metric_type: metric_types.metric_type_to_string(
-                        state.metric_type,
-                      ),
-                      window_start: utils.current_timestamp(),
-                      window_end: utils.current_timestamp(),
-                      flush_interval: supabase_batch_interval,
-                      scope: scope,
-                      adapters: None,
-                      metric_mode: metric_types.Simple(
-                        convert_metric_store_operation_to_simple(
-                          state.metric_operation,
-                        ),
-                      ),
-                    )
-                  case supabase_actor.send_metric_batch(batch) {
-                    Ok(_) -> {
-                      logging.log(
-                        logging.Info,
-                        "[MetricActor] ✅ Sent diff to SupabaseActor: "
-                          <> float.to_string(diff),
-                      )
-                      current_value
-                    }
-                    Error(e) -> {
-                      logging.log(
-                        logging.Warning,
-                        "[MetricActor] ⚠️ Failed: " <> e,
-                      )
-                      state.last_flushed_value
-                    }
-                  }
-                }
-              }
-            }
           }
-        }
-        False -> {
-          logging.log(
-            logging.Debug,
-            "[MetricActor] Skipping Supabase for this metric type",
-          )
-          state.last_flushed_value
         }
       }
     }

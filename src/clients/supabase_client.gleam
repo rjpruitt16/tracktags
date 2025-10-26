@@ -3336,6 +3336,7 @@ pub fn increment_checkpoint_atomic(
   customer_id: Option(String),
   metric_name: String,
   delta: Float,
+  scope: String,
   tags: Dict(String, String),
 ) -> Result(Float, SupabaseError) {
   let tags_json =
@@ -3346,7 +3347,6 @@ pub fn increment_checkpoint_atomic(
         #(k, json.string(v))
       }),
     )
-
   let body =
     json.object([
       #("p_business_id", json.string(business_id)),
@@ -3355,7 +3355,8 @@ pub fn increment_checkpoint_atomic(
         None -> json.null()
       }),
       #("p_metric_name", json.string(metric_name)),
-      #("p_increment", json.float(delta)),
+      #("p_delta", json.float(delta)),
+      #("p_scope", json.string(scope)),
       #("p_tags", tags_json),
     ])
     |> json.to_string()
@@ -3368,46 +3369,53 @@ pub fn increment_checkpoint_atomic(
 
   case response.status {
     200 -> {
-      // Decoder that tries int first, converts to float
-      let int_decoder = {
-        use i <- decode.field("new_value", decode.int)
-        decode.success(int.to_float(i))
-      }
-
-      // Decoder that tries float directly
-      let float_decoder = {
-        use f <- decode.field("new_value", decode.float)
-        decode.success(f)
-      }
-
-      // Try float first, then int
-      case json.parse(response.body, decode.list(float_decoder)) {
-        Ok([new_value, ..]) -> {
+      // RPC now returns NUMERIC directly (not a table)
+      // Response body is just a number like: 150.0
+      case json.parse(response.body, decode.float) {
+        Ok(new_value) -> {
           logging.log(
             logging.Info,
-            "✅ Atomic increment success: " <> float.to_string(new_value),
+            "[SupabaseClient] ✅ Atomic increment success: "
+              <> metric_name
+              <> " = "
+              <> float.to_string(new_value),
           )
           Ok(new_value)
         }
-        Ok([]) -> Error(ParseError("Empty response from increment RPC"))
         Error(_) -> {
-          // Retry with int decoder
-          case json.parse(response.body, decode.list(int_decoder)) {
-            Ok([new_value, ..]) -> {
+          // Try parsing as int and convert to float
+          case json.parse(response.body, decode.int) {
+            Ok(int_value) -> {
+              let new_value = int.to_float(int_value)
               logging.log(
                 logging.Info,
-                "✅ Atomic increment success (from int): "
+                "[SupabaseClient] ✅ Atomic increment success (from int): "
                   <> float.to_string(new_value),
               )
               Ok(new_value)
             }
-            Ok([]) -> Error(ParseError("Empty response from increment RPC"))
-            Error(_) -> Error(ParseError("Invalid response: " <> response.body))
+            Error(_) -> {
+              logging.log(
+                logging.Error,
+                "[SupabaseClient] ❌ Failed to parse RPC response: "
+                  <> response.body,
+              )
+              Error(ParseError("Invalid response: " <> response.body))
+            }
           }
         }
       }
     }
-    _ -> Error(ParseError("RPC failed: " <> int.to_string(response.status)))
+    _ -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseClient] ❌ RPC failed: "
+          <> int.to_string(response.status)
+          <> " | body: "
+          <> response.body,
+      )
+      Error(ParseError("RPC failed: " <> int.to_string(response.status)))
+    }
   }
 }
 

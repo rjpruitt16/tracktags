@@ -356,6 +356,7 @@ fn flush_interval_to_supabase(
                   batch.customer_id,
                   batch.metric_name,
                   batch.aggregated_value,
+                  batch.scope,
                   dict.new(),
                 )
               {
