@@ -19,7 +19,6 @@ import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
 
-// Add this new event type
 pub type StripeEventType {
   InvoicePaymentSucceeded
   CustomerSubscriptionCreated
@@ -31,16 +30,15 @@ pub type StripeEventType {
   UnknownEvent(String)
 }
 
-// It SHOULD have:
 pub type StripeData {
   StripeData(
-    customer: String,
+    customer: Option(String),
     subscription_id: Option(String),
     status: Option(String),
+    client_reference_id: Option(String),
     price_id: Option(String),
     metadata: Option(Dict(String, String)),
     current_period_end: Option(Int),
-    client_reference_id: Option(String),
   )
 }
 
@@ -432,37 +430,41 @@ pub fn parse_stripe_event(json_string: String) -> Result(StripeEvent, String) {
 }
 
 fn stripe_data_decoder() -> decode.Decoder(StripeData) {
-  use customer <- decode.field("customer", decode.string)
+  use customer <- decode.field("customer", decode.optional(decode.string))
   use subscription_id <- decode.field(
     "subscription",
     decode.optional(decode.string),
   )
   use status <- decode.field("status", decode.optional(decode.string))
-  use price_id <- decode.field(
-    "plan",
-    decode.optional(decode.field("id", decode.string, decode.success)),
+  use client_reference_id <- decode.optional_field(
+    "client_reference_id",
+    None,
+    decode.optional(decode.string),
   )
-  use metadata <- decode.field(
+  use price_id <- decode.optional_field(
+    "price_id",
+    None,
+    decode.optional(decode.string),
+  )
+  use metadata <- decode.optional_field(
     "metadata",
+    None,
     decode.optional(decode.dict(decode.string, decode.string)),
   )
-  use current_period_end <- decode.field(
+  use current_period_end <- decode.optional_field(
     "current_period_end",
+    None,
     decode.optional(decode.int),
-  )
-  use client_reference_id <- decode.field(
-    "client_reference_id",
-    decode.optional(decode.string),
   )
 
   decode.success(StripeData(
     customer: customer,
     subscription_id: subscription_id,
     status: status,
+    client_reference_id: client_reference_id,
     price_id: price_id,
     metadata: metadata,
     current_period_end: current_period_end,
-    client_reference_id: client_reference_id,
   ))
 }
 
@@ -853,14 +855,22 @@ fn handle_subscription_deleted(event: StripeEvent) -> WebhookResult {
   }
 }
 
-// DELETE handle_subscription_cancellation entirely
 fn extract_subscription_data(
   data: StripeData,
 ) -> Result(#(String, String, String), String) {
-  let status = option.unwrap(data.status, "active")
-  let price_id = option.unwrap(data.price_id, "price_unknown")
-
-  Ok(#(data.customer, price_id, status))
+  use customer <- result.try(
+    data.customer
+    |> option.to_result("Missing customer in subscription data"),
+  )
+  use price_id <- result.try(
+    data.price_id
+    |> option.to_result("Missing price_id in subscription data"),
+  )
+  use status <- result.try(
+    data.status
+    |> option.to_result("Missing status in subscription data"),
+  )
+  Ok(#(customer, price_id, status))
 }
 
 // Handle payment failure with graceful degradation
@@ -903,9 +913,9 @@ fn handle_payment_failure_gracefully(
   }
 }
 
-/// Extract Stripe customer ID from webhook data
 fn extract_customer_id(data: StripeData) -> Result(String, String) {
-  Ok(data.customer)
+  data.customer
+  |> option.to_result("Missing customer ID in event data")
 }
 
 /// Update business plan after successful payment
@@ -1087,7 +1097,7 @@ fn verify_and_process_customer(
           // REUSE existing parsing and processing
           case parse_stripe_event(body) {
             Error(error) -> InvalidPayload(error)
-            Ok(event) -> process_business_stripe_event(event, business_id)
+            Ok(event) -> process_business_stripe_event(business_id, event)
           }
         }
       }
@@ -1116,51 +1126,52 @@ fn get_customer_webhook_secret(business_id: String) -> Result(String, String) {
 }
 
 fn process_business_stripe_event(
-  event: StripeEvent,
   business_id: String,
+  event: StripeEvent,
 ) -> WebhookResult {
-  {
-    case event.event_type {
-      CheckoutSessionCompleted -> {
-        // Extract client_reference_id
+  case event.event_type {
+    CheckoutSessionCompleted -> {
+      let result = {
         use client_reference_id <- result.try(
           event.data.client_reference_id
-          // Read directly from data field
           |> option.to_result("Missing client_reference_id")
           |> result.map_error(ProcessingError),
         )
-
-        // Extract subscription info
+        use stripe_customer_id <- result.try(
+          event.data.customer
+          |> option.to_result("Missing customer")
+          |> result.map_error(ProcessingError),
+        )
         use stripe_subscription_id <- result.try(
           event.data.subscription_id
           |> option.to_result("Missing subscription_id")
           |> result.map_error(ProcessingError),
         )
-
-        // Link Stripe subscription to TrackTags customer
-        case
+        use _ <- result.try(
           supabase_client.link_stripe_subscription_to_customer(
             business_id,
             client_reference_id,
+            stripe_customer_id,
             stripe_subscription_id,
-            event.data.customer,
           )
-        {
-          Ok(_) ->
-            Ok(Success(
-              "Linked subscription to customer: " <> client_reference_id,
-            ))
-          Error(e) ->
-            Ok(ProcessingError("Failed to link: " <> string.inspect(e)))
-        }
+          |> result.map_error(fn(e) {
+            ProcessingError("Failed to link: " <> string.inspect(e))
+          }),
+        )
+        Ok(Success("Linked subscription to customer: " <> client_reference_id))
       }
-      CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
+      case result {
+        Ok(success) -> success
+        Error(e) -> e
+      }
+    }
+
+    CustomerSubscriptionCreated | CustomerSubscriptionUpdated -> {
+      let result = {
         use stripe_customer_id <- result.try(
           extract_customer_id(event.data)
           |> result.map_error(ProcessingError),
         )
-
-        // Look up TrackTags customer by Stripe customer ID
         use customer <- result.try(
           supabase_client.get_customer_by_stripe_customer_id(
             business_id,
@@ -1168,26 +1179,21 @@ fn process_business_stripe_event(
           )
           |> result.map_error(fn(_) {
             ProcessingError(
-              "No TrackTags customer found for Stripe customer: "
-              <> stripe_customer_id,
+              "No customer found for stripe_customer_id: " <> stripe_customer_id,
             )
           }),
         )
-
-        // Now we have the customer_id, proceed with plan update
         use price_id <- result.try(
           event.data.price_id
           |> option.to_result("Missing price_id")
           |> result.map_error(ProcessingError),
         )
-
         use plan <- result.try(
           supabase_client.get_plan_by_stripe_price_id(business_id, price_id)
           |> result.map_error(fn(_) {
             ProcessingError("Plan not found for price_id: " <> price_id)
           }),
         )
-
         use _ <- result.try(
           supabase_client.update_customer_plan(
             business_id,
@@ -1199,8 +1205,6 @@ fn process_business_stripe_event(
             ProcessingError("Failed to update customer: " <> string.inspect(e))
           }),
         )
-
-        // Notify customer actor
         let registry_key =
           "client:" <> business_id <> ":" <> customer.customer_id
         case
@@ -1217,23 +1221,53 @@ fn process_business_stripe_event(
           }
           Error(_) -> Nil
         }
-
         Ok(Success("Customer upgraded to plan: " <> plan.plan_name))
       }
-      CustomerSubscriptionDeleted -> {
+      case result {
+        Ok(success) -> success
+        Error(e) -> e
+      }
+    }
+
+    CustomerSubscriptionDeleted -> {
+      Success("Customer subscription deleted for business: " <> business_id)
+    }
+
+    InvoicePaymentSucceeded -> {
+      let result = {
+        use #(stripe_customer_id, _price_id, _status) <- result.try(
+          extract_subscription_data(event.data)
+          |> result.map_error(ProcessingError),
+        )
+        use customer <- result.try(
+          supabase_client.get_customer_by_stripe_customer_id(
+            business_id,
+            stripe_customer_id,
+          )
+          |> result.map_error(fn(e) {
+            ProcessingError("Failed to find customer: " <> string.inspect(e))
+          }),
+        )
         Ok(Success(
-          "Customer subscription deleted for business: " <> business_id,
+          "Invoice payment successful for customer: " <> customer.customer_id,
         ))
       }
-      _ ->
-        Ok(Success("Event acknowledged: " <> string.inspect(event.event_type)))
+      case result {
+        Ok(success) -> success
+        Error(e) -> e
+      }
     }
-  }
-  // Replace result.unwrap_both with case expression
-  |> fn(res) {
-    case res {
-      Ok(webhook_result) -> webhook_result
-      Error(webhook_result) -> webhook_result
+
+    InvoiceFinalized -> {
+      Success("Invoice finalized for business: " <> business_id)
+    }
+
+    InvoicePaymentFailed -> {
+      Success("Invoice payment failed for business: " <> business_id)
+    }
+
+    UnknownEvent(_) -> {
+      Success("Unknown event acknowledged")
     }
   }
 }
@@ -1270,7 +1304,7 @@ pub fn fetch_and_process_business_stripe_event(
           case parse_stripe_event(event_json) {
             Error(error) -> Error("Failed to parse Stripe event: " <> error)
             Ok(event) -> {
-              case process_business_stripe_event(event, business_id) {
+              case process_business_stripe_event(business_id, event) {
                 Success(message) -> Ok(message)
                 InvalidSignature -> Error("Invalid signature")
                 InvalidPayload(error) -> Error("Invalid payload: " <> error)

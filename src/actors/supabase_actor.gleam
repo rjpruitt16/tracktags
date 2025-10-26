@@ -336,15 +336,97 @@ fn flush_interval_to_supabase(
           <> tick_type,
       )
 
-      // Convert MetricBatch list to MetricRecord list
-      let metric_records = list.map(metric_batches, batch_to_metric_record)
+      // ✅ Process each batch according to its metric type
+      let results =
+        list.map(metric_batches, fn(batch) {
+          case batch.metric_type {
+            "checkpoint" -> {
+              // ✅ Use atomic checkpoint function for distributed coordination
+              logging.log(
+                logging.Info,
+                "[SupabaseActor] 📊 Checkpoint batch: "
+                  <> batch.metric_name
+                  <> " = "
+                  <> float.to_string(batch.aggregated_value),
+              )
 
-      // Send to Supabase in single batch
-      case supabase_client.store_metrics_batch(metric_records) {
-        Ok(_) -> {
+              case
+                supabase_client.increment_checkpoint_atomic(
+                  batch.business_id,
+                  batch.customer_id,
+                  batch.metric_name,
+                  batch.aggregated_value,
+                  dict.new(),
+                )
+              {
+                Ok(new_value) -> {
+                  logging.log(
+                    logging.Info,
+                    "[SupabaseActor] ✅ Checkpoint atomic increment: "
+                      <> batch.metric_name
+                      <> " -> "
+                      <> float.to_string(new_value),
+                  )
+                  Ok(Nil)
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Error,
+                    "[SupabaseActor] ❌ Checkpoint atomic failed: "
+                      <> string.inspect(e),
+                  )
+                  Error(e)
+                }
+              }
+            }
+
+            _ -> {
+              // ✅ Regular insert for reset and other metrics
+              logging.log(
+                logging.Info,
+                "[SupabaseActor] 📊 Reset/Regular batch: "
+                  <> batch.metric_name
+                  <> " = "
+                  <> float.to_string(batch.aggregated_value),
+              )
+
+              let record = batch_to_metric_record(batch)
+              case supabase_client.store_metrics_batch([record]) {
+                Ok(_) -> {
+                  logging.log(
+                    logging.Info,
+                    "[SupabaseActor] ✅ Regular insert: " <> batch.metric_name,
+                  )
+                  Ok(Nil)
+                }
+                Error(e) -> {
+                  logging.log(
+                    logging.Error,
+                    "[SupabaseActor] ❌ Regular insert failed: "
+                      <> string.inspect(e),
+                  )
+                  Error(e)
+                }
+              }
+            }
+          }
+        })
+
+      // Check if all succeeded
+      let all_succeeded =
+        list.all(results, fn(result) {
+          case result {
+            Ok(_) -> True
+            Error(_) -> False
+          }
+        })
+
+      case all_succeeded {
+        True -> {
           logging.log(
             logging.Info,
-            "[SupabaseActor] ✅ Batch insert successful for " <> tick_type,
+            "[SupabaseActor] ✅ All batches flushed successfully for "
+              <> tick_type,
           )
 
           // Clear the batches after successful flush
@@ -361,13 +443,10 @@ fn flush_interval_to_supabase(
               )
           }
         }
-        Error(error) -> {
+        False -> {
           logging.log(
             logging.Error,
-            "[SupabaseActor] ❌ Batch insert failed for "
-              <> tick_type
-              <> ": "
-              <> string.inspect(error),
+            "[SupabaseActor] ❌ Some batches failed for " <> tick_type,
           )
           // Keep batches for retry (don't clear on failure)
         }

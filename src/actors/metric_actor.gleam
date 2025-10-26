@@ -238,7 +238,7 @@ pub fn start_link(
 
   // Create the metric in ETS
   let restored_value = case
-    metric_types.should_restore_on_startup(state.metric_type, state.metadata)
+    metric_types.should_restore_on_startup(state.metric_type)
   {
     True -> {
       // User wants restoration (Checkpoint always, StripeBilling if configured)
@@ -530,121 +530,58 @@ fn handle_message(state: State, message: Message) -> actor.Next(State, Message) 
       case state.is_breached && state.breach_action == "disabled" {
         True -> actor.continue(state)
         False -> {
-          // Determine if we should use atomic Supabase or ETS
-          case state.metric_type {
-            // Checkpoint and StripeBilling need atomic updates across servers
-            metric_types.Checkpoint | metric_types.StripeBilling -> {
-              let #(business_id, customer_id, _) =
-                metric_types.parse_account_id(state.default_metric.account_id)
+          case
+            metric_store.add_value(
+              state.default_metric.account_id,
+              state.default_metric.metric_name,
+              metric.value,
+            )
+          {
+            Ok(new_value) -> {
+              logging.log(
+                logging.Info,
+                "[MetricActor] ✅ Value updated in ETS: "
+                  <> float.to_string(new_value)
+                  <> " (type: "
+                  <> metric_types.metric_type_to_string(state.metric_type)
+                  <> ")",
+              )
 
-              case
-                supabase_client.increment_checkpoint_atomic(
-                  business_id,
-                  customer_id,
-                  state.default_metric.metric_name,
-                  metric.value,
-                  metric.tags,
+              let updated_current_metric =
+                metric_types.Metric(
+                  ..state.current_metric,
+                  value: new_value,
+                  timestamp: utils.current_timestamp(),
                 )
-              {
-                Ok(new_value) -> {
+
+              let new_breach_state = check_plan_breach(new_value, state)
+              let next_state =
+                State(
+                  ..state,
+                  is_breached: new_breach_state,
+                  current_metric: updated_current_metric,
+                )
+
+              case new_breach_state != state.is_breached {
+                True ->
                   logging.log(
-                    logging.Info,
-                    "[MetricActor] ✅ Atomic increment: "
-                      <> state.default_metric.metric_name
-                      <> " = "
-                      <> float.to_string(new_value),
+                    logging.Warning,
+                    "[MetricActor] 🚨 BREACH STATE CHANGED: "
+                      <> string.inspect(new_breach_state)
+                      <> " action="
+                      <> next_state.breach_action,
                   )
-
-                  // Update ETS cache to match Supabase
-                  let _ =
-                    metric_store.reset_metric(
-                      state.default_metric.account_id,
-                      state.default_metric.metric_name,
-                      new_value,
-                    )
-
-                  // Update state
-                  let updated_current_metric =
-                    metric_types.Metric(
-                      ..state.current_metric,
-                      value: new_value,
-                      timestamp: utils.current_timestamp(),
-                    )
-
-                  let new_breach_state = check_plan_breach(new_value, state)
-
-                  actor.continue(
-                    State(
-                      ..state,
-                      is_breached: new_breach_state,
-                      current_metric: updated_current_metric,
-                    ),
-                  )
-                }
-                Error(e) -> {
-                  logging.log(
-                    logging.Error,
-                    "[MetricActor] ❌ Atomic increment failed: "
-                      <> string.inspect(e),
-                  )
-                  actor.continue(state)
-                }
+                False -> Nil
               }
+
+              actor.continue(next_state)
             }
-
-            // Reset metrics use ETS only (existing behavior)
-            metric_types.Reset -> {
-              case
-                metric_store.add_value(
-                  state.default_metric.account_id,
-                  state.default_metric.metric_name,
-                  metric.value,
-                )
-              {
-                Ok(new_value) -> {
-                  logging.log(
-                    logging.Info,
-                    "[MetricActor] Value updated: "
-                      <> float.to_string(new_value),
-                  )
-
-                  let updated_current_metric =
-                    metric_types.Metric(
-                      ..state.current_metric,
-                      value: new_value,
-                      timestamp: utils.current_timestamp(),
-                    )
-
-                  let new_breach_state = check_plan_breach(new_value, state)
-                  let next_state =
-                    State(
-                      ..state,
-                      is_breached: new_breach_state,
-                      current_metric: updated_current_metric,
-                    )
-
-                  case new_breach_state != state.is_breached {
-                    True ->
-                      logging.log(
-                        logging.Warning,
-                        "[MetricActor] 🚨 BREACH STATE CHANGED: "
-                          <> string.inspect(new_breach_state)
-                          <> " action="
-                          <> next_state.breach_action,
-                      )
-                    False -> Nil
-                  }
-
-                  actor.continue(next_state)
-                }
-                Error(e) -> {
-                  logging.log(
-                    logging.Error,
-                    "[MetricActor] Store error: " <> string.inspect(e),
-                  )
-                  actor.continue(state)
-                }
-              }
+            Error(e) -> {
+              logging.log(
+                logging.Error,
+                "[MetricActor] ❌ Store error: " <> string.inspect(e),
+              )
+              actor.continue(state)
             }
           }
         }
@@ -1085,7 +1022,7 @@ fn flush_metrics(state: State) -> actor.Next(State, Message) {
 
   // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
-    metric_types.Checkpoint | metric_types.StripeBilling -> {
+    metric_types.Checkpoint -> {
       // Both accumulate until explicitly reset
       logging.log(
         logging.Info,
@@ -1170,7 +1107,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
   let new_last_flushed_value = case state.metric_type {
     // Checkpoint and StripeBilling write to Supabase immediately via atomic increment
     // So flush doesn't need to write again - just update our tracking
-    metric_types.Checkpoint | metric_types.StripeBilling -> {
+    metric_types.Checkpoint -> {
       logging.log(
         logging.Info,
         "[MetricActor] ✅ Checkpoint/StripeBilling already written atomically, updating flush marker",
@@ -1323,7 +1260,7 @@ fn flush_metrics_and_get_state(state: State) -> State {
 
   // Handle metric type specific behavior (reset vs checkpoint)
   case state.metric_type {
-    metric_types.Checkpoint | metric_types.StripeBilling -> {
+    metric_types.Checkpoint -> {
       logging.log(
         logging.Info,
         "[MetricActor] ✅ Accumulating metric (keeping current value)",
