@@ -661,19 +661,6 @@ fn handle_message(
 
           // TRACK STRIPE BILLING METRICS HERE TOO!
           let final_state = case metric_type {
-            metric_types.StripeBilling -> {
-              case
-                list.contains(updated_state.stripe_billing_metrics, metric_name)
-              {
-                True -> updated_state
-                // Already tracked
-                False ->
-                  State(..updated_state, stripe_billing_metrics: [
-                    metric_name,
-                    ..updated_state.stripe_billing_metrics
-                  ])
-              }
-            }
             _ -> updated_state
           }
 
@@ -760,22 +747,6 @@ fn handle_message(
 
               // TRACK STRIPE BILLING METRICS AFTER SPAWNING
               let final_state = case metric_type {
-                metric_types.StripeBilling -> {
-                  case
-                    list.contains(
-                      updated_state.stripe_billing_metrics,
-                      metric_name,
-                    )
-                  {
-                    True -> updated_state
-                    // Already tracked
-                    False ->
-                      State(..updated_state, stripe_billing_metrics: [
-                        metric_name,
-                        ..updated_state.stripe_billing_metrics
-                      ])
-                  }
-                }
                 _ -> updated_state
               }
 

@@ -47,7 +47,6 @@ pub type MetricScope {
 pub type MetricType {
   Reset
   Checkpoint
-  StripeBilling
 }
 
 pub type Metric {
@@ -244,8 +243,6 @@ pub fn metric_type_to_string(metric_type: MetricType) -> String {
   case metric_type {
     Reset -> "reset"
     Checkpoint -> "checkpoint"
-    StripeBilling -> "stripe_billing"
-    // ✅ NEW
   }
 }
 
@@ -253,7 +250,6 @@ pub fn string_to_metric_type(metric_type: String) -> MetricType {
   case metric_type {
     "reset" -> Reset
     "checkpoint" -> Checkpoint
-    "stripe_billing" -> StripeBilling
     _ -> Checkpoint
   }
 }
@@ -311,17 +307,6 @@ pub fn handle_metric_types_flush(
       )
       Nil
     }
-    StripeBilling -> {
-      // ✅ NEW: StripeBilling behaves like Reset but with billing cycle awareness
-      logging.log(
-        logging.Info,
-        "[MetricActor] 💳 StripeBilling metric - checking for billing cycle reset",
-      )
-      // For now, just reset like a normal Reset metric
-      // TODO: Add billing cycle check logic
-      let _ = metric_store.reset_metric(account_id, metric_name, initial_value)
-      Nil
-    }
   }
 }
 
@@ -330,7 +315,6 @@ fn default_supabase_behavior(metric_type: MetricType) -> Bool {
   case metric_type {
     Checkpoint -> False
     Reset -> False
-    StripeBilling -> False
   }
 }
 
@@ -599,41 +583,14 @@ fn supabase_config_decoder() -> decode.Decoder(SupabaseConfig) {
 }
 
 /// Check if metric should restore from DB on startup
-pub fn should_restore_on_startup(
-  metric_type: MetricType,
-  metadata: Option(MetricMetadata),
-) -> Bool {
+pub fn should_restore_on_startup(metric_type: MetricType) -> Bool {
   case metric_type {
     // Checkpoint ALWAYS restores (that's its purpose)
     Checkpoint -> True
 
     // Reset NEVER restores (always starts fresh)
     Reset -> False
-
     // StripeBilling lets user decide (default: false for safety)
-    StripeBilling -> {
-      case metadata {
-        Some(meta) -> {
-          case meta.integrations {
-            Some(integrations) -> {
-              case integrations.supabase {
-                Some(config) -> {
-                  // User explicitly controls restoration
-                  case config.restore_on_startup {
-                    Some(restore) -> restore
-                    None -> False
-                    // DEFAULT: Safe mode (no restore)
-                  }
-                }
-                None -> False
-              }
-            }
-            None -> False
-          }
-        }
-        None -> False
-      }
-    }
   }
 }
 
