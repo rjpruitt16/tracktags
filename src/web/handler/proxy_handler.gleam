@@ -23,6 +23,7 @@ import types/customer_types
 import types/metric_types
 import utils/auth
 import utils/cachex
+import utils/crypto
 import utils/utils
 import wisp.{type Request, type Response}
 
@@ -713,6 +714,7 @@ fn forward_request_to_target(
         logging.Warning,
         "[ProxyHandler] Domain not authorized: " <> domain,
       )
+
       wisp.json_response(
         json.to_string_tree(
           json.object([
@@ -852,12 +854,14 @@ fn forward_request_to_target(
                         int.to_string(list.length(ctx.machines)),
                       )
                       |> request.set_header("X-TrackTags-Proxied", "true")
+                      |> add_webhook_secret_headers(business_id)
                     }
                     metric_types.Business(bid), _ -> {
                       req_with_headers
                       |> request.set_header("X-TrackTags-Business-Id", bid)
                       |> request.set_header("X-TrackTags-Scope", "business")
                       |> request.set_header("X-TrackTags-Proxied", "true")
+                      |> add_webhook_secret_headers(business_id)
                     }
                     _, _ -> {
                       req_with_headers
@@ -1716,5 +1720,169 @@ fn is_subscription_expired(ends_at: Option(String)) -> Bool {
       }
     }
     None -> False
+  }
+}
+
+// Fetch business webhook secrets from Supabase
+fn get_business_secrets(
+  business_id: String,
+) -> Result(#(String, Option(String)), String) {
+  logging.log(
+    logging.Info,
+    "[ProxyHandler] 🔍 Fetching webhook secrets for business",
+  )
+
+  case
+    supabase_client.get_integration_keys(business_id, Some("webhook_secret"))
+  {
+    Ok(keys) -> {
+      // Filter active webhook_secret keys
+      let active_secrets =
+        list.filter(keys, fn(k) {
+          k.is_active && k.key_type == "webhook_secret"
+        })
+
+      case active_secrets {
+        [] -> {
+          logging.log(
+            logging.Info,
+            "[ProxyHandler] 📭 No webhook secrets configured",
+          )
+          Error("No webhook secrets configured")
+        }
+        [key] -> {
+          // Only one key exists
+          case decrypt_secret_key(key.encrypted_key) {
+            Ok(secret) -> {
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] ✅ Found one webhook secret",
+              )
+              Ok(#(secret, None))
+            }
+            Error(e) -> Error(e)
+          }
+        }
+        [key1, key2, ..] -> {
+          // Both keys exist
+          let secret1_result = decrypt_secret_key(key1.encrypted_key)
+          let secret2_result = decrypt_secret_key(key2.encrypted_key)
+
+          case secret1_result, secret2_result {
+            Ok(secret1), Ok(secret2) -> {
+              logging.log(
+                logging.Info,
+                "[ProxyHandler] ✅ Found two webhook secrets",
+              )
+              // Determine which is primary/secondary by key_name
+              case key1.key_name, key2.key_name {
+                "primary", _ -> Ok(#(secret1, Some(secret2)))
+                _, "primary" -> Ok(#(secret2, Some(secret1)))
+                _, _ -> Ok(#(secret1, Some(secret2)))
+                // Default: first is primary
+              }
+            }
+            Ok(secret1), Error(_) -> {
+              logging.log(
+                logging.Warning,
+                "[ProxyHandler] ⚠️ Secondary secret failed to decrypt",
+              )
+              Ok(#(secret1, None))
+            }
+            Error(e), _ -> Error(e)
+          }
+        }
+      }
+    }
+    Error(_) -> {
+      logging.log(
+        logging.Warning,
+        "[ProxyHandler] ❌ Failed to fetch integration keys",
+      )
+      Error("Failed to fetch webhook secrets")
+    }
+  }
+}
+
+// Decrypt a single secret key from encrypted JSON
+fn decrypt_secret_key(encrypted_json: String) -> Result(String, String) {
+  // Use the crypto module's decrypt_from_json function
+  use credentials_json <- result.try(
+    crypto.decrypt_from_json(encrypted_json)
+    |> result.map_error(fn(_e) { "Failed to decrypt secret" }),
+    // ← Convert CryptoError to String
+  )
+
+  // Extract the "secret" field using manual parsing
+  use #(_, rest) <- result.try(
+    string.split_once(credentials_json, "\"secret\":\"")
+    |> result.replace_error("Secret field not found in credentials"),
+  )
+
+  use #(secret, _) <- result.try(
+    string.split_once(rest, "\"")
+    |> result.replace_error("Failed to parse secret from credentials JSON"),
+  )
+
+  logging.log(logging.Info, "[ProxyHandler] ✅ Successfully decrypted secret")
+  Ok(secret)
+}
+
+// Helper to add webhook secrets to request builder
+fn add_webhook_secret_headers(
+  req: request.Request(String),
+  business_id: String,
+) -> request.Request(String) {
+  case get_business_secrets_cached(business_id) {
+    Ok(#(primary, secondary)) -> {
+      logging.log(
+        logging.Info,
+        "[ProxyHandler] 🔐 Adding webhook secrets to request",
+      )
+
+      let req_with_primary =
+        request.set_header(req, "x-webhook-secret-primary", primary)
+
+      case secondary {
+        Some(sec) ->
+          request.set_header(
+            req_with_primary,
+            "x-webhook-secret-secondary",
+            sec,
+          )
+        None -> req_with_primary
+      }
+    }
+    Error(e) -> {
+      logging.log(logging.Info, "[ProxyHandler] 📭 No secrets: " <> e)
+      req
+      // No secrets, return unchanged
+    }
+  }
+}
+
+// Cache secrets tuple for 5 minutes
+fn get_business_secrets_cached(
+  business_id: String,
+) -> Result(#(String, Option(String)), String) {
+  let cache_key = "webhook_secrets:" <> business_id
+
+  // Try cache first
+  case cachex.get("secrets_cache", cache_key) {
+    Ok(Some(cached)) -> {
+      logging.log(logging.Info, "[ProxyHandler] 💾 Cache hit for secrets")
+      Ok(cached)
+    }
+    _ -> {
+      // Cache miss, fetch from DB
+      case get_business_secrets(business_id) {
+        Ok(secrets) -> {
+          // Cache for 5 minutes (300 seconds)
+          let _ = cachex.put("secrets_cache", cache_key, secrets)
+          Ok(secrets)
+        }
+        Error(e) -> Error(e)
+      }
+    }
   }
 }

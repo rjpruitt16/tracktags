@@ -56,6 +56,7 @@ const valid_key_types = [
   "business",
   "customer_api",
   "stripe_frontend",
+  "webhook_secret",
 ]
 
 // ============================================================================
@@ -91,7 +92,6 @@ fn validate_fly_credentials(
   })
 }
 
-// Update validate_credentials function to include fly
 fn validate_credentials(
   key_type: String,
   credentials: Dict(String, String),
@@ -100,11 +100,39 @@ fn validate_credentials(
     "stripe" -> validate_stripe_credentials(credentials)
     "supabase" -> validate_supabase_credentials(credentials)
     "fly" -> validate_fly_credentials(credentials)
-    // Add this line
     "business" -> validate_business_credentials(credentials)
     "stripe_frontend" -> Ok(Nil)
+    "webhook_secret" -> validate_webhook_secret_credentials(credentials)
+    // ← ADD THIS
     _ -> Error("Unknown key type")
   }
+}
+
+fn validate_webhook_secret_credentials(
+  credentials: Dict(String, String),
+) -> Result(Nil, String) {
+  case dict.get(credentials, "primary") {
+    Ok(secret) ->
+      case string.length(secret) >= 16 {
+        True -> Ok(Nil)
+        False -> Error("Primary secret must be at least 16 characters")
+      }
+    Error(_) -> Error("Missing primary secret")
+  }
+  // Secondary is optional, only validate if present
+  |> result.try(fn(_) {
+    case dict.get(credentials, "secondary") {
+      Ok("") -> Ok(Nil)
+      Ok(secret) ->
+        case string.length(secret) >= 16 {
+          True -> Ok(Nil)
+          False ->
+            Error("Secondary secret must be at least 16 characters if provided")
+        }
+      Error(_) -> Ok(Nil)
+      // Optional field
+    }
+  })
 }
 
 fn validate_business_credentials(
