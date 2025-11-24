@@ -828,9 +828,14 @@ fn forward_request_to_target(
                 }
                 Ok(base_req) -> {
                   // Add forwarded headers from original request
+                  // SECURITY: Strip Authorization header to prevent user API key leakage
                   let req_with_headers =
                     dict.fold(req.headers, base_req, fn(acc_req, key, value) {
-                      request.set_header(acc_req, key, value)
+                      case string.lowercase(key) {
+                        "authorization" -> acc_req
+                        // Don't forward user's API key
+                        _ -> request.set_header(acc_req, key, value)
+                      }
                     })
 
                   // Add TrackTags metadata headers based on scope and context
@@ -1438,9 +1443,14 @@ fn forward_with_limit_metadata(
                   wisp.json_response(json.to_string_tree(error_json), 400)
                 }
                 Ok(base_req) -> {
+                  // SECURITY: Strip Authorization header to prevent user API key leakage
                   let req_with_headers =
                     dict.fold(req.headers, base_req, fn(acc_req, key, value) {
-                      request.set_header(acc_req, key, value)
+                      case string.lowercase(key) {
+                        "authorization" -> acc_req
+                        // Don't forward user's API key
+                        _ -> request.set_header(acc_req, key, value)
+                      }
                     })
 
                   // NEW: Add X-TrackTags-Limits header with all limit statuses
