@@ -1,6 +1,15 @@
 // src/web/router.gleam
+import gleam/erlang/process
 import gleam/http.{Delete, Get, Post, Put}
+import gleam/http/request
+import gleam/int
+import gleam/json
+import gleam/string
 import logging
+import glixir
+import types/application_types
+import utils/ip_ban
+import utils/utils
 import web/handler/admin_handler
 import web/handler/key_handler
 import web/handler/metric_handler
@@ -10,10 +19,18 @@ import web/handler/stripe_handler
 import web/handler/user_handler
 import wisp.{type Request, type Response}
 
+// Maximum request body size: 1MB
+const max_body_size = 1_000_000
+
 pub fn handle_request(req: Request) -> Response {
   use <- wisp.log_request(req)
   use <- wisp.rescue_crashes
   use req <- wisp.handle_head(req)
+  use <- require_ip_not_banned(req)
+  use <- require_body_under_limit(req, max_body_size)
+
+  // Set the max body size for wisp's internal body reading
+  let req = wisp.set_max_body_size(req, max_body_size)
 
   case wisp.path_segments(req) {
     // Health check
@@ -349,4 +366,133 @@ pub fn handle_request(req: Request) -> Response {
 fn health_check() -> Response {
   wisp.ok()
   |> wisp.string_body("OK")
+}
+
+/// Middleware to reject requests with bodies exceeding the limit.
+/// Checks Content-Length header first for fast rejection without reading body.
+fn require_body_under_limit(
+  req: Request,
+  limit: Int,
+  next: fn() -> Response,
+) -> Response {
+  case request.get_header(req, "content-length") {
+    Ok(length_str) -> {
+      case int.parse(length_str) {
+        Ok(length) if length > limit -> {
+          logging.log(
+            logging.Warning,
+            "[Router] Rejecting oversized request: "
+              <> int.to_string(length)
+              <> " bytes (limit: "
+              <> int.to_string(limit)
+              <> ")",
+          )
+          wisp.json_response(
+            json.to_string_tree(
+              json.object([
+                #("error", json.string("Request Too Large")),
+                #(
+                  "message",
+                  json.string(
+                    "Request body exceeds maximum size of "
+                      <> int.to_string(limit / 1_000_000)
+                      <> "MB",
+                  ),
+                ),
+                #("max_bytes", json.int(limit)),
+              ]),
+            ),
+            413,
+          )
+        }
+        _ -> next()
+      }
+    }
+    Error(_) -> next()
+  }
+}
+
+/// Middleware to reject requests from banned IPs (429 Too Many Requests)
+/// Also fires off async IP request recording (fire and forget)
+fn require_ip_not_banned(req: Request, next: fn() -> Response) -> Response {
+  let client_ip = get_client_ip(req)
+
+  // Check if banned first (fast cache lookup)
+  case ip_ban.is_banned(client_ip) {
+    True -> {
+      logging.log(
+        logging.Warning,
+        "[Router] Rejecting banned IP: " <> client_ip,
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Too Many Requests")),
+            #("message", json.string("Rate limit exceeded. Try again later.")),
+            #("retry_after_seconds", json.int(300)),
+          ]),
+        ),
+        429,
+      )
+    }
+    False -> {
+      // Fire and forget: record this IP request asynchronously
+      let _ = process.spawn(fn() { record_ip_request(client_ip) })
+      next()
+    }
+  }
+}
+
+/// Record an IP request to the application actor (fire and forget)
+fn record_ip_request(ip_address: String) -> Nil {
+  case get_application_actor() {
+    Ok(app_actor) -> {
+      process.send(app_actor, application_types.RecordIpRequest(ip_address))
+    }
+    Error(_) -> Nil
+  }
+}
+
+fn get_application_actor() -> Result(
+  process.Subject(application_types.ApplicationMessage),
+  String,
+) {
+  case
+    glixir.lookup_subject(
+      utils.tracktags_registry(),
+      utils.application_actor_key(),
+      glixir.atom_key_encoder,
+    )
+  {
+    Ok(subject) -> Ok(subject)
+    Error(_) -> Error("Application actor not found")
+  }
+}
+
+/// Extract client IP from request headers
+/// Checks x-forwarded-for (for reverse proxy), x-real-ip, then falls back
+fn get_client_ip(req: Request) -> String {
+  // Try x-forwarded-for first (comma-separated, first is client)
+  case request.get_header(req, "x-forwarded-for") {
+    Ok(forwarded) -> {
+      // Take first IP before comma
+      case string.split_once(forwarded, ",") {
+        Ok(#(first_ip, _rest)) -> string.trim(first_ip)
+        Error(_) -> string.trim(forwarded)
+      }
+    }
+    Error(_) -> {
+      // Try x-real-ip
+      case request.get_header(req, "x-real-ip") {
+        Ok(ip) -> ip
+        Error(_) -> {
+          // Try fly-client-ip (Fly.io specific)
+          case request.get_header(req, "fly-client-ip") {
+            Ok(ip) -> ip
+            Error(_) -> "unknown"
+          }
+        }
+      }
+    }
+  }
 }

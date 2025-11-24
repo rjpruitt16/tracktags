@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/option.{type Option}
 import types/business_types
 import types/customer_types
+import types/ip_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 
 pub type ApplicationMessage {
@@ -60,5 +61,10 @@ pub type ApplicationMessage {
     key_hash: String,
     reply: process.Subject(Result(Nil, String)),
   )
+  CheckIpRateLimit(
+    ip_address: String,
+    reply: process.Subject(ip_types.RateLimitResult),
+  )
+  RecordIpRequest(ip_address: String)
   Shutdown
 }

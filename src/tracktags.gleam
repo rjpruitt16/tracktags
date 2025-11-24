@@ -10,6 +10,7 @@ import gleam/string
 import logging
 import mist
 import utils/cachex
+import utils/ip_ban
 import utils/utils
 import web/router
 import wisp
@@ -78,6 +79,13 @@ pub fn start_link() -> Result(process.Pid, String) {
     Ok(_) -> logging.log(logging.Info, "Domain cache started")
     Error(e) ->
       logging.log(logging.Warning, "Cache start failed: " <> string.inspect(e))
+  }
+
+  // Initialize banned IPs cache
+  case ip_ban.init() {
+    Ok(_) -> logging.log(logging.Info, "[Main] Banned IPs cache initialized")
+    Error(e) ->
+      logging.log(logging.Warning, "[Main] Banned IPs cache failed: " <> e)
   }
   let self_hosted =
     string.lowercase(utils.get_env_or("SELF_HOSTED", "false")) == "true"

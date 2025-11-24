@@ -36,6 +36,30 @@ fn get_ffi(cache: a, key: String) -> CachexGetResult(value_type)
 @external(erlang, "Elixir.Tracktags.Utils.Cachex", "put")
 fn put_ffi(cache: a, key: String, value: value_type) -> CachexPutResult
 
+@external(erlang, "Elixir.Tracktags.Utils.Cachex", "put_with_ttl")
+fn put_with_ttl_ffi(
+  cache: a,
+  key: String,
+  value: value_type,
+  ttl_ms: Int,
+) -> CachexPutResult
+
+pub type CachexExistsResult {
+  CachexExistsOk(exists: Bool)
+  CachexExistsError(reason: String)
+}
+
+@external(erlang, "Elixir.Tracktags.Utils.Cachex", "exists?")
+fn exists_ffi(cache: a, key: String) -> CachexExistsResult
+
+pub type CachexDeleteResult {
+  CachexDeleteOk(result: Bool)
+  CachexDeleteError(reason: String)
+}
+
+@external(erlang, "Elixir.Tracktags.Utils.Cachex", "delete")
+fn delete_ffi(cache: a, key: String) -> CachexDeleteResult
+
 // ============================================================================
 // PUBLIC API
 // ============================================================================
@@ -64,6 +88,35 @@ pub fn put(
   case put_ffi(cache, key, value) {
     CachexPutOk(result) -> Ok(result)
     CachexPutError(reason) -> Error(string.inspect(reason))
+  }
+}
+
+/// Put a value into cache with TTL in milliseconds
+pub fn put_with_ttl(
+  cache: String,
+  key: String,
+  value: value_type,
+  ttl_ms: Int,
+) -> Result(Bool, String) {
+  case put_with_ttl_ffi(cache, key, value, ttl_ms) {
+    CachexPutOk(result) -> Ok(result)
+    CachexPutError(reason) -> Error(string.inspect(reason))
+  }
+}
+
+/// Check if a key exists in cache
+pub fn exists(cache: String, key: String) -> Result(Bool, String) {
+  case exists_ffi(cache, key) {
+    CachexExistsOk(exists) -> Ok(exists)
+    CachexExistsError(reason) -> Error(string.inspect(reason))
+  }
+}
+
+/// Delete a key from cache
+pub fn delete(cache: String, key: String) -> Result(Bool, String) {
+  case delete_ffi(cache, key) {
+    CachexDeleteOk(result) -> Ok(result)
+    CachexDeleteError(reason) -> Error(string.inspect(reason))
   }
 }
 

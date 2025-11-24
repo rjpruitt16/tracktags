@@ -1,6 +1,7 @@
 // src/actors/application.gleam
 import actors/business_actor
 import actors/clock_actor
+import actors/ip_actor
 import actors/machine_actor
 import actors/metric_actor
 import actors/realtime_actor
@@ -20,6 +21,7 @@ import logging
 import types/application_types.{type ApplicationMessage}
 import types/business_types
 import types/customer_types
+import types/ip_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/auth
 import utils/utils
@@ -102,6 +104,10 @@ pub type ApplicationState {
         String,
       ),
       process.Subject(metric_types.Message),
+    ),
+    ip_supervisor: glixir.DynamicSupervisor(
+      String,
+      process.Subject(ip_types.Message),
     ),
   )
 }
@@ -291,6 +297,16 @@ fn handle_application_message(
     application_types.UnregisterCustomerKey(key_hash, reply) -> {
       let result = auth.unregister_customer_api_key(key_hash)
       process.send(reply, result)
+      actor.continue(state)
+    }
+
+    application_types.CheckIpRateLimit(ip_address, reply) -> {
+      handle_check_ip_rate_limit(state, ip_address, reply)
+      actor.continue(state)
+    }
+
+    application_types.RecordIpRequest(ip_address) -> {
+      handle_record_ip_request(state, ip_address)
       actor.continue(state)
     }
 
@@ -679,6 +695,60 @@ fn forward_to_business(
   }
 }
 
+// ============================================================================
+// IP RATE LIMITING HELPERS
+// ============================================================================
+
+fn handle_check_ip_rate_limit(
+  state: ApplicationState,
+  ip_address: String,
+  reply: process.Subject(ip_types.RateLimitResult),
+) -> Nil {
+  case ip_actor.get_or_spawn_ip_actor(state.ip_supervisor, ip_address) {
+    Ok(ip_subject) -> {
+      process.send(ip_subject, ip_types.CheckAndIncrement(reply))
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Error,
+        "[Application] Failed to get IP actor for " <> ip_address <> ": " <> e,
+      )
+      // On error, allow the request (fail open)
+      let config = ip_types.default_config()
+      process.send(
+        reply,
+        ip_types.Allowed(current_count: 0.0, remaining: config.max_requests),
+      )
+    }
+  }
+}
+
+fn handle_record_ip_request(state: ApplicationState, ip_address: String) -> Nil {
+  logging.log(
+    logging.Info,
+    "[Application] 📡 Recording IP request for: " <> ip_address,
+  )
+  case ip_actor.get_or_spawn_ip_actor(state.ip_supervisor, ip_address) {
+    Ok(ip_subject) -> {
+      logging.log(
+        logging.Info,
+        "[Application] ✅ Got IP actor for: " <> ip_address,
+      )
+      let timestamp = utils.current_timestamp()
+      process.send(ip_subject, ip_types.RecordRequest(timestamp))
+    }
+    Error(e) -> {
+      logging.log(
+        logging.Warning,
+        "[Application] Failed to record IP request for "
+          <> ip_address
+          <> ": "
+          <> e,
+      )
+    }
+  }
+}
+
 // Fix start_application_actor - use the original pattern
 pub fn start_application_actor(
   business_supervisor: glixir.DynamicSupervisor(
@@ -705,6 +775,10 @@ pub fn start_application_actor(
     ),
     process.Subject(metric_types.Message),
   ),
+  ip_supervisor: glixir.DynamicSupervisor(
+    String,
+    process.Subject(ip_types.Message),
+  ),
 ) -> Result(process.Subject(ApplicationMessage), actor.StartError) {
   let initial_state =
     ApplicationState(
@@ -713,6 +787,7 @@ pub fn start_application_actor(
       supabase_actor: supabase_actor_subject,
       self_hosted: self_hosted,
       metrics_supervisor: metrics_supervisor,
+      ip_supervisor: ip_supervisor,
     )
 
   case
@@ -839,6 +914,16 @@ pub fn start_app(
       "Metrics supervisor failed: " <> string.inspect(e)
     }),
   )
+
+  // Start IP supervisor for rate limiting
+  use ip_supervisor <- result.try(
+    glixir.start_dynamic_supervisor_named(atom.create("ip_supervisor"))
+    |> result.map_error(fn(e) {
+      "IP supervisor failed: " <> string.inspect(e)
+    }),
+  )
+  logging.log(logging.Info, "[Application] ✅ IP supervisor started")
+
   // Start application actor to manage all actors
   use app_actor <- result.try(
     start_application_actor(
@@ -847,6 +932,7 @@ pub fn start_app(
       supabase_subject,
       self_hosted,
       metrics_supervisor,
+      ip_supervisor,
     )
     |> result.map_error(fn(e) {
       "ApplicationActor start failed: " <> string.inspect(e)

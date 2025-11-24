@@ -43,4 +43,40 @@ defmodule Tracktags.Utils.Cachex do
       {:error, reason} -> {:cachex_put_error, inspect(reason)}
     end
   end
+
+  @doc """
+  Put a value with TTL (time to live) in milliseconds
+  """
+  def put_with_ttl(cache, key, value, ttl_ms) do
+    cache_name = if is_binary(cache), do: String.to_atom(cache), else: cache
+
+    case Cachex.put(cache_name, key, value, ttl: ttl_ms) do
+      {:ok, result} -> {:cachex_put_ok, result}
+      {:error, reason} -> {:cachex_put_error, inspect(reason)}
+    end
+  end
+
+  @doc """
+  Check if a key exists in cache
+  """
+  def exists?(cache, key) do
+    cache_name = if is_binary(cache), do: String.to_atom(cache), else: cache
+
+    case Cachex.exists?(cache_name, key) do
+      {:ok, exists} -> {:cachex_exists_ok, exists}
+      {:error, reason} -> {:cachex_exists_error, inspect(reason)}
+    end
+  end
+
+  @doc """
+  Delete a key from cache
+  """
+  def delete(cache, key) do
+    cache_name = if is_binary(cache), do: String.to_atom(cache), else: cache
+
+    case Cachex.del(cache_name, key) do
+      {:ok, result} -> {:cachex_delete_ok, result}
+      {:error, reason} -> {:cachex_delete_error, inspect(reason)}
+    end
+  end
 end
