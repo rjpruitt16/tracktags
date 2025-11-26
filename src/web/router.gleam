@@ -65,6 +65,12 @@ pub fn handle_request(req: Request) -> Response {
         _ -> wisp.method_not_allowed([Post])
       }
 
+    ["admin", "billing-cycle-reset"] ->
+      case req.method {
+        Post -> admin_handler.billing_cycle_reset(req)
+        _ -> wisp.method_not_allowed([Post])
+      }
+
     // Admin v1 APIs
     ["admin", "v1", "replay", business_id, event_id] ->
       case req.method {

@@ -793,6 +793,132 @@ pub fn reconcile_platform(req: Request) -> Response {
   }
 }
 
+/// Monthly billing cycle reset for free tier customers
+/// Called by cron job at the start of each month
+pub fn billing_cycle_reset(req: Request) -> Response {
+  use <- with_admin_auth(req)
+  use <- wisp.require_method(req, http.Post)
+
+  logging.log(
+    logging.Info,
+    "[AdminHandler] 🔄 Starting monthly billing cycle reset for free tier",
+  )
+
+  case supabase_client.get_free_tier_customers_for_reset() {
+    Ok(customers) -> {
+      let total = list.length(customers)
+      logging.log(
+        logging.Info,
+        "[AdminHandler] Found "
+          <> int.to_string(total)
+          <> " free tier customers to reset",
+      )
+
+      // Reset each customer's plan metrics
+      let results =
+        list.map(customers, fn(customer) {
+          reset_customer_metrics(customer.business_id, customer.customer_id)
+        })
+
+      let successes = list.count(results, fn(r) { result.is_ok(r) })
+      let failures = total - successes
+
+      let _ =
+        audit.log_action(
+          "billing_cycle_reset",
+          "cron",
+          "monthly_reset",
+          dict.from_list([
+            #("total_customers", json.int(total)),
+            #("successes", json.int(successes)),
+            #("failures", json.int(failures)),
+          ]),
+        )
+
+      logging.log(
+        logging.Info,
+        "[AdminHandler] ✅ Billing cycle reset complete: "
+          <> int.to_string(successes)
+          <> " succeeded, "
+          <> int.to_string(failures)
+          <> " failed",
+      )
+
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("status", json.string("completed")),
+            #("total_customers", json.int(total)),
+            #("successes", json.int(successes)),
+            #("failures", json.int(failures)),
+          ]),
+        ),
+        200,
+      )
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[AdminHandler] ❌ Failed to get customers: " <> string.inspect(err),
+      )
+      wisp.json_response(
+        json.to_string_tree(
+          json.object([
+            #("error", json.string("Internal Server Error")),
+            #("message", json.string("Failed to get free tier customers")),
+          ]),
+        ),
+        500,
+      )
+    }
+  }
+}
+
+/// Helper to reset a single customer's metrics
+fn reset_customer_metrics(
+  business_id: String,
+  customer_id: String,
+) -> Result(Nil, String) {
+  // Reset in database
+  case
+    supabase_client.reset_customer_stripe_billing_metrics(
+      business_id,
+      customer_id,
+    )
+  {
+    Ok(_) -> {
+      // Also try to reset in-memory if actor is running
+      let registry_key = "client:" <> business_id <> ":" <> customer_id
+      case
+        glixir.lookup_subject_string(utils.tracktags_registry(), registry_key)
+      {
+        Ok(customer_subject) -> {
+          process.send(customer_subject, customer_types.ResetPlanMetrics)
+          logging.log(
+            logging.Debug,
+            "[AdminHandler] Reset sent to CustomerActor: " <> customer_id,
+          )
+        }
+        Error(_) -> {
+          // Actor not running - DB reset is sufficient
+          Nil
+        }
+      }
+      Ok(Nil)
+    }
+    Error(err) -> {
+      logging.log(
+        logging.Error,
+        "[AdminHandler] Failed to reset metrics for "
+          <> customer_id
+          <> ": "
+          <> string.inspect(err),
+      )
+      Error("Failed to reset: " <> customer_id)
+    }
+  }
+}
+
 fn reconcile_business_subscription(
   business: business_types.Business,
 ) -> Result(Nil, String) {

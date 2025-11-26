@@ -73,6 +73,32 @@ pub fn start_link() -> Result(process.Pid, String) {
       Nil
     })
     |> clockwork_schedule.with_logging()
+
+  // Monthly billing cycle reset for free tier customers
+  // Runs at 00:05 on the 1st of each month
+  let assert Ok(billing_reset_cron) = clockwork.from_string("5 0 1 * *")
+
+  let _billing_reset_scheduler =
+    clockwork_schedule.new("billing_cycle_reset", billing_reset_cron, fn() {
+      logging.log(
+        logging.Info,
+        "[Cron] 🔄 Running monthly billing cycle reset",
+      )
+      let _ =
+        httpc.send(
+          request.new()
+          |> request.set_method(http.Post)
+          |> request.set_host("127.0.0.1")
+          |> request.set_port(port)
+          |> request.set_path("/admin/billing-cycle-reset")
+          |> request.set_header(
+            "x-admin-key",
+            utils.require_env("ADMIN_SECRET_KEY"),
+          ),
+        )
+      Nil
+    })
+    |> clockwork_schedule.with_logging()
   let cache_opts = []
   // Empty list - use defaults
   case cachex.start_link("domain_cache", cache_opts) {

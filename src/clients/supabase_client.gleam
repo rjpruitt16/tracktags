@@ -4309,3 +4309,89 @@ pub fn get_metric_history(
     _ -> Error(DatabaseError("Failed to query metric history"))
   }
 }
+
+// ============================================================================
+// BILLING CYCLE RESET (Monthly Cron)
+// ============================================================================
+
+/// Customer info needed for billing reset
+pub type CustomerForReset {
+  CustomerForReset(
+    business_id: String,
+    customer_id: String,
+    plan_id: Option(String),
+    stripe_price_id: Option(String),
+  )
+}
+
+/// Get all free tier customers who need monthly billing reset
+/// Free tier = stripe_price_id IS NULL and has a plan with limits
+pub fn get_free_tier_customers_for_reset() -> Result(
+  List(CustomerForReset),
+  SupabaseError,
+) {
+  logging.log(
+    logging.Info,
+    "[SupabaseClient] 🔄 Getting free tier customers for billing reset",
+  )
+
+  // Query customers where stripe_price_id is null (free tier)
+  // and they have a plan_id (so they have limits to reset)
+  let path =
+    "/customers?stripe_price_id=is.null&plan_id=not.is.null&deleted_at=is.null&select=business_id,customer_id,plan_id,stripe_price_id"
+
+  use response <- result.try(make_request(http.Get, path, None))
+
+  case response.status {
+    200 -> {
+      let decoder = {
+        use business_id <- decode.field("business_id", decode.string)
+        use customer_id <- decode.field("customer_id", decode.string)
+        use plan_id <- decode.optional_field(
+          "plan_id",
+          None,
+          decode.optional(decode.string),
+        )
+        use stripe_price_id <- decode.optional_field(
+          "stripe_price_id",
+          None,
+          decode.optional(decode.string),
+        )
+        decode.success(CustomerForReset(
+          business_id: business_id,
+          customer_id: customer_id,
+          plan_id: plan_id,
+          stripe_price_id: stripe_price_id,
+        ))
+      }
+
+      case json.parse(response.body, decode.list(decoder)) {
+        Ok(customers) -> {
+          logging.log(
+            logging.Info,
+            "[SupabaseClient] ✅ Found "
+              <> int.to_string(list.length(customers))
+              <> " free tier customers for reset",
+          )
+          Ok(customers)
+        }
+        Error(e) -> {
+          logging.log(
+            logging.Error,
+            "[SupabaseClient] ❌ Failed to parse customers: "
+              <> string.inspect(e),
+          )
+          Error(DatabaseError("Failed to parse free tier customers"))
+        }
+      }
+    }
+    status -> {
+      logging.log(
+        logging.Error,
+        "[SupabaseClient] ❌ Failed to get free tier customers: "
+          <> int.to_string(status),
+      )
+      Error(DatabaseError("Failed to get free tier customers"))
+    }
+  }
+}
