@@ -60,6 +60,30 @@ pub type CachexDeleteResult {
 @external(erlang, "Elixir.Tracktags.Utils.Cachex", "delete")
 fn delete_ffi(cache: a, key: String) -> CachexDeleteResult
 
+// Fetch result type - wraps the result from the fallback
+pub type CachexFetchResult(value_type) {
+  CachexFetchOk(value: Result(value_type, String))
+  CachexFetchError(reason: String)
+}
+
+@external(erlang, "Elixir.Tracktags.Utils.Cachex", "fetch")
+fn fetch_ffi(
+  cache: a,
+  key: String,
+  module: String,
+  function: String,
+  args: List(b),
+  ttl_ms: Int,
+) -> CachexFetchResult(value_type)
+
+@external(erlang, "Elixir.Tracktags.Utils.Cachex", "fetch_with_fn")
+fn fetch_with_fn_ffi(
+  cache: a,
+  key: String,
+  fallback: fn() -> Result(value_type, String),
+  ttl_ms: Int,
+) -> CachexFetchResult(value_type)
+
 // ============================================================================
 // PUBLIC API
 // ============================================================================
@@ -126,6 +150,54 @@ pub fn delete(cache: String, key: String) -> Result(Bool, String) {
 
 pub fn get_bool(cache: String, key: String) -> Result(Option(Bool), String) {
   get(cache, key)
+}
+
+/// Fetch a value from cache with automatic coalescing.
+/// If the key doesn't exist, calls the fallback (module.function(args)) to compute it.
+/// Multiple simultaneous requests for the same key will only execute the fallback ONCE.
+///
+/// The fallback function must return Result(value, String).
+/// On success, the value is cached with the specified TTL.
+/// On error, the error is returned but NOT cached.
+pub fn fetch(
+  cache: String,
+  key: String,
+  module: String,
+  function: String,
+  args: List(a),
+  ttl_ms: Int,
+) -> Result(value_type, String) {
+  case fetch_ffi(cache, key, module, function, args, ttl_ms) {
+    CachexFetchOk(Ok(value)) -> Ok(value)
+    CachexFetchOk(Error(reason)) -> Error(reason)
+    CachexFetchError(reason) -> Error(reason)
+  }
+}
+
+/// Fetch a value from cache with automatic coalescing using a Gleam function.
+/// This is the preferred way to use fetch from Gleam code.
+///
+/// Multiple simultaneous requests for the same key will only execute the fallback ONCE.
+/// Other requests wait and share the result (coalescing).
+///
+/// Example:
+///   cachex.fetch_with(
+///     "my_cache",
+///     "user:123",
+///     fn() { expensive_lookup("123") },
+///     60_000  // 1 minute TTL
+///   )
+pub fn fetch_with(
+  cache: String,
+  key: String,
+  fallback: fn() -> Result(value_type, String),
+  ttl_ms: Int,
+) -> Result(value_type, String) {
+  case fetch_with_fn_ffi(cache, key, fallback, ttl_ms) {
+    CachexFetchOk(Ok(value)) -> Ok(value)
+    CachexFetchOk(Error(reason)) -> Error(reason)
+    CachexFetchError(reason) -> Error(reason)
+  }
 }
 
 pub fn put_bool(cache: String, key: String, value: Bool) -> Result(Bool, String) {

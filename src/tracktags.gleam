@@ -107,6 +107,16 @@ pub fn start_link() -> Result(process.Pid, String) {
       logging.log(logging.Warning, "Cache start failed: " <> string.inspect(e))
   }
 
+  // Initialize customer actor cache for coalesced actor creation
+  case cachex.start_link("customer_actor_cache", cache_opts) {
+    Ok(_) -> logging.log(logging.Info, "Customer actor cache started")
+    Error(e) ->
+      logging.log(
+        logging.Warning,
+        "Customer actor cache failed: " <> string.inspect(e),
+      )
+  }
+
   // Initialize banned IPs cache
   case ip_ban.init() {
     Ok(_) -> logging.log(logging.Info, "[Main] Banned IPs cache initialized")

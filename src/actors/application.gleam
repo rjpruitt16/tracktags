@@ -24,6 +24,7 @@ import types/customer_types
 import types/ip_types
 import types/metric_types.{type MetricMetadata, type MetricType}
 import utils/auth
+import utils/cachex
 import utils/utils
 
 // Now we can import auth!
@@ -599,7 +600,7 @@ fn ensure_customer_with_context(
   customer_id: String,
   context: customer_types.CustomerContext,
 ) -> Result(process.Subject(customer_types.Message), String) {
-  // Check if customer actor already exists
+  // Check if customer actor already exists (fast path)
   case customer_types.lookup_client_subject(business_id, customer_id) {
     Ok(customer_subject) -> {
       // Update with fresh context
@@ -610,24 +611,50 @@ fn ensure_customer_with_context(
       Ok(customer_subject)
     }
     Error(_) -> {
-      // Need to spawn via business actor first
-      case get_or_spawn_business_simple(business_supervisor, business_id) {
-        Ok(business_subject) -> {
-          // Have business spawn the customer
-          let reply = process.new_subject()
-          process.send(
-            business_subject,
-            business_types.EnsureCustomerExists(customer_id, context, reply),
-          )
+      // Slow path: use coalesced creation via cachex
+      // Multiple simultaneous requests will only spawn ONE actor
+      let cache_key = business_id <> ":" <> customer_id
 
-          case process.receive(reply, 1000) {
-            Ok(customer_subject) -> Ok(customer_subject)
-            Error(_) -> Error("Failed to spawn customer actor")
-          }
-        }
-        Error(e) -> Error("Failed to get business actor: " <> e)
+      cachex.fetch_with(
+        "customer_actor_cache",
+        cache_key,
+        fn() {
+          spawn_customer_actor(business_supervisor, business_id, customer_id, context)
+        },
+        300_000,  // 5 minute TTL
+      )
+    }
+  }
+}
+
+/// Actually spawn the customer actor via business actor.
+/// This is called by cachex.fetch_with and will only run ONCE per customer
+/// even if multiple requests arrive simultaneously.
+fn spawn_customer_actor(
+  business_supervisor: glixir.DynamicSupervisor(
+    String,
+    process.Subject(business_types.Message),
+  ),
+  business_id: String,
+  customer_id: String,
+  context: customer_types.CustomerContext,
+) -> Result(process.Subject(customer_types.Message), String) {
+  case get_or_spawn_business_simple(business_supervisor, business_id) {
+    Ok(business_subject) -> {
+      // Have business spawn the customer
+      let reply = process.new_subject()
+      process.send(
+        business_subject,
+        business_types.EnsureCustomerExists(customer_id, context, reply),
+      )
+
+      // Longer timeout since we're coalesced (only one spawn at a time)
+      case process.receive(reply, 10_000) {
+        Ok(customer_subject) -> Ok(customer_subject)
+        Error(_) -> Error("Failed to spawn customer actor")
       }
     }
+    Error(e) -> Error("Failed to get business actor: " <> e)
   }
 }
 
