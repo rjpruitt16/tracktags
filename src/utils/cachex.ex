@@ -109,7 +109,7 @@ defmodule Tracktags.Utils.Cachex do
 
     case result do
       {:ok, value} -> {:cachex_fetch_ok, value}
-      {:commit, value, _opts} -> {:cachex_fetch_ok, value}
+      {:commit, value} -> {:cachex_fetch_ok, value}
       {:ignore, value} -> {:cachex_fetch_ok, value}
       {:error, reason} -> {:cachex_fetch_error, inspect(reason)}
     end
@@ -134,7 +134,7 @@ defmodule Tracktags.Utils.Cachex do
 
     case result do
       {:ok, value} -> {:cachex_fetch_ok, value}
-      {:commit, value, _opts} -> {:cachex_fetch_ok, value}
+      {:commit, value} -> {:cachex_fetch_ok, value}
       {:ignore, value} -> {:cachex_fetch_ok, value}
       {:error, reason} -> {:cachex_fetch_error, inspect(reason)}
     end
