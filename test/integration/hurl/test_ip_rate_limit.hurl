@@ -7,7 +7,7 @@
 # ===========================================================================
 # TEST 1: Health check works normally
 # ===========================================================================
-GET {{host}}/health
+GET {{TRACKTAGS_URL}}/health
 HTTP 200
 [Asserts]
 body == "OK"
@@ -20,7 +20,7 @@ body == "OK"
 # ===========================================================================
 # TEST 3: Request with body > 1MB should return 413
 # ===========================================================================
-POST {{host}}/api/v1/proxy
+POST {{TRACKTAGS_URL}}/api/v1/proxy
 Content-Type: application/json
 Content-Length: 2000000
 ```
@@ -35,7 +35,7 @@ jsonpath "$.max_bytes" == 1000000
 # TEST 4: Normal sized request should work (assuming valid auth)
 # This will return 401 without auth, but proves the size check passed
 # ===========================================================================
-POST {{host}}/api/v1/proxy
+POST {{TRACKTAGS_URL}}/api/v1/proxy
 Content-Type: application/json
 ```json
 {"target_url": "https://example.com", "method": "GET"}
